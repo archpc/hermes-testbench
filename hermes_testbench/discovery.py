@@ -385,7 +385,23 @@ def _python_suite(root: Path) -> Optional[SuiteSpec]:
         tests_dir / "test_tmux_integration.py"
     ).is_file()
 
-    if _has_module(python, "pytest"):
+    needs_pyte = False
+    if has_tests and not _has_module(python, "pyte") and shutil.which("uv"):
+        import re as _re
+        for tf in tests_dir.glob("test_*.py"):
+            try:
+                src = tf.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if _re.search(r"^[ \t]*(?:import|from)[ \t]+pyte\b", src, _re.M):
+                needs_pyte = True
+                break
+
+    if needs_pyte:
+        command = ["uv", "run", "--offline", "--with", "pyte", "python", "-m", "unittest", "discover", "-s", "tests", "-v"]
+        adapter, name = "python_unittest", "python-unittest"
+        description = "unittest discovery via uv offline with pyte"
+    elif _has_module(python, "pytest"):
         command = [str(python), "-m", "pytest", "-q"]
         if has_tests:
             command.append("tests")
@@ -413,14 +429,17 @@ def _python_suite(root: Path) -> Optional[SuiteSpec]:
 def _rust_suite(root: Path) -> Optional[SuiteSpec]:
     if not (root / "Cargo.toml").is_file():
         return None
+    cmd = ["cargo", "test"]
+    if (root / "Cargo.lock").is_file():
+        cmd.append("--locked")
+    cmd.extend(["--offline", "--workspace"])
     return SuiteSpec(
         name="cargo-unit",
         adapter="cargo",
         profile=ProfileName.UNIT,
-        command=["cargo", "test", "--offline", "--workspace"],
+        command=cmd,
         timeout_s=900.0,
-        # cargo writes build artifacts into target/ inside the repository.
-        allow_repo_write=True,
+        allow_repo_write=False,
         required_binaries=["cargo"],
         description="cargo workspace unit tests (offline)",
     )
@@ -473,7 +492,20 @@ rc=0
 for src in "$@"; do
   name=$(printf '%s' "$src" | tr -c 'A-Za-z0-9._-' '_')
   bin="$TMPDIR/asan_$name"
-  if ! clang -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -o "$bin" "$src"; then
+  dir=$(dirname "$src")
+  extra_c=""
+  for sib in "$dir"/*.c; do
+    [ -f "$sib" ] || continue
+    [ "$sib" = "$src" ] && continue
+    if ! grep -Eq 'int[[:space:]]+main[[:space:]]*\\(' "$sib"; then
+      extra_c="$extra_c $sib"
+    fi
+  done
+  libs=""
+  if grep -Fq 'sqlite3.h' "$src"; then
+    libs="-lsqlite3"
+  fi
+  if ! clang -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -o "$bin" "$src" $extra_c $libs; then
     echo "TB-FAIL c-asan:$src compile"
     rc=1
     continue
@@ -584,7 +616,12 @@ def _cobol_suites(root: Path, files: List[str]) -> Tuple[List[SuiteSpec], bool]:
                     "--with",
                     "pyte",
                     "python",
-                    harness,
+                    "-m",
+                    "unittest",
+                    "discover",
+                    "-s",
+                    "bench/tui/cobol",
+                    "-v",
                 ],
                 timeout_s=300.0,
                 required_binaries=["uv"],
@@ -592,7 +629,7 @@ def _cobol_suites(root: Path, files: List[str]) -> Tuple[List[SuiteSpec], bool]:
             )
         )
 
-    sources = _matching(files, suffix=".cob")
+    sources = _matching(files, suffix=".cob") if not suites else []
     if sources:
         suites.append(
             SuiteSpec(
@@ -644,12 +681,18 @@ def _script_suites(root: Path, files: List[str]) -> Tuple[List[SuiteSpec], List[
     for rel, name, adapter, language in _VERIFIER_SCRIPTS:
         if rel not in present:
             continue
+        cmd = [str(python), rel]
+        try:
+            if "sys.argv[1]" in (root / rel).read_text(encoding="utf-8", errors="ignore"):
+                cmd.append(".")
+        except OSError:
+            pass
         suites.append(
             SuiteSpec(
                 name=name,
                 adapter=adapter,
                 profile=ProfileName.REGRESSION,
-                command=[str(python), rel],
+                command=cmd,
                 timeout_s=300.0,
                 description=f"verifier script {rel}",
             )

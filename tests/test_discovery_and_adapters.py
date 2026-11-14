@@ -271,7 +271,7 @@ class DiscoverProjectZeroConfigTests(unittest.TestCase):
         self.assertEqual(suite.command, ["cargo", "test", "--offline", "--workspace"])
         self.assertIn("cargo", suite.required_binaries)
         self.assertGreaterEqual(suite.timeout_s, 60)
-        self.assertTrue(suite.allow_repo_write, "cargo needs target/ writes")
+        self.assertFalse(suite.allow_repo_write, "cargo uses disposable CARGO_TARGET_DIR in sandbox")
         self.assertFalse(suite.custom_from_manifest)
 
     def test_python_project_falls_back_to_unittest_without_pytest(self) -> None:
@@ -404,9 +404,22 @@ class DiscoverProjectMultiLanguageTests(unittest.TestCase):
         suite = spec.suites[0]
         self.assertEqual(suite.adapter, "cobol")
         self.assertEqual(
-            suite.command[:6], ["uv", "run", "--offline", "--with", "pyte", "python"]
+            suite.command,
+            [
+                "uv",
+                "run",
+                "--offline",
+                "--with",
+                "pyte",
+                "python",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "bench/tui/cobol",
+                "-v",
+            ],
         )
-        self.assertEqual(suite.command[6], "bench/tui/cobol/test_cobol.py")
         self.assertIn("uv", suite.required_binaries)
 
     def test_c_selftest_gets_asan_ubsan_suite(self) -> None:

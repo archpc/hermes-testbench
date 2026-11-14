@@ -188,7 +188,8 @@ class IsolationTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "macOS sandbox-exec unavailable")
     def test_seatbelt_blocks_network_and_hermes_home_writes_while_allowing_scratch(self) -> None:
-        hermes_probe = Path.home() / ".hermes" / "_tb_forbidden_write_probe"
+        from hermes_testbench.isolation import real_user_home
+        hermes_probe = real_user_home() / ".hermes" / "_tb_forbidden_write_probe"
         script = (
             "import os, pathlib, socket\n"
             "net_blocked = False\n"
@@ -254,10 +255,13 @@ class IsolationTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "macOS sandbox-exec unavailable")
     def test_nested_process_inherits_effective_seatbelt_restrictions_and_detects_outer_sandbox(self) -> None:
+        from hermes_testbench.isolation import can_apply_seatbelt
         real_hermes_probe = Path("/Users/sein/.hermes/_tb_nested_effective_probe")
         real_ssh_dir = Path("/Users/sein/.ssh")
-        repo_ro_probe = self.repo / "should_not_be_written.txt"
         repo_root_dir = Path(__file__).resolve().parent.parent
+        # When already inside an outer TestBench Seatbelt, repo_root_dir is the protected read-only repo
+        protected_repo = self.repo if can_apply_seatbelt() else repo_root_dir
+        repo_ro_probe = protected_repo / "_tb_should_not_be_written.txt"
 
         leaf_file = self.root / "leaf_probe.py"
         leaf_file.write_text(
@@ -329,7 +333,7 @@ class IsolationTests(unittest.TestCase):
             scratch_root=self.root,
         )
         self.assertEqual(outer_res.exit_code, 0, outer_res.stderr_text + "\n" + outer_res.stdout_text)
-        self.assertEqual(outer_res.isolation_meta.get("seatbelt"), "active")
+        self.assertIn(outer_res.isolation_meta.get("seatbelt"), ("active", "inherited_outer"))
         self.assertIn('"seatbelt": "inherited_outer"', outer_res.stdout_text)
         self.assertIn('"net_denied": true', outer_res.stdout_text)
         self.assertIn('"hermes_write_denied": true', outer_res.stdout_text)

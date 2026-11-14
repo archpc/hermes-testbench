@@ -288,7 +288,10 @@ def parse_cargo(text: str) -> ParseOutcome:
 
 
 def parse_cobol(text: str) -> ParseOutcome:
-    text = _clean(text)
+    cleaned = _clean(text)
+    if re.search(r"^Ran \d+ tests? in ", cleaned, re.M):
+        return parse_python_unittest(cleaned)
+    text = cleaned
     outcome = ParseOutcome()
     markers = _apply_markers(outcome, text)
     success_re = re.compile(r"\b(?:ALL TESTS PASSED|TESTS PASSED|SELFTEST OK)\b")

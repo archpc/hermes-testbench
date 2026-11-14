@@ -296,9 +296,10 @@ timeout_ms = int(timeout_ms)
 hold_ms = float(hold_ms)
 start_at = float(start_at)
 
-conn = sqlite3.connect(db_path, timeout=max(0.0, timeout_ms / 1000.0), isolation_level=None)
-conn.execute("PRAGMA busy_timeout = %d" % timeout_ms)
+conn = sqlite3.connect(db_path, timeout=5.0, isolation_level=None)
+conn.execute("PRAGMA busy_timeout = 5000")
 conn.execute("PRAGMA synchronous = NORMAL")
+conn.execute("PRAGMA busy_timeout = %d" % timeout_ms)
 
 busy_retries = 0
 writer_errors = 0
@@ -375,7 +376,7 @@ def _sqlite_phase(
     result_dir: Path,
     phase: str,
 ) -> Dict[str, Any]:
-    start_at = time.time() + 0.25
+    start_at = time.time() + 0.45
     procs: List[subprocess.Popen] = []
     result_paths: List[Path] = []
     t0 = time.monotonic()
@@ -850,10 +851,12 @@ def run_tmux_lifecycle_probe(scratch_root: Optional[Path] = None) -> Dict[str, A
 
     base = Path(scratch_root).expanduser() if scratch_root else default_scratch_root()
     base.mkdir(parents=True, exist_ok=True)
-    work = base / f"tb-tmux-{os.getpid()}-{os.urandom(4).hex()}"
+    from .isolation import short_writable_tmux_base
+    short_base = short_writable_tmux_base(base)
+    work = short_base / f"tx{os.urandom(3).hex()}"
     work.mkdir(mode=0o700)
     (work / "home").mkdir(mode=0o700)
-    socket = f"tbx{os.getpid():x}{os.urandom(3).hex()}"
+    socket = f"s{os.urandom(2).hex()}"
     env = _tmux_env(work, socket)
     session = "tb-lifecycle"
 

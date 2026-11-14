@@ -49,6 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     resp.add_argument("--last", action="store_true", help="Show most recent run")
     resp.add_argument("--project", default="")
     resp.add_argument("--format", choices=["text", "json", "junit"], default="text")
+    resp.add_argument("--json", action="store_true", help="Alias for --format json")
+    resp.add_argument("--logs", action="store_true", help="Include sanitized suite log tails")
 
     reprop = sub.add_parser("reproduce", help="Print or replay reproduction instructions for a run")
     reprop.add_argument("run_id")
@@ -236,12 +238,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if rec is None:
                     sys.stderr.write("testbench: no matching run found\n")
                     return 1
-                if args.format == "json":
+                fmt = "json" if args.json else args.format
+                if fmt == "json":
                     sys.stdout.write(render_run_json(rec))
-                elif args.format == "junit":
+                elif fmt == "junit":
                     sys.stdout.write(render_junit_xml(rec))
                 else:
                     print(format_terminal_summary(rec))
+                    if args.logs:
+                        ev = Path(rec.evidence_dir) if rec.evidence_dir else None
+                        if ev and ev.is_dir():
+                            for lf in sorted(ev.glob("*.sanitized.log")):
+                                print(f"--- {lf.name} ---")
+                                print(lf.read_text(encoding="utf-8", errors="replace")[-4000:])
                 return 0
 
             if args.command == "reproduce":

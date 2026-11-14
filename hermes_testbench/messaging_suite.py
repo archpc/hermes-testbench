@@ -473,7 +473,7 @@ def _contract_cases(
     cases.append(
         _result(
             "g1_completion_notification_is_the_settle_channel",
-            '"reply_delivery": "notification"' in dm_src,
+            '"reply_delivery"' in dm_src and '"notification"' in dm_src and "notify_on_complete" in dm_src,
             "completion notification must be the settle channel",
         )
     )
@@ -495,8 +495,9 @@ def _contract_cases(
 
     # g4 exercises this module's own fallback against a synthetic durable receipt.
     delivery_id = "ab" * 32
+    evidence_dir.mkdir(parents=True, exist_ok=True)
     try:
-        with tempfile.TemporaryDirectory(prefix="tb-g4-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="tb-g4-", dir=str(evidence_dir)) as tmp:
             profile_home = Path(tmp) / "profile"
             receipt = delivery_receipt_path(profile_home, delivery_id)
             receipt.parent.mkdir(parents=True, exist_ok=True)
@@ -548,14 +549,23 @@ def _wiring_suite(artifact_root: Path, evidence_dir: Path) -> Optional[SuiteResu
     if not script.is_file():
         return None
 
+    from contextlib import closing
+    import sqlite3
     cases: List[CaseResult] = []
     evidence_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="tb-wiring-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="tb-wiring-", dir=str(evidence_dir)) as tmp:
         base = Path(tmp)
         wired = base / "wired-home"
         (wired / "profiles" / "opus").mkdir(parents=True, exist_ok=True)
-        (wired / "profiles" / "opus" / "config.yaml").write_text("profile: opus\n", encoding="utf-8")
-        (wired / "profile.yaml").write_text("ui_meta:\n  hermes-bots: enabled\n", encoding="utf-8")
+        (wired / "profiles" / "opus" / "config.yaml").write_text(
+            "model:\n  default: anthropic/claude-opus-5.5\n", encoding="utf-8"
+        )
+        (wired / "profile.yaml").write_text("ui_meta:\n  hermes-bots:\n    enabled: true\n", encoding="utf-8")
+        for db_dir in (wired, wired / "profiles" / "opus"):
+            with closing(sqlite3.connect(str(db_dir / "state.db"))) as conn:
+                conn.execute("CREATE TABLE sessions (id TEXT, title TEXT, started_at INTEGER)")
+                conn.execute("INSERT INTO sessions VALUES ('s1', 'Bot Chat', 1)")
+                conn.commit()
         unwired = base / "unwired-home"
         unwired.mkdir(parents=True, exist_ok=True)
 

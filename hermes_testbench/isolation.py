@@ -32,6 +32,7 @@ _SCRUB_EXACT = frozenset(
         "HERMES_TMUX",
         "HXMAIL_DB",
         "HXMAIL_LOCAL_DIR",
+        "TESTBENCH_HOME",
         "SSH_AUTH_SOCK",
         "SSH_AGENT_PID",
         "GPG_AGENT_INFO",
@@ -41,8 +42,8 @@ _SCRUB_EXACT = frozenset(
 
 _SCRUB_KEY_RE = re.compile(
     r"(?i)(?:"
-    r"API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|COOKIE|SESSION_KEY|AUTH_KEY"
-    r"|^(?:OPENAI|ANTHROPIC|OPENROUTER|NOUS|DEEPSEEK|GITHUB|GH|AWS|FASTMAIL|SLACK|DISCORD|TELEGRAM)_"
+    r"API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|COOKIE|SESSION_KEY|AUTH_KEY|_KEY$"
+    r"|^(?:OPENAI|ANTHROPIC|OPENROUTER|NOUS|DEEPSEEK|GITHUB|GH|AWS|FASTMAIL|SLACK|DISCORD|TELEGRAM|HERMES_PEER)_"
     r")"
 )
 
@@ -74,16 +75,55 @@ def real_user_home() -> Path:
         return Path.home().resolve()
 
 
+def _probe_writable_dir(cand: Path) -> bool:
+    try:
+        cand.mkdir(parents=True, exist_ok=True)
+        probe = cand / f".tbp_{os.getpid()}_{os.urandom(3).hex()}"
+        os.mkdir(str(probe), 0o700)
+        os.rmdir(str(probe))
+        return True
+    except OSError:
+        return False
+
+
 def default_scratch_root() -> Path:
-    for var in ("TESTBENCH_SCRATCH_DIR", "TMPDIR"):
-        val = os.environ.get(var, "").strip()
-        if val:
-            p = Path(val).expanduser()
-            p.mkdir(parents=True, exist_ok=True)
+    tb_sc = os.environ.get("TESTBENCH_SCRATCH_DIR", "").strip()
+    if tb_sc:
+        p = Path(tb_sc).expanduser()
+        if _probe_writable_dir(p):
             return p.resolve()
-    fallback = real_user_home() / ".hermes" / "cache" / "scratch"
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback.resolve()
+    preferred = real_user_home() / ".hermes" / "cache" / "scratch"
+    if _probe_writable_dir(preferred):
+        return preferred.resolve()
+    td = os.environ.get("TMPDIR", "").strip()
+    if td:
+        p = Path(td).expanduser()
+        if _probe_writable_dir(p):
+            return p.resolve()
+    preferred.mkdir(parents=True, exist_ok=True)
+    return preferred.resolve()
+
+
+def short_writable_tmux_base(preferred: Path) -> Path:
+    """Return a writable directory short enough for macOS 104-byte sockaddr_un."""
+    candidates: List[Path] = []
+    tb_sc = os.environ.get("TESTBENCH_SCRATCH_DIR", "").strip()
+    if tb_sc:
+        p = Path(tb_sc).expanduser().resolve()
+        candidates.extend([p.parent, p])
+    candidates.append((real_user_home() / ".hermes" / "cache" / "scratch").resolve())
+    pref_res = preferred.expanduser().resolve()
+    candidates.append(pref_res)
+    for anc in pref_res.parents:
+        if len(str(anc)) < 15:
+            break
+        candidates.append(anc)
+    best: Optional[Path] = None
+    for cand in candidates:
+        if len(str(cand)) <= 74 and _probe_writable_dir(cand):
+            if best is None or len(str(cand)) < len(str(best)):
+                best = cand
+    return best if best is not None else pref_res
 
 
 def _process_start_fingerprint(pid: int) -> Optional[str]:
@@ -204,12 +244,18 @@ def build_seatbelt_profile(
     if not allow_network:
         rules.append("(deny network*)")
         rules.append("(allow network* (local unix))")
+        rules.append('(allow network-bind (local ip "localhost:*"))')
+        rules.append('(allow network-inbound (local ip "localhost:*"))')
+        rules.append('(allow network-outbound (remote ip "localhost:*"))')
+        rules.append('(deny network-outbound (remote ip "localhost:9119"))')
 
     rules.append(
         "(deny file-read-data "
         f"(subpath {_sb_quote(u_home / '.ssh')}) "
         f"(subpath {_sb_quote(u_home / '.aws')}) "
         f"(subpath {_sb_quote(u_home / '.gnupg')}) "
+        f"(literal {_sb_quote(u_home / '.cargo' / 'credentials.toml')}) "
+        f"(literal {_sb_quote(u_home / '.cargo' / 'credentials')}) "
         f"(literal {_sb_quote(hermes_dir / '.env')}) "
         f"(literal {_sb_quote(hermes_dir / 'auth.json')}) "
         f"(subpath {_sb_quote(hermes_dir / 'mcp-tokens')}) "
@@ -218,6 +264,8 @@ def build_seatbelt_profile(
     rules.append(
         "(deny file-write* "
         f"(subpath {_sb_quote(hermes_dir)}) "
+        f"(subpath {_sb_quote(u_home / '.cargo')}) "
+        f"(subpath {_sb_quote(u_home / '.rustup')}) "
         f"(subpath {_sb_quote(hxmail_support)}))"
     )
     if not allow_repo_write:
@@ -244,11 +292,31 @@ def build_isolated_env(
     sandbox_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(str(sandbox_dir), 0o700)
     subdirs = {}
-    for sub in ("home", "xdg_config", "xdg_data", "xdg_cache", "tmp", "tmux_tmp"):
+    for sub in ("home", "xdg_config", "xdg_data", "xdg_cache", "tmp", "tmux_tmp", "cargo_home", "cargo_target", "uv_cache"):
         d = sandbox_dir / sub
         d.mkdir(parents=True, exist_ok=True)
         os.chmod(str(d), 0o700)
         subdirs[sub] = d
+    u_home = real_user_home()
+    for cargo_sub in ("registry", "git", "bin"):
+        real_csub = u_home / ".cargo" / cargo_sub
+        dst_link = subdirs["cargo_home"] / cargo_sub
+        if real_csub.exists() and not dst_link.exists():
+            try:
+                dst_link.symlink_to(real_csub)
+            except OSError:
+                pass
+    real_uv = u_home / ".cache" / "uv"
+    if real_uv.is_dir():
+        try:
+            for item in real_uv.iterdir():
+                if not item.name.startswith(("wheels-", "archive-", "simple-", "interpreter-", "builds-", "git-")):
+                    continue
+                dst_uv = subdirs["uv_cache"] / item.name
+                if not dst_uv.exists():
+                    dst_uv.symlink_to(item)
+        except OSError:
+            pass
     if tmux_tmpdir is not None:
         tmux_tmpdir.mkdir(parents=True, exist_ok=True)
         os.chmod(str(tmux_tmpdir), 0o700)
@@ -272,6 +340,20 @@ def build_isolated_env(
     clean["XDG_CACHE_HOME"] = str(subdirs["xdg_cache"])
     clean["TMPDIR"] = str(subdirs["tmp"])
     clean["TESTBENCH_SCRATCH_DIR"] = str(subdirs["tmp"])
+    clean["CARGO_HOME"] = str(subdirs["cargo_home"])
+    clean["CARGO_TARGET_DIR"] = str(subdirs["cargo_target"])
+    if (u_home / ".rustup").is_dir():
+        clean["RUSTUP_HOME"] = str(u_home / ".rustup")
+    if (u_home / ".cache" / "uv").is_dir():
+        clean["UV_CACHE_DIR"] = str(u_home / ".cache" / "uv")
+    if (u_home / ".local" / "share" / "uv" / "python").is_dir():
+        clean["UV_PYTHON_INSTALL_DIR"] = str(u_home / ".local" / "share" / "uv" / "python")
+    # Ensure standard toolchains (/Users/sein/.local/bin, /opt/homebrew/bin) are reachable
+    cur_path = clean.get("PATH", "/usr/bin:/bin")
+    for extra_bin in (str(u_home / ".local" / "bin"), "/opt/homebrew/bin"):
+        if extra_bin not in cur_path.split(":"):
+            cur_path = f"{extra_bin}:{cur_path}"
+    clean["PATH"] = cur_path
     clean["HERMES_HOME"] = str(fake_hermes)
     clean["HERMES_TMUX"] = "0"
     clean["HXMAIL_DB"] = str(subdirs["tmp"] / "mail.db")
@@ -371,13 +453,9 @@ def run_isolated_command(
     nonce = os.urandom(6).hex()
     sandbox_dir = sroot / f"tbw-{nonce[:8]}"
     # Keep Unix domain socket paths well under macOS sockaddr_un.sun_path (104 bytes)
-    tmux_socket = f"s{nonce[:5]}" if needs_tmux else ""
-    short_tmux_base = sroot
-    if needs_tmux and len(str(sroot)) > 52:
-        cand_short = real_user_home() / ".hermes" / "cache" / "scratch"
-        if cand_short.is_dir() and os.access(str(cand_short), os.W_OK):
-            short_tmux_base = cand_short
-    tmux_tmpdir: Optional[Path] = (short_tmux_base / f"tbt-{nonce[:6]}") if needs_tmux else None
+    tmux_socket = f"s{nonce[:4]}" if needs_tmux else ""
+    short_tmux_base = short_writable_tmux_base(sroot) if needs_tmux else sroot
+    tmux_tmpdir: Optional[Path] = (short_tmux_base / f"tx{nonce[:5]}") if needs_tmux else None
 
     env = build_isolated_env(
         sandbox_dir,
