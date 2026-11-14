@@ -5,6 +5,7 @@ Architectural choices for Hermes TestBench (`hermes_testbench`). Managed with th
 <!-- adr-index:start -->
 | ID | Status | Date | Decision |
 |---|---|---|---|
+| 0004 | accepted | 2026-11-14 | [In-stream secret redaction before disk write and strict schema-sanitize-reporting separation](0004-in-stream-secret-redaction-before-disk-write-and-strict-sche.md) |
 | 0003 | accepted | 2026-11-14 | [Restrained borderless hx:testbench TUI and permanent auxiliary tmux window semantics](0003-restrained-borderless-hx-testbench-tui-and-permanent-auxilia.md) |
 | 0002 | accepted | 2026-11-14 | [Local stdio MCP server with project trust registry and Seatbelt sandbox over in-process plugins](0002-local-stdio-mcp-server-with-project-trust-registry-and-seatb.md) |
 | 0001 | accepted | 2026-11-14 | [Single stdlib core engine and WAL SQLite store backing CLI, MCP, skill, and tmux TUI](0001-single-stdlib-core-engine-and-wal-sqlite-store-backing-cli-m.md) |
