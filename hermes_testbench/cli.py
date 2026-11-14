@@ -70,7 +70,6 @@ def build_parser() -> argparse.ArgumentParser:
     brun.add_argument("--repeats", type=int, default=5)
     brun.add_argument("--timeout", type=float, default=120.0)
     brun.add_argument("--json", action="store_true")
-    brun.add_argument("cmd", nargs=argparse.REMAINDER, help="Command after -- (or omit to run benchmark profile)")
     bcomp = bsub.add_parser("compare", help="Compare two benchmark run IDs")
     bcomp.add_argument("baseline_run_id")
     bcomp.add_argument("candidate_run_id")
@@ -121,8 +120,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    raw_argv = list(argv if argv is not None else sys.argv[1:])
+    extra_cmd: List[str] = []
+    if "--" in raw_argv:
+        sep = raw_argv.index("--")
+        extra_cmd = raw_argv[sep + 1 :]
+        raw_argv = raw_argv[:sep]
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
     if not args.command:
         parser.print_help()
         return 2
@@ -313,10 +318,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             if args.command == "bench":
                 from .benchmark import compare_benchmarks, format_benchmark_comparison, run_workload  # type: ignore
+                from .discovery import detect_git_metadata
                 if args.bench_action == "run":
-                    cmd_argv = list(args.cmd)
-                    if cmd_argv and cmd_argv[0] == "--":
-                        cmd_argv = cmd_argv[1:]
+                    cmd_argv = list(extra_cmd)
                     target = Path(args.path).expanduser().resolve(strict=True)
                     if not cmd_argv:
                         rec = eng.run_sync(target, profile="benchmark")
@@ -325,12 +329,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                         else:
                             print(format_terminal_summary(rec))
                         return 0 if rec.status in (RunStatus.PASS, RunStatus.SKIP) else 1
+                    rev, _br = detect_git_metadata(target)
                     rec, payload = run_workload(
                         args.name,
                         cmd_argv,
                         cwd=target,
                         store=store,
                         project=target.name,
+                        revision=rev,
                         warmup=args.warmup,
                         repeats=args.repeats,
                         timeout_s=args.timeout,
@@ -344,7 +350,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             f"p50={st.get('p50_ms', 0):.2f}ms p95={st.get('p95_ms', 0):.2f}ms "
                             f"iqr={st.get('iqr_ms', 0):.2f}ms (n={st.get('runs', 0)})"
                         )
-                    return 0
+                    return 0 if rec.status == RunStatus.PASS else 1
                 if args.bench_action == "compare":
                     rows = store.list_benchmarks(limit=200)
                     by_run = {r["run_id"]: r["payload"] for r in rows}

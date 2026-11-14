@@ -296,11 +296,11 @@ def build_isolated_env(
     os.chmod(str(sandbox_dir), 0o700)
     subdirs = {}
     dir_names = {
-        "home": "h",
+        "home": "home",
         "xdg_config": "xc",
         "xdg_data": "xd",
         "xdg_cache": "xk",
-        "tmp": "t",
+        "tmp": "tmp",
         "tmux_tmp": "tx",
         "cargo_home": "ch",
         "cargo_target": "ct",

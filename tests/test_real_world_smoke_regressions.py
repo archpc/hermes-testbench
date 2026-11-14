@@ -225,6 +225,65 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
         self.assertEqual(rc2, 0)
         self.assertIn("line two", buf2.getvalue())
 
+    def test_cli_bench_run_parses_options_before_double_dash_and_compares_runs(self) -> None:
+        tb_home = self.root / "bench_cli_home"
+        from contextlib import redirect_stdout
+        b1 = io.StringIO()
+        with redirect_stdout(b1):
+            rc1 = cli_main(
+                [
+                    "--home",
+                    str(tb_home),
+                    "bench",
+                    "run",
+                    str(Path(__file__).resolve().parent.parent),
+                    "--name",
+                    "noop-py",
+                    "--warmup",
+                    "0",
+                    "--repeats",
+                    "2",
+                    "--",
+                    "/Users/sein/.local/bin/python3.14",
+                    "-c",
+                    "x = sum(range(1000))",
+                ]
+            )
+        self.assertEqual(rc1, 0, b1.getvalue())
+        self.assertIn("noop-py", b1.getvalue())
+        rid1 = b1.getvalue().split()[1]
+
+        b2 = io.StringIO()
+        with redirect_stdout(b2):
+            rc2 = cli_main(
+                [
+                    "--home",
+                    str(tb_home),
+                    "bench",
+                    "run",
+                    str(Path(__file__).resolve().parent.parent),
+                    "--name",
+                    "noop-py",
+                    "--warmup",
+                    "0",
+                    "--repeats",
+                    "2",
+                    "--",
+                    "/Users/sein/.local/bin/python3.14",
+                    "-c",
+                    "x = sum(range(1000))",
+                ]
+            )
+        self.assertEqual(rc2, 0)
+        rid2 = b2.getvalue().split()[1]
+
+        bc = io.StringIO()
+        with redirect_stdout(bc):
+            rc_cmp = cli_main(["--home", str(tb_home), "bench", "compare", rid1, rid2])
+        self.assertEqual(rc_cmp, 0)
+        self.assertIn("noop-py", bc.getvalue())
+        self.assertIn("p50_ms", bc.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
