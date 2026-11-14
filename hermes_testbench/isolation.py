@@ -240,6 +240,7 @@ def build_seatbelt_profile(
     rules = [
         "(version 1)",
         "(allow default)",
+        '(allow process-exec (literal "/bin/ps") (with no-sandbox))',
     ]
     if not allow_network:
         rules.append("(deny network*)")

@@ -123,6 +123,18 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
         self.assertEqual(r_net.exit_code, 0, r_net.stderr_text)
         self.assertIn("LOOP=ok DASH_BLOCKED=True EXT_BLOCKED=True", r_net.stdout_text)
 
+        # Verify macOS setuid /bin/ps works inside Seatbelt (needed by hermes-tmux job/lock checks)
+        r_ps = run_isolated_command(
+            ["/bin/ps", "-o", "pid=", "-p", str(os.getpid())],
+            cwd=self.root,
+            evidence_dir=self.root / "ev_ps",
+            step_name="ps_seatbelt",
+            run_id="tb_ps_sb",
+            scratch_root=self.root,
+        )
+        self.assertEqual(r_ps.exit_code, 0, r_ps.stderr_text)
+        self.assertEqual(r_ps.stdout_text.strip(), str(os.getpid()))
+
     def test_discovery_handles_cargo_lock_sibling_c_sqlite_cobol_harness_and_verify_docs_arg(self) -> None:
         proj = self.root / "poly"
         proj.mkdir()
