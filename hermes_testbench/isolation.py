@@ -294,8 +294,19 @@ def build_isolated_env(
     sandbox_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(str(sandbox_dir), 0o700)
     subdirs = {}
-    for sub in ("home", "xdg_config", "xdg_data", "xdg_cache", "tmp", "tmux_tmp", "cargo_home", "cargo_target", "uv_cache"):
-        d = sandbox_dir / sub
+    dir_names = {
+        "home": "h",
+        "xdg_config": "xc",
+        "xdg_data": "xd",
+        "xdg_cache": "xk",
+        "tmp": "t",
+        "tmux_tmp": "tx",
+        "cargo_home": "ch",
+        "cargo_target": "ct",
+        "uv_cache": "uv",
+    }
+    for sub, short in dir_names.items():
+        d = sandbox_dir / short
         d.mkdir(parents=True, exist_ok=True)
         os.chmod(str(d), 0o700)
         subdirs[sub] = d
@@ -352,7 +363,7 @@ def build_isolated_env(
         clean["UV_PYTHON_INSTALL_DIR"] = str(u_home / ".local" / "share" / "uv" / "python")
     # Ensure standard toolchains (/Users/sein/.local/bin, /opt/homebrew/bin) are reachable
     cur_path = clean.get("PATH", "/usr/bin:/bin")
-    for extra_bin in (str(u_home / ".local" / "bin"), "/opt/homebrew/bin"):
+    for extra_bin in (str(u_home / ".local" / "bin"), "/opt/homebrew/bin", "/usr/sbin"):
         if extra_bin not in cur_path.split(":"):
             cur_path = f"{extra_bin}:{cur_path}"
     clean["PATH"] = cur_path
@@ -453,7 +464,7 @@ def run_isolated_command(
     sroot = (scratch_root.expanduser().resolve() if scratch_root else default_scratch_root())
     sroot.mkdir(parents=True, exist_ok=True)
     nonce = os.urandom(6).hex()
-    sandbox_dir = sroot / f"tbw-{nonce[:8]}"
+    sandbox_dir = sroot / f"tbw-{nonce[:4]}"
     # Keep Unix domain socket paths well under macOS sockaddr_un.sun_path (104 bytes)
     tmux_socket = f"s{nonce[:4]}" if needs_tmux else ""
     short_tmux_base = short_writable_tmux_base(sroot) if needs_tmux else sroot
