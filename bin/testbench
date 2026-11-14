@@ -1,0 +1,15 @@
+#!/Users/sein/.local/bin/python3.14
+"""Standalone launcher for Hermes TestBench (pinned to Python >=3.11 for tomllib)."""
+
+import os
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from hermes_testbench.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

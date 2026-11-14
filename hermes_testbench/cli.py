@@ -1,0 +1,397 @@
+"""Standalone CLI for Hermes TestBench."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict
+import json
+from pathlib import Path
+import sys
+from typing import List, Optional
+
+from .engine import AuthorizationError, TestBenchEngine
+from .reporting import format_terminal_summary, render_junit_xml, render_run_json
+from .schema import RunStatus
+from .store import TestBenchStore
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="testbench",
+        description="Hermes TestBench: isolated testing, benchmarking, and verification CLI.",
+    )
+    p.add_argument("--home", default="", help="Override TESTBENCH_HOME store directory")
+    sub = p.add_subparsers(dest="command")
+
+    disc = sub.add_parser("discover", help="Discover capabilities, suites, and profiles in a repository")
+    disc.add_argument("path", nargs="?", default=".")
+    disc.add_argument("--json", action="store_true")
+
+    runp = sub.add_parser("run", help="Execute a test profile or named suites in isolation")
+    runp.add_argument("path", nargs="?", default=".")
+    runp.add_argument("--profile", default="unit")
+    runp.add_argument("--suite", action="append", default=[], help="Specific suite name (repeatable)")
+    runp.add_argument("--async", dest="async_run", action="store_true", help="Detach background worker")
+    runp.add_argument("--wait", type=float, default=0.5, help="Seconds to wait when --async is used")
+    runp.add_argument("--timeout", type=float, default=None, help="Per-suite timeout override (s)")
+    runp.add_argument("--allow-billable", action="store_true", help="Explicitly permit billable model-backed suites")
+    runp.add_argument("--max-tokens", type=int, default=0, help="Token budget required with --allow-billable")
+    runp.add_argument("--json", action="store_true")
+
+    statp = sub.add_parser("status", help="Show active and recent TestBench runs")
+    statp.add_argument("run_id", nargs="?", default="")
+    statp.add_argument("--project", default="")
+    statp.add_argument("--limit", type=int, default=15)
+    statp.add_argument("--json", action="store_true")
+
+    resp = sub.add_parser("results", help="Inspect persisted run results without rerunning tests")
+    resp.add_argument("run_id", nargs="?", default="")
+    resp.add_argument("--last", action="store_true", help="Show most recent run")
+    resp.add_argument("--project", default="")
+    resp.add_argument("--format", choices=["text", "json", "junit"], default="text")
+
+    reprop = sub.add_parser("reproduce", help="Print or replay reproduction instructions for a run")
+    reprop.add_argument("run_id")
+    reprop.add_argument("--print-only", action="store_true")
+    reprop.add_argument("--json", action="store_true")
+
+    canp = sub.add_parser("cancel", help="Cancel a TestBench-owned active run")
+    canp.add_argument("run_id")
+    canp.add_argument("--json", action="store_true")
+
+    bench = sub.add_parser("bench", help="Run or compare reproducible benchmarks")
+    bsub = bench.add_subparsers(dest="bench_action")
+    brun = bsub.add_parser("run", help="Run a benchmark workload")
+    brun.add_argument("path", nargs="?", default=".")
+    brun.add_argument("--name", default="workload")
+    brun.add_argument("--warmup", type=int, default=1)
+    brun.add_argument("--repeats", type=int, default=5)
+    brun.add_argument("--timeout", type=float, default=120.0)
+    brun.add_argument("--json", action="store_true")
+    brun.add_argument("cmd", nargs=argparse.REMAINDER, help="Command after -- (or omit to run benchmark profile)")
+    bcomp = bsub.add_parser("compare", help="Compare two benchmark run IDs")
+    bcomp.add_argument("baseline_run_id")
+    bcomp.add_argument("candidate_run_id")
+    bcomp.add_argument("--json", action="store_true")
+    blist = bsub.add_parser("list", help="List recorded benchmarks")
+    blist.add_argument("--project", default="")
+    blist.add_argument("--json", action="store_true")
+
+    projp = sub.add_parser("projects", help="Manage registered projects")
+    psub = projp.add_subparsers(dest="proj_action")
+    plist = psub.add_parser("list", help="List registered projects")
+    plist.add_argument("--json", action="store_true")
+    preg = psub.add_parser("register", help="Register a repository path for scoped access")
+    preg.add_argument("path")
+    preg.add_argument("--name", default="")
+    preg.add_argument("--json", action="store_true")
+
+    trustp = sub.add_parser("trust", help="Trust a repository's current .testbench.toml SHA-256")
+    trustp.add_argument("path", nargs="?", default=".")
+    trustp.add_argument("--json", action="store_true")
+
+    prunep = sub.add_parser("prune", help="Prune old unpinned run artifacts")
+    prunep.add_argument("--keep-last", type=int, default=50)
+    prunep.add_argument("--older-than-days", type=int, default=None)
+    prunep.add_argument("--dry-run", action="store_true")
+    prunep.add_argument("--json", action="store_true")
+
+    msgp = sub.add_parser("messaging-verify", help="Run offline agent-messaging verification suite")
+    msgp.add_argument("--hermes-pytest", action="store_true", help="Also run Hermes offline bot_mode_dm pytest suite")
+    msgp.add_argument("--json", action="store_true")
+
+    tuip = sub.add_parser("tui", help="Launch interactive terminal UI (hx:testbench)")
+    tuip.add_argument("--quit-on-q", action="store_true", help="Exit on lowercase q at top level")
+    tuip.add_argument("--project", default="", help="Initial project filter")
+
+    sub.add_parser("mcp", help="Run local stdio MCP server")
+
+    workp = sub.add_parser("_worker", help=argparse.SUPPRESS)
+    workp.add_argument("--run-id", required=True)
+    workp.add_argument("--project-root", required=True)
+    workp.add_argument("--profile", default="unit")
+    workp.add_argument("--suite", action="append", default=[])
+    workp.add_argument("--allow-billable", action="store_true")
+    workp.add_argument("--max-tokens", type=int, default=0)
+    workp.add_argument("--timeout", type=float, default=None)
+
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return 2
+
+    home = Path(args.home).expanduser() if args.home else None
+
+    if args.command == "mcp":
+        from .mcp_server import serve_stdio
+        with TestBenchStore(home) as store:
+            eng = TestBenchEngine(store)
+            return serve_stdio(eng)
+
+    if args.command == "tui":
+        from .tui import run_tui  # type: ignore
+        return run_tui(home=home, permanent_tab=not args.quit_on_q, initial_project=args.project or None)
+
+    try:
+        with TestBenchStore(home) as store:
+            eng = TestBenchEngine(store)
+
+            if args.command == "_worker":
+                return eng.run_worker(
+                    run_id=args.run_id,
+                    project_root=Path(args.project_root),
+                    profile=args.profile,
+                    suite_names=args.suite or None,
+                    allow_billable=args.allow_billable,
+                    max_tokens=args.max_tokens,
+                    timeout_s=args.timeout,
+                )
+
+            if args.command == "discover":
+                spec = eng.discover(Path(args.path))
+                if args.json:
+                    print(json.dumps(asdict(spec), indent=2, sort_keys=True))
+                else:
+                    print(f"project:   {spec.name} ({spec.root})")
+                    print(f"revision:  {spec.revision or '-'}  branch: {spec.branch or '-'}  trusted: {spec.trusted}")
+                    print(f"languages: {', '.join(spec.languages) or 'auto'}")
+                    for s in spec.suites:
+                        flags = []
+                        if s.needs_tmux:
+                            flags.append("tmux")
+                        if s.needs_pty:
+                            flags.append("pty")
+                        if s.billable:
+                            flags.append("billable-opt-in")
+                        fstr = f" ({','.join(flags)})" if flags else ""
+                        print(f"  - [{s.profile}] {s.name} ({s.adapter}){fstr}: {' '.join(s.command)}")
+                return 0
+
+            if args.command == "run":
+                if args.async_run:
+                    rec = eng.spawn_async(
+                        Path(args.path),
+                        profile=args.profile,
+                        suite_names=args.suite or None,
+                        allow_billable=args.allow_billable,
+                        max_tokens=args.max_tokens,
+                        timeout_s=args.timeout,
+                        wait_up_to_s=args.wait,
+                    )
+                else:
+                    rec = eng.run_sync(
+                        Path(args.path),
+                        profile=args.profile,
+                        suite_names=args.suite or None,
+                        allow_billable=args.allow_billable,
+                        max_tokens=args.max_tokens,
+                        timeout_s=args.timeout,
+                    )
+                if args.json:
+                    sys.stdout.write(render_run_json(rec))
+                else:
+                    print(format_terminal_summary(rec))
+                if args.async_run and rec.status in RunStatus.ACTIVE:
+                    return 0
+                return 0 if rec.status in (RunStatus.PASS, RunStatus.SKIP) else 1
+
+            if args.command == "status":
+                if args.run_id:
+                    rec = store.get_run(args.run_id)
+                    if rec is None:
+                        sys.stderr.write(f"testbench: unknown run_id {args.run_id}\n")
+                        return 1
+                    if args.json:
+                        sys.stdout.write(render_run_json(rec))
+                    else:
+                        print(format_terminal_summary(rec))
+                    return 0
+                runs = store.list_runs(project=args.project or None, limit=args.limit)
+                if args.json:
+                    print(
+                        json.dumps(
+                            [{"run_id": r.run_id, "project": r.project, "profile": r.profile, "status": r.status, "duration_ms": r.duration_ms} for r in runs],
+                            indent=2,
+                        )
+                    )
+                elif not runs:
+                    print("no TestBench runs recorded")
+                else:
+                    for r in runs:
+                        print(format_terminal_summary(r))
+                return 0
+
+            if args.command == "results":
+                rec = None
+                if args.run_id:
+                    rec = store.get_run(args.run_id)
+                else:
+                    recent = store.list_runs(project=args.project or None, limit=1)
+                    rec = recent[0] if recent else None
+                if rec is None:
+                    sys.stderr.write("testbench: no matching run found\n")
+                    return 1
+                if args.format == "json":
+                    sys.stdout.write(render_run_json(rec))
+                elif args.format == "junit":
+                    sys.stdout.write(render_junit_xml(rec))
+                else:
+                    print(format_terminal_summary(rec))
+                return 0
+
+            if args.command == "reproduce":
+                out = eng.reproduce(args.run_id, print_only=args.print_only)
+                if args.json:
+                    print(json.dumps(out, indent=2, sort_keys=True))
+                elif args.print_only:
+                    print(out["repro_command"])
+                else:
+                    print(f"{out['status']} {out['repro_run_id']} (from {out['source_run_id']})  evidence={out['evidence_dir']}")
+                return 0 if args.print_only or out.get("status") in (RunStatus.PASS, RunStatus.SKIP) else 1
+
+            if args.command == "cancel":
+                rec = eng.cancel(args.run_id)
+                if args.json:
+                    sys.stdout.write(render_run_json(rec))
+                else:
+                    print(format_terminal_summary(rec))
+                return 0
+
+            if args.command == "trust":
+                info = store.trust_project(Path(args.path))
+                if args.json:
+                    print(json.dumps(info, indent=2, sort_keys=True))
+                else:
+                    print(f"trusted {info['name']} ({info['project_root']}) sha256={info['manifest_sha256']}")
+                return 0
+
+            if args.command == "projects":
+                if args.proj_action == "register":
+                    info = store.register_project(Path(args.path), name=args.name or None)
+                    if args.json:
+                        print(json.dumps(info, indent=2, sort_keys=True))
+                    else:
+                        print(f"registered {info['name']} ({info['project_root']})")
+                    return 0
+                rows = store.list_projects()
+                if args.json:
+                    print(json.dumps(rows, indent=2, sort_keys=True))
+                elif not rows:
+                    print("no registered projects")
+                else:
+                    for r in rows:
+                        t_str = "trusted" if r["trusted"] else "sandbox"
+                        print(f"{r['name']:<26} {t_str:<8} {r['project_root']}")
+                return 0
+
+            if args.command == "prune":
+                removed = store.prune_runs(
+                    keep_last=args.keep_last,
+                    older_than_days=args.older_than_days,
+                    dry_run=args.dry_run,
+                )
+                if args.json:
+                    print(json.dumps({"removed": removed, "dry_run": args.dry_run}, indent=2))
+                else:
+                    verb = "would prune" if args.dry_run else "pruned"
+                    print(f"testbench: {verb} {len(removed)} run(s)")
+                return 0
+
+            if args.command == "bench":
+                from .benchmark import compare_benchmarks, format_benchmark_comparison, run_workload  # type: ignore
+                if args.bench_action == "run":
+                    cmd_argv = list(args.cmd)
+                    if cmd_argv and cmd_argv[0] == "--":
+                        cmd_argv = cmd_argv[1:]
+                    target = Path(args.path).expanduser().resolve(strict=True)
+                    if not cmd_argv:
+                        rec = eng.run_sync(target, profile="benchmark")
+                        if args.json:
+                            sys.stdout.write(render_run_json(rec))
+                        else:
+                            print(format_terminal_summary(rec))
+                        return 0 if rec.status in (RunStatus.PASS, RunStatus.SKIP) else 1
+                    rec, payload = run_workload(
+                        args.name,
+                        cmd_argv,
+                        cwd=target,
+                        store=store,
+                        project=target.name,
+                        warmup=args.warmup,
+                        repeats=args.repeats,
+                        timeout_s=args.timeout,
+                    )
+                    if args.json:
+                        print(json.dumps(payload, indent=2, sort_keys=True))
+                    else:
+                        st = payload.get("stats", {})
+                        print(
+                            f"BENCH {rec.run_id} {target.name}:{args.name}  "
+                            f"p50={st.get('p50_ms', 0):.2f}ms p95={st.get('p95_ms', 0):.2f}ms "
+                            f"iqr={st.get('iqr_ms', 0):.2f}ms (n={st.get('runs', 0)})"
+                        )
+                    return 0
+                if args.bench_action == "compare":
+                    rows = store.list_benchmarks(limit=200)
+                    by_run = {r["run_id"]: r["payload"] for r in rows}
+                    if args.baseline_run_id not in by_run or args.candidate_run_id not in by_run:
+                        sys.stderr.write("testbench bench compare: run_id not found in benchmarks table\n")
+                        return 1
+                    comp = compare_benchmarks(by_run[args.baseline_run_id], by_run[args.candidate_run_id])
+                    if args.json:
+                        print(json.dumps(comp, indent=2, sort_keys=True))
+                    else:
+                        print(format_benchmark_comparison(comp))
+                    return 0
+                rows = store.list_benchmarks(project=args.project or None, limit=30)
+                if args.json:
+                    print(json.dumps(rows, indent=2, sort_keys=True))
+                elif not rows:
+                    print("no benchmarks recorded")
+                else:
+                    for r in rows:
+                        print(f"{r['run_id']}  {r['project']}:{r['workload']}  median={r['median_ms']}ms  rev={r['revision']}")
+                return 0
+
+            if args.command == "messaging-verify":
+                from .messaging_suite import run_agent_messaging_verification  # type: ignore
+                from .schema import RunRecord, new_run_id, utc_now_iso
+                import time as _time
+                rid = new_run_id()
+                now = utc_now_iso()
+                art_root = Path("/Users/sein/.hermes/artifacts/agent-messaging")
+                run = RunRecord(
+                    run_id=rid,
+                    project="agent-messaging",
+                    project_root=str(art_root if art_root.exists() else Path.cwd()),
+                    revision="verified",
+                    profile="verification",
+                    status=RunStatus.RUNNING,
+                    created_at=now,
+                    started_at=now,
+                )
+                store.create_run(run)
+                t0 = _time.monotonic()
+                with store.hold_run_lock(rid):
+                    suites = run_agent_messaging_verification(
+                        store.run_dir(rid),
+                        artifact_root=art_root if art_root.exists() else None,
+                        hermes_agent_root=Path("/Users/sein/.hermes/hermes-agent"),
+                        run_hermes_pytest=args.hermes_pytest,
+                    )
+                    done = eng._populate_and_finalize(run, suites, [], t0)
+                if args.json:
+                    sys.stdout.write(render_run_json(done))
+                else:
+                    print(format_terminal_summary(done))
+                return 0 if done.status in (RunStatus.PASS, RunStatus.SKIP) else 1
+
+    except (AuthorizationError, KeyError, ValueError) as exc:
+        sys.stderr.write(f"testbench error: {exc}\n")
+        return 1
+    return 2
