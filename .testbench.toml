@@ -1,0 +1,57 @@
+[project]
+name = "hermes-testbench"
+languages = ["python"]
+
+[[suite]]
+name = "core-unit"
+adapter = "python_unittest"
+profile = "unit"
+command = ["/Users/sein/.local/bin/python3.14", "-W", "default", "-m", "unittest", "tests.test_schema", "tests.test_sanitize", "tests.test_reporting", "tests.test_store", "tests.test_discovery_and_adapters", "tests.test_tui_render", "tests.test_skill_and_agent_eval", "-v"]
+timeout_s = 120.0
+description = "Fast deterministic core, adapter, parser, store, and TUI state-machine unit tests"
+
+[[suite]]
+name = "engine-mcp-messaging-integration"
+adapter = "python_unittest"
+profile = "integration"
+command = ["/Users/sein/.local/bin/python3.14", "-W", "default", "-m", "unittest", "tests.test_engine_and_cli", "tests.test_mcp_server", "tests.test_messaging_suite", "tests.test_fixtures_and_bench", "tests.test_real_world_smoke_regressions", "-v"]
+timeout_s = 180.0
+needs_tmux = true
+description = "Engine, CLI, stdio MCP 2.0 protocol, SQLite WAL contention, and offline agent-messaging suites"
+
+[[suite]]
+name = "tui-pty-and-tmux"
+adapter = "python_unittest"
+profile = "terminal"
+command = ["/Users/sein/.local/bin/python3.14", "-W", "default", "-m", "unittest", "tests.test_tui_render", "tests.test_tui_pty", "-v"]
+timeout_s = 120.0
+needs_tmux = true
+description = "Borderless 4-band TUI rendering, real PTY SIGWINCH resize, live refresh, and permanent-tab guards"
+
+[[suite]]
+name = "isolation-and-redaction-security"
+adapter = "python_unittest"
+profile = "security"
+command = ["/Users/sein/.local/bin/python3.14", "-W", "default", "-m", "unittest", "tests.test_sanitize", "tests.test_isolation", "-v"]
+timeout_s = 120.0
+needs_tmux = true
+description = "In-stream secret redaction, Seatbelt effective permissions, symlink-safe cleanup, and pgid termination"
+
+[[suite]]
+name = "full-regression"
+adapter = "python_unittest"
+profile = "regression"
+command = ["/Users/sein/.local/bin/python3.14", "-W", "default", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"]
+timeout_s = 300.0
+needs_tmux = true
+description = "Complete TestBench regression suite"
+
+[[suite]]
+name = "fresh-session-skill-eval"
+adapter = "agent_eval"
+profile = "agent-eval"
+command = ["/Users/sein/.local/bin/python3.14", "scripts/agent_eval_probe.py"]
+timeout_s = 240.0
+billable = true
+allow_network = true
+description = "Opt-in bounded fresh-session Hermes skill verification evaluating observable outcomes and state.db usage"
