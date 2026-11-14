@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -489,3 +491,555 @@ class DiscoverProjectMultiLanguageTests(unittest.TestCase):
         (root / "vendor" / "lib_selftest.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
         spec = discover_project(root)
         self.assertEqual(spec.suites, [])
+
+
+def _isolated_result(
+    command,
+    *,
+    exit_code: int | None = 0,
+    stdout_text: str = "",
+    stderr_text: str = "",
+    timed_out: bool = False,
+    cancelled: bool = False,
+):
+    from hermes_testbench.isolation import IsolatedExecResult
+
+    return IsolatedExecResult(
+        command=list(command),
+        cwd=".",
+        exit_code=exit_code,
+        signal_num=None,
+        duration_ms=1.5,
+        timed_out=timed_out,
+        cancelled=cancelled,
+        stdout_text=stdout_text,
+        stderr_text=stderr_text,
+        stdout_path="/nonexistent/stdout.log",
+        stderr_path="/nonexistent/stderr.log",
+        sanitized_path="/nonexistent/sanitized.log",
+        isolation_meta={"seatbelt": "active"},
+    )
+
+
+def _suite(**kwargs):
+    from hermes_testbench.schema import SuiteSpec
+
+    params = {
+        "name": "unit",
+        "adapter": "shell",
+        "profile": "unit",
+        "command": ["/usr/bin/true"],
+    }
+    params.update(kwargs)
+    return SuiteSpec(**params)
+
+
+class ExecuteSuitePolicyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from unittest import mock
+
+        import hermes_testbench.adapters as adapters_mod
+
+        self.adapters = adapters_mod
+        self.root = _tmpdir()
+        self.evidence = _tmpdir("tb-ev-")
+        self._patcher = mock.patch.object(
+            adapters_mod, "run_isolated_command", side_effect=self._fake_run
+        )
+        self.run_mock = self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+        self.fake_kwargs: dict = {}
+
+    def _fake_run(self, command, **kwargs):
+        self.fake_kwargs = dict(kwargs)
+        return _isolated_result(command, stdout_text="TB-PASS shell:unit\n1 passed, 0 skipped, 0 failed\n")
+
+    def _exec(self, suite, **kwargs):
+        return self.adapters.execute_suite(
+            suite,
+            project_root=self.root,
+            evidence_dir=self.evidence,
+            run_id="tb_policy",
+            **kwargs,
+        )
+
+    def test_billable_suite_without_approval_is_blocked_before_spawn(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        result, usage = self._exec(_suite(billable=True))
+        self.assertEqual(result.status, RunStatus.BLOCKED)
+        self.assertEqual(result.blocked_count, 1)
+        self.assertEqual(result.total_count, 1)
+        self.assertIsNone(usage)
+        self.assertEqual(self.run_mock.call_count, 0)
+        self.assertIn("billable", result.summary_excerpt.lower())
+
+    def test_billable_suite_with_approval_but_no_token_budget_is_blocked(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        result, _usage = self._exec(_suite(billable=True), allow_billable=True, max_tokens=0)
+        self.assertEqual(result.status, RunStatus.BLOCKED)
+        self.assertEqual(self.run_mock.call_count, 0)
+
+    def test_billable_suite_runs_when_approved_with_budget(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        result, _usage = self._exec(
+            _suite(billable=True), allow_billable=True, max_tokens=1000
+        )
+        self.assertNotEqual(result.status, RunStatus.BLOCKED)
+        self.assertEqual(self.run_mock.call_count, 1)
+
+    def test_untrusted_custom_manifest_network_request_is_blocked(self) -> None:
+        from hermes_testbench.schema import FailureKind, RunStatus
+
+        suite = _suite(custom_from_manifest=True, allow_network=True)
+        result, _usage = self._exec(suite, trusted_manifest=False)
+        self.assertEqual(result.status, RunStatus.BLOCKED)
+        self.assertEqual(result.blocked_count, 1)
+        self.assertEqual(len(result.failures), 1)
+        self.assertEqual(result.failures[0].kind, FailureKind.UNTRUSTED_MANIFEST)
+        self.assertEqual(self.run_mock.call_count, 0)
+
+    def test_untrusted_custom_manifest_repo_write_is_blocked(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        suite = _suite(custom_from_manifest=True, allow_repo_write=True)
+        result, _usage = self._exec(suite, trusted_manifest=False)
+        self.assertEqual(result.status, RunStatus.BLOCKED)
+        self.assertEqual(self.run_mock.call_count, 0)
+
+    def test_trusted_manifest_allows_network_and_repo_write(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        suite = _suite(custom_from_manifest=True, allow_network=True, allow_repo_write=True)
+        result, _usage = self._exec(suite, trusted_manifest=True)
+        self.assertEqual(result.status, RunStatus.PASS)
+        self.assertEqual(self.run_mock.call_count, 1)
+
+    def test_non_manifest_suite_is_not_gated_on_network(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        result, _usage = self._exec(_suite(allow_network=True), trusted_manifest=False)
+        self.assertEqual(result.status, RunStatus.PASS)
+        self.assertEqual(self.run_mock.call_count, 1)
+
+    def test_missing_required_binary_skips_suite(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        result, usage = self._exec(
+            _suite(required_binaries=["definitely-not-a-real-binary-xyz"])
+        )
+        self.assertEqual(result.status, RunStatus.SKIP)
+        self.assertEqual(result.skip_count, 1)
+        self.assertEqual(result.total_count, 1)
+        self.assertIsNone(usage)
+        self.assertEqual(self.run_mock.call_count, 0)
+        self.assertIn("definitely-not-a-real-binary-xyz", result.summary_excerpt)
+
+    def test_missing_required_path_skips_suite(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        result, _usage = self._exec(_suite(required_paths=["missing/dir"]))
+        self.assertEqual(result.status, RunStatus.SKIP)
+        self.assertEqual(self.run_mock.call_count, 0)
+
+    def test_suite_without_command_skips(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        result, _usage = self._exec(_suite(command=[]))
+        self.assertEqual(result.status, RunStatus.SKIP)
+        self.assertEqual(self.run_mock.call_count, 0)
+
+    def test_policy_result_records_repro_command_and_timestamps(self) -> None:
+        result, _usage = self._exec(_suite(billable=True))
+        self.assertIn("true", result.repro_command)
+        self.assertTrue(result.started_at)
+        self.assertTrue(result.finished_at)
+        self.assertEqual(result.adapter, "shell")
+
+
+class AdapterParserContractTests(unittest.TestCase):
+    """Captured-text parser behaviour for runners without local toolchains."""
+
+    def test_unittest_ok_with_skips(self) -> None:
+        from hermes_testbench.adapters.parsers import parse_python_unittest
+
+        outcome = parse_python_unittest("Ran 4 tests in 0.010s\n\nOK (skipped=2)\n")
+        self.assertEqual((outcome.total, outcome.passed, outcome.skipped), (4, 2, 2))
+        self.assertTrue(outcome.structured)
+
+    def test_unittest_failed_clause_and_error_headers(self) -> None:
+        from hermes_testbench.adapters.parsers import parse_python_unittest
+
+        text = (
+            "test_a (mod.T.test_a) ... ok\n"
+            "test_b (mod.T.test_b) ... FAIL\n"
+            "test_c (mod.T.test_c) ... ERROR\n"
+            "======================================================================\n"
+            "FAIL: test_b (mod.T.test_b)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            'AssertionError: 1 != 2\n'
+            "======================================================================\n"
+            "ERROR: test_c (mod.T.test_c)\n"
+            "----------------------------------------------------------------------\n"
+            "RuntimeError: boom\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 3 tests in 0.020s\n\n"
+            "FAILED (failures=1, errors=1)\n"
+        )
+        outcome = parse_python_unittest(text)
+        self.assertEqual(outcome.total, 3)
+        self.assertEqual(outcome.passed, 1)
+        self.assertEqual((outcome.failed, outcome.errors), (1, 1))
+        self.assertEqual([f["case_name"] for f in outcome.failures], ["test_b (mod.T.test_b)", "test_c (mod.T.test_c)"])
+        self.assertIn("1 != 2", outcome.failures[0]["message"])
+
+    def test_pytest_summary_and_failed_lines(self) -> None:
+        from hermes_testbench.adapters.parsers import parse_python_pytest
+
+        text = (
+            "tests/test_api.py::test_ok PASSED\n"
+            "tests/test_api.py::test_bad FAILED\n"
+            "========================= 1 failed, 1 passed, 2 skipped in 0.11s =========================\n"
+            "FAILED tests/test_api.py::test_bad - AssertionError: 500 != 200\n"
+        )
+        outcome = parse_python_pytest(text)
+        self.assertEqual((outcome.total, outcome.passed, outcome.failed, outcome.skipped), (4, 1, 1, 2))
+        self.assertEqual(outcome.failures[0]["case_name"], "tests/test_api.py::test_bad")
+
+    def test_sqlite_probe_and_pty_markers(self) -> None:
+        from hermes_testbench.adapters.parsers import parse_pty_tmux, parse_sqlite_probe
+
+        probe = parse_sqlite_probe("PASS: integrity_check\nFAIL: wal_sync\nSKIP: fts5\n")
+        self.assertEqual((probe.total, probe.passed, probe.failed, probe.skipped), (3, 1, 1, 1))
+        tty = parse_pty_tmux("\x1b[32mPASS: resize\x1b[0m\nPASS: detach\n")
+        self.assertEqual((tty.total, tty.passed), (2, 2))
+
+    def test_asan_report_is_a_single_failure(self) -> None:
+        from hermes_testbench.adapters.parsers import parse_c_sanitizer
+
+        text = (
+            "=================================================================\n"
+            "==49278==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x00016eeee186\n"
+            "WRITE of size 1 at 0x00016eeee186 thread T0\n"
+            "SUMMARY: AddressSanitizer: stack-buffer-overflow probe.c:2 in main\n"
+            "==49278==ABORTING\n"
+        )
+        outcome = parse_c_sanitizer(text)
+        self.assertEqual(outcome.failed, 1)
+        self.assertEqual(len(outcome.failures), 1)
+        self.assertIn("stack-buffer-overflow", outcome.failures[0]["message"])
+
+    def test_adapter_parser_map_covers_every_known_adapter(self) -> None:
+        from hermes_testbench.adapters.parsers import ADAPTER_PARSERS
+        from hermes_testbench.discovery import KNOWN_ADAPTERS
+
+        self.assertEqual(set(ADAPTER_PARSERS), set(KNOWN_ADAPTERS))
+        self.assertTrue(all(callable(fn) for fn in ADAPTER_PARSERS.values()))
+
+
+class AdapterExecutionIntegrationTests(unittest.TestCase):
+    """Real executions through execute_suite -> isolation, no mocked runner."""
+
+    def setUp(self) -> None:
+        import hermes_testbench.adapters as adapters_mod
+
+        self.adapters = adapters_mod
+        self.evidence = _tmpdir("tb-ev-int-")
+
+    def _exec(self, suite, root: Path, **kwargs):
+        return self.adapters.execute_suite(
+            suite,
+            project_root=root,
+            evidence_dir=self.evidence,
+            run_id="tb_integration",
+            **kwargs,
+        )
+
+    def test_real_unittest_summary_on_stderr_is_parsed(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        root = _tmpdir()
+        (root / "test_calc.py").write_text(
+            "import unittest\n\n"
+            "class CalcTests(unittest.TestCase):\n"
+            "    def test_add(self):\n"
+            "        self.assertEqual(1 + 1, 2)\n\n"
+            "    def test_broken(self):\n"
+            "        self.assertEqual(2 + 2, 5)\n",
+            encoding="utf-8",
+        )
+        suite = _suite(
+            name="python-unittest",
+            adapter="python_unittest",
+            profile="unit",
+            command=[sys.executable, "-m", "unittest", "test_calc", "-v"],
+        )
+        result, usage = self._exec(suite, root)
+        self.assertIsNone(usage)
+        self.assertEqual(result.status, RunStatus.FAIL)
+        self.assertEqual(result.total_count, 2)
+        self.assertEqual(result.pass_count, 1)
+        self.assertEqual(result.fail_count, 1)
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("test_broken", result.failures[0].case_name)
+        self.assertIn("Ran 2 tests", result.summary_excerpt)
+
+    def test_real_cargo_workspace_sums_every_test_result_block(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        cargo = shutil.which("cargo") or shutil.which("cargo", path="/opt/homebrew/bin")
+        if not cargo:
+            self.skipTest("cargo not installed")
+        root = _tmpdir()
+        (root / "Cargo.toml").write_text(
+            '[workspace]\nmembers = ["alpha", "beta"]\nresolver = "2"\n', encoding="utf-8"
+        )
+        (root / "alpha" / "src").mkdir(parents=True)
+        (root / "alpha" / "Cargo.toml").write_text(
+            '[package]\nname = "alpha"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8"
+        )
+        (root / "alpha" / "src" / "lib.rs").write_text(
+            "#[test]\nfn alpha_ok() { assert_eq!(1 + 1, 2); }\n", encoding="utf-8"
+        )
+        (root / "beta" / "src").mkdir(parents=True)
+        (root / "beta" / "Cargo.toml").write_text(
+            '[package]\nname = "beta"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8"
+        )
+        (root / "beta" / "src" / "lib.rs").write_text(
+            "#[test]\nfn beta_ok() { assert_eq!(2 * 2, 4); }\n\n"
+            "#[test]\nfn beta_bad() { assert_eq!(2 + 2, 5); }\n",
+            encoding="utf-8",
+        )
+        suite = _suite(
+            name="cargo-workspace",
+            adapter="cargo",
+            profile="unit",
+            command=[cargo, "test", "--offline", "--color", "never"],
+            allow_repo_write=True,
+            timeout_s=240.0,
+            env_overrides={"CARGO_TARGET_DIR": "target"},
+        )
+        result, _usage = self._exec(suite, root)
+        self.assertEqual(result.status, RunStatus.FAIL)
+        self.assertEqual(result.total_count, 3)
+        self.assertEqual(result.pass_count, 2)
+        self.assertEqual(result.fail_count, 1)
+        self.assertTrue(any("beta_bad" in f.case_name for f in result.failures), result.failures)
+
+    def test_cargo_parser_sums_multi_crate_blocks_and_names_failures(self) -> None:
+        from hermes_testbench.adapters.parsers import parse_cargo
+
+        text = (
+            "   Compiling alpha v0.1.0\n"
+            "    Finished test [unoptimized]\n"
+            "     Running unittests src/lib.rs (target/debug/deps/alpha-1234)\n"
+            "running 2 tests\n"
+            "test alpha::one ... ok\n"
+            "test alpha::two ... ok\n"
+            "\n"
+            "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+            "\n"
+            "     Running unittests src/lib.rs (target/debug/deps/beta-5678)\n"
+            "running 3 tests\n"
+            "test beta::one ... ok\n"
+            "test beta::two ... FAILED\n"
+            "test beta::three ... ok\n"
+            "\n"
+            "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s\n"
+        )
+        outcome = parse_cargo(text)
+        self.assertTrue(outcome.structured)
+        self.assertEqual(outcome.total, 6)
+        self.assertEqual(outcome.passed, 4)
+        self.assertEqual(outcome.failed, 1)
+        self.assertEqual(outcome.skipped, 1)
+        self.assertEqual([f["case_name"] for f in outcome.failures], ["beta::two"])
+
+    def test_real_asan_clean_selftest_passes(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        clang = shutil.which("clang") or "/usr/bin/clang"
+        if not Path(clang).exists():
+            self.skipTest("clang not installed")
+        root = _tmpdir()
+        (root / "selftest.c").write_text(
+            "#include <stdio.h>\n"
+            "static int add(int a, int b) { return a + b; }\n"
+            "int main(void) {\n"
+            "    if (add(2, 3) != 5) { printf(\"FAIL: add\\n\"); return 1; }\n"
+            "    printf(\"SELFTEST OK\\n\");\n"
+            "    return 0;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        build = subprocess.run(
+            [clang, "-fsanitize=address,undefined", "-g", "-O1", "-o", "selftest", "selftest.c"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(build.returncode, 0, build.stderr)
+        suite = _suite(name="c-selftest", adapter="c_sanitizer", profile="integration", command=["./selftest"])
+        result, _usage = self._exec(suite, root)
+        self.assertEqual(result.status, RunStatus.PASS)
+        self.assertEqual(result.fail_count, 0)
+        self.assertGreaterEqual(result.pass_count, 1)
+
+    def test_real_ubsan_diagnostic_fails_run_even_with_zero_exit(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        clang = shutil.which("clang") or "/usr/bin/clang"
+        if not Path(clang).exists():
+            self.skipTest("clang not installed")
+        root = _tmpdir()
+        (root / "ubsan_probe.c").write_text(
+            "#include <stdio.h>\n"
+            "int main(void) {\n"
+            "    int big = 2147483647;\n"
+            "    big += 1; /* recoverable UBSan signed overflow: exit stays 0 */\n"
+            "    printf(\"value=%d\\n\", big);\n"
+            "    return 0;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        build = subprocess.run(
+            [clang, "-fsanitize=address,undefined", "-g", "-O1", "-o", "ubsan_probe", "ubsan_probe.c"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(build.returncode, 0, build.stderr)
+        suite = _suite(name="c-ubsan", adapter="c_sanitizer", profile="integration", command=["./ubsan_probe"])
+        result, _usage = self._exec(suite, root)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.status, RunStatus.FAIL)
+        self.assertGreaterEqual(result.fail_count, 1)
+        self.assertTrue(
+            any("runtime error" in f.message for f in result.failures), result.failures
+        )
+
+    def test_real_cobol_selftest_compiles_and_runs(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        cobc = shutil.which("cobc") or (shutil.which("cobc", path="/opt/homebrew/bin"))
+        if not cobc:
+            self.skipTest("cobc not installed")
+        root = _tmpdir()
+        (root / "selftest.cob").write_text(
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. selftest.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WS-N PIC 9(2) VALUE 0.\n"
+            "       PROCEDURE DIVISION.\n"
+            "           ADD 1 TO WS-N\n"
+            "           IF WS-N = 1\n"
+            "               DISPLAY \"PASS: counter\"\n"
+            "           ELSE\n"
+            "               DISPLAY \"FAIL: counter\"\n"
+            "           END-IF\n"
+            "           DISPLAY \"TESTS PASSED: 1 / 1\"\n"
+            "           STOP RUN.\n",
+            encoding="utf-8",
+        )
+        build = subprocess.run(
+            [cobc, "-x", "-free", "-o", "selftest", "selftest.cob"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(build.returncode, 0, build.stderr)
+        suite = _suite(name="cobol-selftest", adapter="cobol", profile="unit", command=["./selftest"])
+        result, _usage = self._exec(suite, root)
+        self.assertEqual(result.status, RunStatus.PASS)
+        self.assertEqual(result.total_count, 1)
+        self.assertEqual(result.pass_count, 1)
+        self.assertEqual(result.fail_count, 0)
+
+    def test_real_re_project_skip_line_is_counted_as_skip(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        root = _tmpdir()
+        script = root / "verify_docs.sh"
+        script.write_text("#!/bin/sh\necho 'SKIP: browser toolchain unavailable'\nexit 0\n", encoding="utf-8")
+        script.chmod(0o755)
+        suite = _suite(
+            name="re-verify-docs",
+            adapter="re_project",
+            profile="security",
+            command=["/bin/sh", "verify_docs.sh"],
+        )
+        result, _usage = self._exec(suite, root)
+        self.assertEqual(result.status, RunStatus.PASS)
+        self.assertEqual(result.total_count, 1)
+        self.assertEqual(result.skip_count, 1)
+        self.assertEqual(result.fail_count, 0)
+
+    def test_real_re_project_pass_and_fail_lines_are_attributed(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        root = _tmpdir()
+        (root / "verify.sh").write_text(
+            "#!/bin/sh\n"
+            "echo 'PASS: header anchored'\n"
+            "echo 'PASS endpoint table present'\n"
+            "echo 'FAIL: stale diagram reference'\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        suite = _suite(
+            name="re-verify",
+            adapter="re_project",
+            profile="security",
+            command=["/bin/sh", "verify.sh"],
+        )
+        result, _usage = self._exec(suite, root)
+        self.assertEqual(result.status, RunStatus.FAIL)
+        self.assertEqual(result.total_count, 3)
+        self.assertEqual(result.pass_count, 2)
+        self.assertEqual(result.fail_count, 1)
+        self.assertEqual([f.case_name for f in result.failures], ["stale diagram reference"])
+
+    def test_agent_eval_never_fabricates_usage_without_emitted_line(self) -> None:
+        from hermes_testbench.schema import RunStatus
+
+        root = _tmpdir()
+        (root / "eval.sh").write_text("#!/bin/sh\necho '1 passed, 0 skipped, 0 failed'\nexit 0\n", encoding="utf-8")
+        suite = _suite(
+            name="agent-eval",
+            adapter="agent_eval",
+            profile="agent-eval",
+            command=["/bin/sh", "eval.sh"],
+        )
+        result, usage = self._exec(suite, root)
+        self.assertEqual(result.status, RunStatus.PASS)
+        self.assertIsNone(usage)
+        self.assertNotIn("usage", result.metrics)
+        self.assertNotIn("tokens", result.summary_excerpt.lower())
+        self.assertNotIn("cost", result.summary_excerpt.lower())
+
+    def test_agent_eval_uses_only_verbatim_usage_json(self) -> None:
+        root = _tmpdir()
+        (root / "eval_usage.sh").write_text(
+            "#!/bin/sh\n"
+            "echo '2 passed, 0 skipped, 0 failed'\n"
+            'echo \'TESTBENCH_MODEL_USAGE={"input_tokens": 120, "output_tokens": 30, "cost_usd": 0.0004}\'\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        suite = _suite(
+            name="agent-eval-usage",
+            adapter="agent_eval",
+            profile="agent-eval",
+            command=["/bin/sh", "eval_usage.sh"],
+        )
+        result, usage = self._exec(suite, root)
+        self.assertEqual(result.total_count, 2)
+        self.assertEqual(usage, {"input_tokens": 120, "output_tokens": 30, "cost_usd": 0.0004})
