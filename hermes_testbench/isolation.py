@@ -268,6 +268,8 @@ def build_seatbelt_profile(
         f"(subpath {_sb_quote(u_home / '.rustup')}) "
         f"(subpath {_sb_quote(hxmail_support)}))"
     )
+    scratch_allow = _sb_quote((hermes_dir / "cache" / "scratch").resolve())
+    rules.append(f"(allow file-write* (subpath {scratch_allow}))")
     if not allow_repo_write:
         rules.append(f"(deny file-write* (subpath {_sb_quote(resolved_cwd)}))")
 
