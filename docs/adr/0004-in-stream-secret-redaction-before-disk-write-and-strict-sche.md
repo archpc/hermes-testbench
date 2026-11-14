@@ -57,7 +57,7 @@ Separating prevention, disk persistence, and agent export closes the disk-leakag
 
 ## Verification status
 
-unverified
+verified (`/Users/sein/.local/bin/python3.14 -W default -m unittest tests.test_schema tests.test_sanitize tests.test_reporting tests.test_isolation -v` — 30/30 passed including AST import isolation on `schema.py` and chunk-split `StreamRedactor` pre-disk redaction, 2026-11-14)
 
 ## Related decisions
 

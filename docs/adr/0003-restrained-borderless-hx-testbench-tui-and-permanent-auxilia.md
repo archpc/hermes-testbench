@@ -55,7 +55,7 @@ Independent critique (opus, 2026-11-14, `delivery_id=90eba6086c27b546687b288d901
 
 ## Verification status
 
-unverified
+verified (`/Users/sein/.local/bin/python3.14 -W default -m unittest tests.test_tui_render tests.test_tui_pty -v` — 44/44 passed; `testbench run wt-hermes-tmux --profile terminal` `tb_20261114_234118_923ce01c` — 27/27 tmux lifecycle tests passed, 2026-11-14)
 
 ## Related decisions
 

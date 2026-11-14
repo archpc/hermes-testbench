@@ -57,7 +57,7 @@ Independent critique (opus, 2026-11-14, `delivery_id=90eba6086c27b546687b288d901
 
 ## Verification status
 
-unverified
+verified (`/Users/sein/.local/bin/python3.14 -W default -m unittest discover -s tests -p "test_*.py"` — 181/181 passed; `testbench run ~/Code/hermes-testbench --profile regression` `tb_20261114_233234_da1f84dc` 180/180 passed; multi-repo runs across `hermes-terminal-env`, `hermes-tmux-workspace`, `apple-power-firmware`, and `agent-messaging`, 2026-11-14)
 
 ## Related decisions
 

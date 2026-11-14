@@ -31,7 +31,7 @@ Additionally, exposing test execution as an MCP tool creates an execution-escala
 
 ## Decision
 
-Expose `testbench mcp` as a stdlib-only newline-delimited JSON-RPC 2.0 stdio MCP server (`hermes_testbench/mcp_server.py`), registered in `~/.hermes/config.yaml` under `mcp_servers.testbench` with `mcp-testbench` appended to `platform_toolsets.cli`:
+Expose `testbench mcp` as a stdlib-only newline-delimited JSON-RPC 2.0 stdio MCP server (`hermes_testbench/mcp_server.py`), optionally registered in `~/.hermes/config.yaml` under `mcp_servers.testbench` (with `mcp-testbench` in `platform_toolsets.cli` when explicit toolset allowlisting is active, while CLI and skill workflows operate with zero live config edits):
 
 - **Protocol & tool surface**: Negotiates `HANDSHAKE_PROTOCOL_VERSIONS` (`2024-11-05` .. `2025-11-25`), handles `initialize`, `notifications/initialized`, `notifications/cancelled`, `ping`, `tools/list`, and `tools/call`, exits cleanly on stdin EOF, and logs exclusively to stderr. Exposes 7 tools:
   - Read-only (`annotations.readOnlyHint: true`): `testbench_discover`, `testbench_status`, `testbench_results`.
@@ -60,7 +60,7 @@ Empirical wire probes (`01-mcp-feasibility.md` §3-4) proved a ~150-LOC stdlib s
 
 ## Verification status
 
-unverified
+verified (`/Users/sein/.local/bin/python3.14 -W default -m unittest tests.test_mcp_server tests.test_isolation -v` — 13/13 passed including live `mcp` 2.0.0 SDK client handshake, `testbench_discover`, `testbench_run`, `testbench_results`, `~/.hermes/skills` refusal, and detached worker survival across server EOF, 2026-11-14)
 
 ## Related decisions
 
