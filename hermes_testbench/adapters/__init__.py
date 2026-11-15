@@ -12,7 +12,7 @@ import shlex
 import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..isolation import run_isolated_command
+from ..isolation import extra_bin_dirs, run_isolated_command
 from ..schema import (
     CaseResult,
     FailureKind,
@@ -27,7 +27,6 @@ from .parsers import ADAPTER_PARSERS, ParseOutcome
 
 __all__ = ["execute_suite", "ADAPTER_PARSERS", "ParseOutcome"]
 
-_EXTRA_BIN_DIRS = ("/Users/sein/.local/bin", "/opt/homebrew/bin")
 _SUMMARY_TAIL_LINES = 12
 
 
@@ -41,9 +40,13 @@ def _repro_command(suite: SuiteSpec, cwd: Path) -> str:
     return f"cd {shlex.quote(str(cwd))} && {shlex.join(suite.command)}"
 
 
+def _extra_bin_dirs() -> List[str]:
+    return extra_bin_dirs()
+
+
 def _search_path() -> str:
     parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
-    for extra in _EXTRA_BIN_DIRS:
+    for extra in _extra_bin_dirs():
         if extra not in parts:
             parts.append(extra)
     return os.pathsep.join(parts)

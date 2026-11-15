@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tomllib
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,7 +20,21 @@ from .store import TestBenchStore
 
 MAX_MANIFEST_BYTES = 256 * 1024
 
-DEFAULT_INTERPRETER = Path("/Users/sein/.local/bin/python3.14")
+def default_interpreter() -> Path:
+    """Interpreter for discovered Python suites when a project has no venv.
+
+    ``$TESTBENCH_PYTHON`` when it names an executable file, else the interpreter running
+    TestBench (>=3.11 by construction: this module imports ``tomllib``).
+    """
+    override = os.environ.get("TESTBENCH_PYTHON", "").strip()
+    if override:
+        cand = Path(override).expanduser()
+        if cand.is_file() and os.access(str(cand), os.X_OK):
+            return cand
+    return Path(sys.executable)
+
+
+PYTHON_TOKEN = "{python}"
 
 
 _UNVERSIONED: Tuple[str, str] = ("unversioned", "")
@@ -241,7 +256,10 @@ def _suite_from_manifest(
         name=name.strip(),
         adapter=adapter,
         profile=profile,
-        command=_as_str_list(entry.get("command"), f"{where} command"),
+        command=[
+            str(default_interpreter()) if i == 0 and arg == PYTHON_TOKEN else arg
+            for i, arg in enumerate(_as_str_list(entry.get("command"), f"{where} command"))
+        ],
         cwd=cwd,
         timeout_s=_as_float(entry.get("timeout_s"), f"{where} timeout_s", 120.0),
         needs_tmux=_as_bool(entry.get("needs_tmux"), f"{where} needs_tmux"),
@@ -287,7 +305,7 @@ def _interpreter_for(root: Path) -> Path:
     for candidate in (root / "venv" / "bin" / "python", root / ".venv" / "bin" / "python"):
         if candidate.is_file() and os.access(str(candidate), os.X_OK):
             return candidate
-    return DEFAULT_INTERPRETER
+    return default_interpreter()
 
 
 def _has_module(python: Path, module: str) -> bool:

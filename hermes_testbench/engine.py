@@ -30,17 +30,12 @@ from .schema import (
 )
 from .store import TestBenchStore, atomic_write_file
 
-PINNED_PYTHON_CANDIDATES = (
-    "/Users/sein/.local/bin/python3.14",
-    "/opt/homebrew/bin/python3.14",
-    "/opt/homebrew/bin/python3",
-)
-
-
 def pinned_python() -> str:
-    for cand in PINNED_PYTHON_CANDIDATES:
-        if os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return cand
+    """The interpreter running TestBench: the one its installation environment provides.
+
+    The detached worker must import the same package from the same environment as its
+    parent, so it is never resolved from a host-specific candidate list.
+    """
     return sys.executable or "python3"
 
 
@@ -52,7 +47,7 @@ def messaging_paths(home: Optional[Path] = None) -> Tuple[Path, Path]:
     """Resolve the ``agent-messaging`` artifact root and ``hermes-agent`` checkout.
 
     Derived from the real user home so neither the engine nor the CLI hard-codes a
-    host-specific ``/Users/<name>`` path. Shared by ``messaging-verify`` and by
+    host-specific home path. Shared by ``messaging-verify`` and by
     ``reproduce`` so both surfaces look at exactly the same locations.
     """
     base = (Path(home).expanduser() if home is not None else real_user_home())
@@ -407,6 +402,7 @@ def host_environment_snapshot() -> Dict[str, Any]:
         "os_release": platform.release(),
         "arch": platform.machine(),
         "python": platform.python_version(),
+        "python_executable": sys.executable,
         "cpu_count": os.cpu_count() or 1,
         "loadavg": load,
     }
@@ -743,14 +739,17 @@ class TestBenchEngine:
             argv.extend(["--timeout", str(float(timeout_s))])
 
         env = dict(os.environ)
-        pkg_root = str(repo_package_root())
+        # The worker imports exactly the package this process imported. A source tree,
+        # site-packages dir, or zipapp all work: PYTHONPATH accepts a zip file, but cwd
+        # must be a directory.
+        pkg_root = repo_package_root()
         existing_pp = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = f"{pkg_root}{os.pathsep}{existing_pp}" if existing_pp else pkg_root
+        env["PYTHONPATH"] = f"{pkg_root}{os.pathsep}{existing_pp}" if existing_pp else str(pkg_root)
         env["TESTBENCH_HOME"] = str(self.store.home)
 
         proc = subprocess.Popen(
             argv,
-            cwd=pkg_root,
+            cwd=str(pkg_root) if pkg_root.is_dir() else None,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -814,6 +813,7 @@ class TestBenchEngine:
                 rec.status = RunStatus.RUNNING
                 rec.started_at = utc_now_iso()
                 rec.worker_pid = os.getpid()
+                rec.environment = {**(rec.environment or {}), "worker_python": sys.executable}
                 rec.worker_pgid = os.getpgrp()
                 rec.commands = [list(s.command) for s in suites]
                 self.store.update_run(rec)

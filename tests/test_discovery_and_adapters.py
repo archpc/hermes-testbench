@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 
-from hermes_testbench.discovery import DEFAULT_INTERPRETER, detect_git_metadata, discover_project
+from hermes_testbench.discovery import default_interpreter, detect_git_metadata, discover_project
 
 
 def _tmpdir(prefix: str = "tb-test-") -> Path:
@@ -289,7 +289,7 @@ class DiscoverProjectZeroConfigTests(unittest.TestCase):
         self.assertEqual(
             suite.command[1:], ["-m", "unittest", "discover", "-s", "tests", "-v"]
         )
-        self.assertEqual(suite.command[0], str(DEFAULT_INTERPRETER))
+        self.assertEqual(suite.command[0], str(default_interpreter()))
         self.assertFalse(suite.needs_tmux)
 
     def test_python_project_prefers_project_venv_interpreter(self) -> None:
@@ -298,7 +298,7 @@ class DiscoverProjectZeroConfigTests(unittest.TestCase):
         (root / "tests" / "test_alpha.py").write_text("import unittest\n", encoding="utf-8")
         venv_bin = root / "venv" / "bin"
         venv_bin.mkdir(parents=True)
-        (venv_bin / "python").symlink_to(DEFAULT_INTERPRETER)
+        (venv_bin / "python").symlink_to(default_interpreter())
 
         spec = discover_project(root)
         suite = spec.suites[0]
@@ -356,7 +356,7 @@ class DiscoverProjectZeroConfigTests(unittest.TestCase):
         self.assertIn("python", spec.languages)
         suite = spec.suites[0]
         self.assertEqual(suite.adapter, "python_unittest")
-        self.assertEqual(suite.command[0], str(DEFAULT_INTERPRETER))
+        self.assertEqual(suite.command[0], str(default_interpreter()))
         self.assertEqual(suite.command[1:3], ["-m", "unittest"])
 
     def test_polyglot_project_reports_every_language(self) -> None:
@@ -451,7 +451,7 @@ class DiscoverProjectMultiLanguageTests(unittest.TestCase):
         self.assertEqual(by_name["regress-release"].adapter, "shell")
         self.assertEqual(by_name["check-wiring"].adapter, "shell")
         for suite in spec.suites:
-            self.assertEqual(Path(suite.command[0]).name, DEFAULT_INTERPRETER.name)
+            self.assertEqual(Path(suite.command[0]).name, default_interpreter().name)
             self.assertTrue(suite.command[1].startswith("scripts/"), suite.command)
             self.assertEqual(suite.profile, "regression")
 
