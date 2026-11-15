@@ -15,12 +15,29 @@ from .schema import RunStatus
 from .store import TestBenchStore
 
 
+def _version_string() -> str:
+    """Package version, store schema, interpreter, and sandbox backend in one line."""
+    import platform
+    import shutil
+
+    from . import __version__
+    from .schema import SCHEMA_VERSION
+
+    sandbox = "seatbelt" if shutil.which("sandbox-exec") else "none (env and process-group isolation only)"
+    return (
+        f"testbench {__version__} (schema {SCHEMA_VERSION}; python {platform.python_version()} "
+        f"{sys.executable}; {platform.system()} {platform.machine()}; sandbox {sandbox})"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="testbench",
         description="Hermes TestBench: isolated testing, benchmarking, and verification CLI.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--home", default="", help="Override TESTBENCH_HOME store directory")
+    p.add_argument("--version", action="version", version=_version_string())
     sub = p.add_subparsers(dest="command")
 
     disc = sub.add_parser("discover", help="Discover capabilities, suites, and profiles in a repository")

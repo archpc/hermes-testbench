@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
 import signal
 import sqlite3
@@ -246,11 +247,12 @@ class PtyResizeTests(unittest.TestCase):
 
 
 class SignalCrashTests(unittest.TestCase):
-    def test_sigabrt_is_classified_as_a_signal_with_no_leaked_children(self) -> None:
-        result = run_signal_crash_probe(signal.SIGABRT)
-        self.assertEqual(result["signal_num"], int(signal.SIGABRT))
-        self.assertEqual(result["exit_code"], 128 + int(signal.SIGABRT))
-        self.assertEqual(result["expected_exit_code"], 128 + int(signal.SIGABRT))
+    def test_sigkill_is_classified_as_a_signal_with_no_leaked_children(self) -> None:
+        # SIGKILL, not SIGABRT: a self-abort makes macOS ReportCrash show a crash dialog per run.
+        result = run_signal_crash_probe(signal.SIGKILL)
+        self.assertEqual(result["signal_num"], int(signal.SIGKILL))
+        self.assertEqual(result["exit_code"], 128 + int(signal.SIGKILL))
+        self.assertEqual(result["expected_exit_code"], 128 + int(signal.SIGKILL))
         self.assertEqual(result["classification"], "signalled")
         self.assertEqual(result["leaked_children"], 0)
         self.assertTrue(result["grandchild_reaped"])
@@ -393,7 +395,7 @@ class EnvironmentMetadataTests(_TempDirTest):
         self.assertEqual(len(env["loadavg"]), 3)
         self.assertIsInstance(env["cpu_count"], int)
         self.assertGreater(env["cpu_count"], 0)
-        self.assertIn("3.14", env["python_version"])
+        self.assertEqual(env["python_version"], platform.python_version())
         self.assertTrue(env["sqlite_version"])
         for tool in ("rustc", "cargo", "cobc", "clang"):
             self.assertIn(f"{tool}_version", env)

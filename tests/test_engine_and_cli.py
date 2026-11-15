@@ -11,6 +11,7 @@ import time
 import unittest
 from pathlib import Path
 
+from hermes_testbench.isolation import real_user_home
 from hermes_testbench.cli import main as cli_main
 from hermes_testbench.engine import AuthorizationError, TestBenchEngine, check_scoped_access
 from hermes_testbench.schema import ProjectSpec, RunStatus, SuiteSpec
@@ -71,7 +72,7 @@ class EngineAndCliTests(unittest.TestCase):
             ok_path = check_scoped_access(self.proj, store, allowed_roots=[self.allowed_code])
             self.assertEqual(ok_path, self.proj.resolve())
 
-            hermes_skills = Path("/Users/sein/.hermes/skills")
+            hermes_skills = real_user_home() / ".hermes" / "skills"
             if hermes_skills.exists():
                 with self.assertRaises(AuthorizationError):
                     check_scoped_access(hermes_skills, store, allowed_roots=[self.allowed_code])

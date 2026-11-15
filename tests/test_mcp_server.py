@@ -12,6 +12,7 @@ import time
 import unittest
 from pathlib import Path
 
+from hermes_testbench.isolation import real_user_home
 from hermes_testbench.engine import TestBenchEngine
 from hermes_testbench.mcp_server import serve_stdio
 from hermes_testbench.schema import RunStatus
@@ -19,7 +20,7 @@ from hermes_testbench.store import TestBenchStore
 
 PY = sys.executable
 REPO_ROOT = Path(__file__).resolve().parent.parent
-HERMES_VENV_PY = Path("/Users/sein/.hermes/hermes-agent/venv/bin/python")
+HERMES_VENV_PY = real_user_home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"
 
 
 class McpServerTests(unittest.TestCase):
@@ -76,7 +77,7 @@ class McpServerTests(unittest.TestCase):
                     "jsonrpc": "2.0",
                     "id": 4,
                     "method": "tools/call",
-                    "params": {"name": "testbench_discover", "arguments": {"path": "/Users/sein/.hermes/skills"}},
+                    "params": {"name": "testbench_discover", "arguments": {"path": str(real_user_home() / ".hermes" / "skills")}},
                 },
                 {
                     "jsonrpc": "2.0",
@@ -109,7 +110,7 @@ class McpServerTests(unittest.TestCase):
         self.assertFalse(tools["testbench_run"]["annotations"]["readOnlyHint"])
         self.assertFalse(tools["testbench_cancel"]["annotations"]["readOnlyHint"])
 
-        # Unauthorized path (/Users/sein/.hermes/skills) returns structured tool error, never crashes
+        # Unauthorized path (~/.hermes/skills) returns structured tool error, never crashes
         self.assertTrue(replies[3]["result"]["isError"])
         # Malformed arguments return error cleanly
         self.assertTrue(replies[4]["result"]["isError"])

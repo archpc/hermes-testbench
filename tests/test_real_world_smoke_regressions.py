@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import sys
 import unittest
 
 from hermes_testbench.adapters import execute_suite
@@ -69,7 +70,7 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
             "subprocess.run(['tmux','-L',s,'-f','/dev/null','new-session','-d','-s','ok'], check=True)"
         )
         res2 = run_isolated_command(
-            ["/Users/sein/.local/bin/python3.14", "-c", sock_script],
+            [sys.executable, "-c", sock_script],
             cwd=self.root,
             evidence_dir=self.root / "ev2",
             step_name="deep_tmux_sock",
@@ -112,7 +113,7 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
             "print(f'LOOP=ok DASH_BLOCKED={dash_blocked} EXT_BLOCKED={ext_blocked}')\n"
         )
         r_net = run_isolated_command(
-            ["/Users/sein/.local/bin/python3.14", "-c", probe_py],
+            [sys.executable, "-c", probe_py],
             cwd=self.root,
             evidence_dir=self.root / "ev_net",
             step_name="net_loopback",
@@ -121,7 +122,11 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
             scratch_root=self.root,
         )
         self.assertEqual(r_net.exit_code, 0, r_net.stderr_text)
-        self.assertIn("LOOP=ok DASH_BLOCKED=True EXT_BLOCKED=True", r_net.stdout_text)
+        if shutil.which("sandbox-exec"):
+            self.assertIn("LOOP=ok DASH_BLOCKED=True EXT_BLOCKED=True", r_net.stdout_text)
+        else:
+            # No Seatbelt (Linux): network is not confined (OPERATING-GUIDE 1.1); loopback must still work.
+            self.assertIn("LOOP=ok", r_net.stdout_text)
 
         # Verify macOS setuid /bin/ps works inside Seatbelt (needed by hermes-tmux job/lock checks)
         r_ps = run_isolated_command(
@@ -244,7 +249,7 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
                     "--repeats",
                     "2",
                     "--",
-                    "/Users/sein/.local/bin/python3.14",
+                    sys.executable,
                     "-c",
                     "x = sum(range(1000))",
                 ]
@@ -269,7 +274,7 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
                     "--repeats",
                     "2",
                     "--",
-                    "/Users/sein/.local/bin/python3.14",
+                    sys.executable,
                     "-c",
                     "x = sum(range(1000))",
                 ]

@@ -9,6 +9,30 @@ Every suite executed by `TestBenchEngine` runs through `isolation.run_isolated_c
 - **macOS Seatbelt (`sandbox-exec`)**: Denies outbound internet and `localhost:9119` (Hermes dashboard) while allowing UNIX domain sockets and ephemeral `127.0.0.1` loopback mock servers when `allow_network = false`; denies reading `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.cargo/credentials*`, `~/.hermes/.env`, `~/.hermes/auth.json`, `~/.hermes/mcp-tokens`, and `~/Library/Application Support/hxmail`; denies writes to `~/.hermes` (except `~/.hermes/cache/scratch`), `~/.cargo`, `~/.rustup`, and the target repository checkout when `allow_repo_write = false`.
 - **In-stream secret redaction (`ADR-0004`)**: Raw pipe/PTY bytes pass through `StreamRedactor` (carrying a 256-char sliding overlap across arbitrary read boundaries) BEFORE writing to `*.stdout.log`, `*.stderr.log`, or `*.sanitized.log` (`0600`). Secrets never land unredacted on disk.
 
+### 1.1 Platform isolation: macOS and Linux are not equivalent
+
+**On Linux, TestBench does not confine the filesystem or the network.** Filesystem and network confinement come only from macOS Seatbelt (`sandbox-exec`). Linux has no `sandbox-exec`, so the suite runs as your user with no confinement wrapper: it can read `~/.ssh`, write anywhere your user can write (including the repository checkout and the real `~/.hermes`), and reach the internet, localhost services, and your live tmux socket. `allow_network = false` and `allow_repo_write = false` are recorded but not enforced there. Run untrusted code on Linux only inside a container or VM you control.
+
+The run record shows which case applied: each suite's `isolation_meta.seatbelt` is `active` (confined), `inherited_outer` (already inside a Seatbelt), or `unavailable` (no confinement). `testbench --version` prints `sandbox seatbelt` or `sandbox none (env and process-group isolation only)`.
+
+| Control | macOS, Seatbelt active | Linux |
+|---|---|---|
+| Writes outside the run sandbox (home, `~/.hermes`, `state.db`, repo when `allow_repo_write = false`) | Denied | **Not enforced** |
+| Reads of credential files (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.netrc`, Keychains, `~/.hermes/auth.json`, `.env`) | Denied | **Not enforced** |
+| Network with `allow_network = false` (internet, DNS, `localhost:9119/9222/11434`) | Denied; `127.0.0.1` loopback mocks allowed | **Not enforced** |
+| Live tmux socket, `mDNSResponder`, `docker.sock` | Denied | **Not enforced** |
+| Credential env scrubbing (`*TOKEN*`, `*SECRET*`, `*API_KEY*`, `SSH_AUTH_SOCK`, `TMUX`, ...) | Enforced | Enforced |
+| Disposable `HOME`/`XDG_*`/`TMPDIR`/`TESTBENCH_HOME` | Enforced | Enforced (redirection only: absolute paths reach the real files) |
+| `setsid` process group, fingerprinted `SIGTERM` then `SIGKILL` on timeout/cancel | Enforced | Enforced (`ps -o lstart=` from procps; BusyBox `ps` disables the fingerprint check) |
+| `setsid`-survivor sweep on timeout, cancel, or non-zero exit | `lsof +D` and `ps` | Best effort: skipped when `lsof` or `/bin/ps` is absent |
+| Private tmux socket and `kill-server` | Enforced | Enforced |
+| In-stream secret redaction before disk | Enforced | Enforced |
+| Trust gate (untrusted manifest requesting network or repo writes is `BLOCKED`) | Enforced | Gate enforced, but the default it protects (no network, read-only repo) does not exist on Linux |
+| Billable gate, MCP scoped roots | Enforced | Enforced |
+| TUI refresh | `kqueue` | `select` polling, same results |
+
+Env scrubbing matches names, not values: a secret in a variable whose name matches no pattern (for example `MYDBPASS`) is passed through on both platforms.
+
 ## 2. Project Onboarding & `.testbench.toml`
 
 Unfamiliar repositories work with zero configuration (`testbench discover <repo>`). When custom profiles or multi-step suites are needed, add an optional `.testbench.toml`:

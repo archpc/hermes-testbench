@@ -75,6 +75,15 @@ def real_user_home() -> Path:
         return Path.home().resolve()
 
 
+def extra_bin_dirs() -> List[str]:
+    """Toolchain directories appended to PATH, derived from the real user home.
+
+    ``~/.local/bin`` is the XDG user bin dir; ``/opt/homebrew/bin`` and ``/usr/local/bin``
+    are the Homebrew prefixes on Apple silicon and Intel/Linux. Missing ones are harmless.
+    """
+    return [str(real_user_home() / ".local" / "bin"), "/opt/homebrew/bin", "/usr/local/bin"]
+
+
 def _probe_writable_dir(cand: Path) -> bool:
     try:
         cand.mkdir(parents=True, exist_ok=True)
@@ -469,9 +478,9 @@ def build_isolated_env(
         clean["UV_CACHE_DIR"] = str(u_home / ".cache" / "uv")
     if (u_home / ".local" / "share" / "uv" / "python").is_dir():
         clean["UV_PYTHON_INSTALL_DIR"] = str(u_home / ".local" / "share" / "uv" / "python")
-    # Ensure standard toolchains (/Users/sein/.local/bin, /opt/homebrew/bin) are reachable
+    # Ensure standard toolchains (user bin dir, Homebrew prefixes, /usr/sbin) are reachable
     cur_path = clean.get("PATH", "/usr/bin:/bin")
-    for extra_bin in (str(u_home / ".local" / "bin"), "/opt/homebrew/bin", "/usr/sbin"):
+    for extra_bin in (*extra_bin_dirs(), "/usr/sbin"):
         if extra_bin not in cur_path.split(":"):
             cur_path = f"{extra_bin}:{cur_path}"
     clean["PATH"] = cur_path
