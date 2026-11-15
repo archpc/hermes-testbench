@@ -99,6 +99,44 @@ class FailedHeaderListTests(unittest.TestCase):
         self.assertEqual(outcome.total, 2)
 
 
+class BulletShapedExcerptTests(unittest.TestCase):
+    """R1-residual (Fable 5.2 review): bullet-shaped lines inside a failure's
+    excerpt (unittest diff ``- ``/``+ `` lines, numbered stack frames) must not
+    split one bare marker into several failures. A block is a list only when it
+    starts with a bullet item."""
+
+    def test_unittest_diff_lines_count_one_failure_with_assertion_message(self) -> None:
+        outcome = parse_shell(
+            "FAIL\n"
+            "  AssertionError: 'one\\ntwo\\nthree\\n' != 'one\\n2\\n3\\n'\n"
+            "    one\n"
+            "  - two\n"
+            "  - three\n"
+            "  + 2\n"
+            "  + 3\n"
+        )
+        self.assertEqual((outcome.total, outcome.failed), (1, 1))
+        self.assertTrue(outcome.failures[0]["message"].startswith("AssertionError:"))
+        self.assertIn("- three", outcome.failures[0]["excerpt"])
+
+    def test_traceback_then_list_diff_keeps_assertion_as_message(self) -> None:
+        outcome = parse_shell(
+            "FAIL\n"
+            "  Traceback (most recent call last):\n"
+            '    File "t.py", line 5, in test_x\n'
+            "  AssertionError: Lists differ: ['a'] != ['x']\n"
+            "  - ['a']\n"
+            "  + ['x']\n"
+        )
+        self.assertEqual(outcome.failed, 1)
+        self.assertTrue(outcome.failures[0]["message"].startswith("AssertionError: Lists differ"))
+        self.assertIn("Traceback", outcome.failures[0]["excerpt"])
+
+    def test_numbered_stack_frames_after_message_count_one(self) -> None:
+        outcome = parse_generic("TB-FAIL\n  panic: boom\n  1) main.go:10\n  2) runtime.go:99\n")
+        self.assertEqual(outcome.failed, 1)
+
+
 class UnittestParseStillStructuredTests(unittest.TestCase):
     def test_plain_unittest_output_unaffected(self) -> None:
         outcome = parse_python_unittest(

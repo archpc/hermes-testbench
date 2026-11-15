@@ -113,7 +113,9 @@ def _summarize_markers(text: str) -> Tuple[int, int, int, int, List[Dict[str, An
                     block.append(cand.strip())
                     look += 1
                 bullets = [bm.group(1).strip() for bm in map(_BULLET_ITEM_RE.match, block) if bm]
-                if bullets:
+                # A list only when the block opens with a bullet item; bullet-shaped
+                # lines later in a block (diff "- "/"+ " lines, stack frames) are excerpt.
+                if bullets and _BULLET_ITEM_RE.match(block[0]):
                     for item in bullets:
                         failed += 1
                         cname = f"failure_{failed}"
