@@ -696,8 +696,12 @@ time.sleep(5)
 '''
 
 
-def run_signal_crash_probe(sig: int = signal.SIGABRT) -> Dict[str, Any]:
-    """Crash a child with ``sig`` and verify signal classification and zero leaked children."""
+def run_signal_crash_probe(sig: int = signal.SIGKILL) -> Dict[str, Any]:
+    """Crash a child with ``sig`` and verify signal classification and zero leaked children.
+
+    Defaults to SIGKILL: on macOS, SIGABRT/SIGSEGV make ReportCrash file a report and
+    show a "Python quit unexpectedly" dialog for every probe run.
+    """
     signal_num_expected = int(sig)
     work = Path(tempfile.mkdtemp(dir=str(default_scratch_root()), prefix="tb-crash-"))
     grandchild_file = work / "grandchild.pid"
