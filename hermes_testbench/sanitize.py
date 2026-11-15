@@ -8,7 +8,7 @@ from typing import List, Optional
 _PEM_BLOCK_RE = re.compile(
     r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----[\s\S]*?-----END \1-----"
 )
-_PEM_BEGIN_RE = re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----")
+_PEM_BEGIN_RE = re.compile(r"^\s*-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----\s*$")
 _PEM_END_RE = re.compile(r"-----END ([A-Z0-9 ]*PRIVATE KEY)-----")
 _URL_USERINFO_RE = re.compile(r"(https?://[^/\s:@]+:)([^@\s/]+)(@)")
 _BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)([^\s\"'`,;]{6,})")

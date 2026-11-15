@@ -280,6 +280,11 @@ class AdversarialAndOpusRegressionTests(unittest.TestCase):
         self.assertNotIn("MIIEpAIBAAKCAQEA", out)
         self.assertIn("REDACTED", out)
 
+        # Prose mentioning -----BEGIN PRIVATE KEY----- mid-line must NOT swallow subsequent lines!
+        red2 = StreamRedactor()
+        prose_out = red2.feed("Docstring mentioning -----BEGIN PRIVATE KEY----- mid-sentence ... ok\nRan 188 tests in 1.0s\n\nOK\n") + red2.finish()
+        self.assertIn("Ran 188 tests in 1.0s", prose_out)
+
     def test_opus_tui_overview_excludes_benchmarks_aligns_header_counts_and_surfaces_failures(self) -> None:
         """Opus TUI critique: overview excludes benchmark runs, header counts match overview, FAIL logs lead."""
         r_pass = RunRecord(
