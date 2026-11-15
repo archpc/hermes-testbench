@@ -333,9 +333,7 @@ def execute_suite(
         for frec in result.failures:
             blob = f"{frec.message}\n{frec.excerpt}"
             if frec.kind == FailureKind.HARNESS_ERROR and (
-                "PermissionError: [Errno 1] Operation not permitted" in blob
-                or "[Errno 1] Operation not permitted" in blob
-                or "Operation not permitted" in frec.message
+                "[Errno 1] Operation not permitted" in blob or "Operation not permitted" in frec.message
             ):
                 frec.kind = FailureKind.SANDBOX_DENIED
     if not result.summary_excerpt:

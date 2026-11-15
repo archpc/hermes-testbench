@@ -334,7 +334,8 @@ def _overview_runs(state: TuiState) -> List[RunRecord]:
         r
         for _idx, r in sorted(
             ((idx, r) for idx, r in indexed if r.status in RunStatus.ACTIVE),
-            key=lambda item: (0 if item[1].status == RunStatus.RUNNING else 1, -_run_sort_ts(item[1]), item[0]),
+            # Oldest active first (FIFO). state.runs is newest-first, so a larger index is older on ties.
+            key=lambda item: (0 if item[1].status == RunStatus.RUNNING else 1, _run_sort_ts(item[1]), -item[0]),
         )
     ]
     terminal = [

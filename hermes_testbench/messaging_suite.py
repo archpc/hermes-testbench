@@ -255,7 +255,7 @@ def _suite(
         name=name,
         adapter=adapter,
         profile=profile,
-        command=list(command or ["testbench", "messaging-verify"]),
+        command=list(command) if command is not None else ["testbench", "messaging-verify"],
         cwd=str(cwd),
         status=_status_for(pass_count, fail_count, skip_count, error_count),
         started_at=utc_now_iso(),
@@ -684,6 +684,7 @@ def _pytest_suite(hermes_agent_root: Optional[Path], evidence_dir: Optional[Path
         f"pytest exit={rc}: {output.strip()[:600]}",
         suite=PYTEST_SUITE,
     )
+    # When pytest produced output, that output is the suite log; skip the case-line log it would replace.
     res = _suite(
         PYTEST_SUITE,
         adapter="pytest",
@@ -691,7 +692,7 @@ def _pytest_suite(hermes_agent_root: Optional[Path], evidence_dir: Optional[Path
         cwd=root,
         cases=[case],
         command=command,
-        evidence_dir=evidence_dir,
+        evidence_dir=None if output.strip() else evidence_dir,
         summary=f"pytest: hermetic bot-mode tests exit={rc}",
     )
     if evidence_dir is not None and output.strip():

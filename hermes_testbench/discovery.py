@@ -699,7 +699,9 @@ with tempfile.TemporaryDirectory(prefix="tb-cw-") as tmp:
     unwired = base / "unwired-home"
     unwired.mkdir(parents=True, exist_ok=True)
 
-    p_ok = subprocess.run([sys.executable, script, "--hermes-home", str(wired)], capture_output=True, text=True)
+    p_ok = subprocess.run(
+        [sys.executable, script, "--hermes-home", str(wired)], capture_output=True, text=True, timeout=120.0
+    )
     out_ok = (p_ok.stdout or "") + (p_ok.stderr or "")
     if p_ok.returncode == 0 and "wiring OK" in out_ok:
         print("TB-PASS check-wiring:synthetic_wired_home")
@@ -707,12 +709,14 @@ with tempfile.TemporaryDirectory(prefix="tb-cw-") as tmp:
         print(f"TB-FAIL check-wiring:synthetic_wired_home rc={p_ok.returncode} {out_ok.strip()[:240]}")
         rc_all = 1
 
-    p_bad = subprocess.run([sys.executable, script, "--hermes-home", str(unwired)], capture_output=True, text=True)
+    p_bad = subprocess.run(
+        [sys.executable, script, "--hermes-home", str(unwired)], capture_output=True, text=True, timeout=120.0
+    )
     out_bad = (p_bad.stdout or "") + (p_bad.stderr or "")
-    if p_bad.returncode != 0:
+    if p_bad.returncode != 0 and "advisor profile missing" in out_bad:
         print("TB-PASS check-wiring:unwired_home_rejected")
     else:
-        print(f"TB-FAIL check-wiring:unwired_home_rejected unexpectedly exited 0: {out_bad.strip()[:240]}")
+        print(f"TB-FAIL check-wiring:unwired_home_rejected rc={p_bad.returncode} {out_bad.strip()[:240]}")
         rc_all = 1
 sys.exit(rc_all)
 """
