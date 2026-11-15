@@ -673,6 +673,55 @@ _VERIFIER_SCRIPTS: Tuple[Tuple[str, str, str, str], ...] = (
 )
 
 
+_CHECK_WIRING_PROBE_SCRIPT = """
+from contextlib import closing
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+script = sys.argv[1]
+rc_all = 0
+with tempfile.TemporaryDirectory(prefix="tb-cw-") as tmp:
+    base = Path(tmp)
+    wired = base / "wired-home"
+    (wired / "profiles" / "opus").mkdir(parents=True, exist_ok=True)
+    (wired / "profiles" / "opus" / "config.yaml").write_text(
+        "model:\\n  default: anthropic/claude-opus-5.5\\n", encoding="utf-8"
+    )
+    (wired / "profile.yaml").write_text("ui_meta:\\n  hermes-bots:\\n    enabled: true\\n", encoding="utf-8")
+    for db_dir in (wired, wired / "profiles" / "opus"):
+        with closing(sqlite3.connect(str(db_dir / "state.db"))) as conn:
+            conn.execute("CREATE TABLE sessions (id TEXT, title TEXT, started_at INTEGER)")
+            conn.execute("INSERT INTO sessions VALUES ('s1', 'Bot Chat', 1)")
+            conn.commit()
+    unwired = base / "unwired-home"
+    unwired.mkdir(parents=True, exist_ok=True)
+
+    p_ok = subprocess.run(
+        [sys.executable, script, "--hermes-home", str(wired)], capture_output=True, text=True, timeout=120.0
+    )
+    out_ok = (p_ok.stdout or "") + (p_ok.stderr or "")
+    if p_ok.returncode == 0 and "wiring OK" in out_ok:
+        print("TB-PASS check-wiring:synthetic_wired_home")
+    else:
+        print(f"TB-FAIL check-wiring:synthetic_wired_home rc={p_ok.returncode} {out_ok.strip()[:240]}")
+        rc_all = 1
+
+    p_bad = subprocess.run(
+        [sys.executable, script, "--hermes-home", str(unwired)], capture_output=True, text=True, timeout=120.0
+    )
+    out_bad = (p_bad.stdout or "") + (p_bad.stderr or "")
+    if p_bad.returncode != 0 and "advisor profile missing" in out_bad:
+        print("TB-PASS check-wiring:unwired_home_rejected")
+    else:
+        print(f"TB-FAIL check-wiring:unwired_home_rejected rc={p_bad.returncode} {out_bad.strip()[:240]}")
+        rc_all = 1
+sys.exit(rc_all)
+"""
+
+
 def _script_suites(root: Path, files: List[str]) -> Tuple[List[SuiteSpec], List[str]]:
     suites: List[SuiteSpec] = []
     languages: List[str] = []
@@ -683,7 +732,10 @@ def _script_suites(root: Path, files: List[str]) -> Tuple[List[SuiteSpec], List[
             continue
         cmd = [str(python), rel]
         try:
-            if "sys.argv[1]" in (root / rel).read_text(encoding="utf-8", errors="ignore"):
+            src_text = (root / rel).read_text(encoding="utf-8", errors="ignore")
+            if rel == "scripts/check-wiring.py" and "--hermes-home" in src_text and "hermes-bots" in src_text:
+                cmd = [str(python), "-c", _CHECK_WIRING_PROBE_SCRIPT, rel]
+            elif "sys.argv[1]" in src_text:
                 cmd.append(".")
         except OSError:
             pass

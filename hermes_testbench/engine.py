@@ -48,6 +48,48 @@ def repo_package_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def messaging_paths(home: Optional[Path] = None) -> Tuple[Path, Path]:
+    """Resolve the ``agent-messaging`` artifact root and ``hermes-agent`` checkout.
+
+    Derived from the real user home so neither the engine nor the CLI hard-codes a
+    host-specific ``/Users/<name>`` path. Shared by ``messaging-verify`` and by
+    ``reproduce`` so both surfaces look at exactly the same locations.
+    """
+    base = (Path(home).expanduser() if home is not None else real_user_home())
+    hermes = base / ".hermes"
+    return (hermes / "artifacts" / "agent-messaging"), (hermes / "hermes-agent")
+
+
+def base_profile(profile: str) -> str:
+    """Strip accumulated ``repro:`` prefixes so repro-of-repro never stacks them."""
+    name = profile or ""
+    while name.startswith("repro:"):
+        name = name[len("repro:"):]
+    return name
+
+
+def _recorded_artifact_root(
+    orig: RunRecord, resolved: Path, default_art_root: Path
+) -> Optional[Path]:
+    """Return the ``artifact_root`` the original messaging run actually used.
+
+    Runs recorded since the messaging path exists store it explicitly in
+    ``environment['messaging_artifact_root']`` (an empty string means "no
+    artifact root was used"). Older runs lack the marker, so fall back to the
+    recorded project_root only when it is in fact the artifact root.
+    """
+    env = orig.environment or {}
+    if "messaging_artifact_root" in env:
+        recorded = str(env.get("messaging_artifact_root") or "").strip()
+        return Path(recorded).expanduser() if recorded else None
+    try:
+        if resolved == default_art_root.resolve():
+            return resolved
+    except OSError:
+        return None
+    return None
+
+
 class AuthorizationError(PermissionError):
     """Raised when an interface attempts to access a path outside its scoped allowlist."""
 
@@ -370,6 +412,30 @@ def host_environment_snapshot() -> Dict[str, Any]:
     }
 
 
+def _blocked_failure_kind(suites: List[SuiteResult]) -> str:
+    for s in suites:
+        if s.status != RunStatus.BLOCKED:
+            continue
+        for f in s.failures:
+            if f.kind == FailureKind.UNTRUSTED_MANIFEST:
+                return FailureKind.UNTRUSTED_MANIFEST
+    return FailureKind.BLOCKED_POLICY
+
+
+def _failed_suite_kind(suites: List[SuiteResult]) -> str:
+    failing = [s for s in suites if s.status == RunStatus.FAIL]
+    kinds = [f.kind for s in failing for f in s.failures if f.kind]
+    if FailureKind.ASSERTION in kinds:
+        return FailureKind.ASSERTION
+    if FailureKind.SANDBOX_DENIED in kinds:
+        return FailureKind.SANDBOX_DENIED
+    if kinds:
+        return kinds[0]
+    if sum(s.error_count for s in failing) > 0 and sum(s.fail_count for s in failing) == 0:
+        return FailureKind.HARNESS_ERROR
+    return FailureKind.ASSERTION
+
+
 def _aggregate_run_status(suites: List[SuiteResult]) -> Tuple[str, Optional[str]]:
     if not suites:
         return RunStatus.SKIP, None
@@ -381,13 +447,13 @@ def _aggregate_run_status(suites: List[SuiteResult]) -> Tuple[str, Optional[str]
     if any(st == RunStatus.TIMEOUT for st in statuses):
         return RunStatus.TIMEOUT, FailureKind.TIMEOUT
     if any(st == RunStatus.FAIL for st in statuses):
-        return RunStatus.FAIL, FailureKind.ASSERTION
+        return RunStatus.FAIL, _failed_suite_kind(suites)
     if any(st == RunStatus.BLOCKED for st in statuses) and not any(st == RunStatus.PASS for st in statuses):
-        return RunStatus.BLOCKED, FailureKind.BLOCKED_POLICY
+        return RunStatus.BLOCKED, _blocked_failure_kind(suites)
     if all(st == RunStatus.SKIP for st in statuses):
         return RunStatus.SKIP, None
     if any(st == RunStatus.BLOCKED for st in statuses):
-        return RunStatus.BLOCKED, FailureKind.BLOCKED_POLICY
+        return RunStatus.BLOCKED, _blocked_failure_kind(suites)
     return RunStatus.PASS, None
 
 
@@ -483,10 +549,11 @@ class TestBenchEngine:
         repros = [s.repro_command for s in suite_results if s.repro_command and s.status != RunStatus.PASS]
         if not repros:
             repros = [s.repro_command for s in suite_results if s.repro_command]
-        run.repro_instructions = " && ".join(repros)
+        run.repro_instructions = " && ".join(dict.fromkeys(repros))
         run.summary = (
             f"{run.status}: {run.pass_count}/{run.total_count} passed, "
-            f"{run.fail_count} failed, {run.skip_count} skipped, {run.blocked_count} blocked"
+            f"{run.fail_count} failed, {run.error_count} errors, "
+            f"{run.skip_count} skipped, {run.blocked_count} blocked"
         )
 
         # Never fabricate model token usage; record only when measured
@@ -869,6 +936,54 @@ class TestBenchEngine:
 
         target = Path(orig.project_root)
         resolved = self.resolve_target(target, enforce_scope=enforce_scope)
+        if orig.project == "agent-messaging" and base_profile(orig.profile) == "verification":
+            from .messaging_suite import PYTEST_SUITE, run_agent_messaging_verification
+            rid = new_run_id()
+            now = utc_now_iso()
+            use_pt = any(s.name == PYTEST_SUITE for s in orig.suites)
+            default_art_root, ha_root = messaging_paths()
+            art_root = _recorded_artifact_root(orig, resolved, default_art_root)
+            env_snap = host_environment_snapshot()
+            env_snap["messaging_artifact_root"] = str(art_root) if art_root is not None else ""
+            replay_mv = RunRecord(
+                run_id=rid,
+                project=orig.project,
+                project_root=str(resolved),
+                revision=_fallback_git_metadata(resolved)[0],
+                profile="repro:" + base_profile(orig.profile),
+                status=RunStatus.RUNNING,
+                commands=list(orig.commands),
+                created_at=now,
+                started_at=now,
+                environment=env_snap,
+            )
+            self.store.create_run(replay_mv)
+            ev_mv = self.store.run_dir(rid)
+            t0_mv = time.monotonic()
+            try:
+                with self.store.hold_run_lock(rid):
+                    mv_suites = run_agent_messaging_verification(
+                        ev_mv,
+                        artifact_root=art_root,
+                        hermes_agent_root=ha_root,
+                        run_hermes_pytest=use_pt,
+                    )
+                    done_mv = self._populate_and_finalize(replay_mv, mv_suites, [], t0_mv)
+            except Exception as exc:
+                replay_mv.status = RunStatus.ERROR
+                replay_mv.failure_kind = FailureKind.HARNESS_ERROR
+                replay_mv.error_count = 1
+                replay_mv.first_failure = f"Reproduce error: {exc}"[:300]
+                done_mv = self.store.finalize_run(replay_mv)
+            return {
+                "source_run_id": orig.run_id,
+                "repro_run_id": done_mv.run_id,
+                "status": done_mv.status,
+                "pass_count": done_mv.pass_count,
+                "fail_count": done_mv.fail_count,
+                "first_failure": done_mv.first_failure,
+                "evidence_dir": done_mv.evidence_dir,
+            }
         # Replay recorded suites directly without rediscovery if suites were persisted
         if orig.suites:
             rid = new_run_id()

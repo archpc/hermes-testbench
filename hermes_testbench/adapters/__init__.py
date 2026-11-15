@@ -329,6 +329,13 @@ def execute_suite(
     outcome = parser(combined)
     result.summary_excerpt = outcome.summary_line or _tail_excerpt(combined)
     _finalize_counts(result, outcome, exec_result.exit_code, exec_result.signal_num)
+    if result.isolation_meta.get("seatbelt") in ("active", "inherited_outer"):
+        for frec in result.failures:
+            blob = f"{frec.message}\n{frec.excerpt}"
+            if frec.kind == FailureKind.HARNESS_ERROR and (
+                "[Errno 1] Operation not permitted" in blob or "Operation not permitted" in frec.message
+            ):
+                frec.kind = FailureKind.SANDBOX_DENIED
     if not result.summary_excerpt:
         result.summary_excerpt = _tail_excerpt(combined)
     return result, outcome.usage

@@ -323,25 +323,35 @@ def _query_ok(state: TuiState, run: RunRecord) -> bool:
     return needle in haystack
 
 
+def _run_sort_ts(run: RunRecord) -> float:
+    parsed = _parse_iso(run.created_at)
+    return parsed if parsed is not None else 0.0
+
+
 def _overview_runs(state: TuiState) -> List[RunRecord]:
-    runs = [r for r in state.runs if _project_ok(state, r.project) and _query_ok(state, r)]
-    active = sorted(
-        (r for r in runs if r.status in RunStatus.ACTIVE),
-        key=lambda r: (0 if r.status == RunStatus.RUNNING else 1, r.created_at),
-    )
+    indexed = [(idx, r) for idx, r in enumerate(state.runs) if _project_ok(state, r.project) and _query_ok(state, r)]
+    active = [
+        r
+        for _idx, r in sorted(
+            ((idx, r) for idx, r in indexed if r.status in RunStatus.ACTIVE),
+            # Oldest active first (FIFO). state.runs is newest-first, so a larger index is older on ties.
+            key=lambda item: (0 if item[1].status == RunStatus.RUNNING else 1, _run_sort_ts(item[1]), -item[0]),
+        )
+    ]
     terminal = [
-        r for r in runs if r.status not in RunStatus.ACTIVE and r.profile != ProfileName.BENCHMARK
+        (idx, r) for idx, r in indexed if r.status not in RunStatus.ACTIVE and r.profile != ProfileName.BENCHMARK
     ]
     latest: Dict[str, RunRecord] = {}
-    for run in sorted(terminal, key=lambda r: r.created_at):
+    # Ascending chronological order (ties broken so smaller index = newer overwrites larger index = older)
+    for _idx, run in sorted(terminal, key=lambda item: (_run_sort_ts(item[1]), -item[0])):
         latest[run.project] = run
     ranked = sorted(latest.values(), key=lambda r: (_STATUS_RANK.get(r.status, 9), r.project))
     return list(active) + ranked
 
 
 def _history_runs(state: TuiState) -> List[RunRecord]:
-    runs = [r for r in state.runs if _project_ok(state, r.project) and _query_ok(state, r)]
-    return sorted(runs, key=lambda r: r.created_at, reverse=True)
+    indexed = [(idx, r) for idx, r in enumerate(state.runs) if _project_ok(state, r.project) and _query_ok(state, r)]
+    return [r for _idx, r in sorted(indexed, key=lambda item: (_run_sort_ts(item[1]), -item[0]), reverse=True)]
 
 
 def _project_list(state: TuiState) -> List[Any]:
@@ -369,12 +379,14 @@ def _clamped_index(state: TuiState, items: Sequence[Any]) -> int:
 
 
 def _latest_run_for(state: TuiState, project: str) -> Optional[RunRecord]:
-    candidates = [r for r in state.runs if r.project == project and r.status not in RunStatus.ACTIVE]
+    candidates = [
+        (idx, r) for idx, r in enumerate(state.runs) if r.project == project and r.status not in RunStatus.ACTIVE
+    ]
     if not candidates:
-        candidates = [r for r in state.runs if r.project == project]
+        candidates = [(idx, r) for idx, r in enumerate(state.runs) if r.project == project]
     if not candidates:
         return None
-    return max(candidates, key=lambda r: r.created_at)
+    return max(candidates, key=lambda item: (_run_sort_ts(item[1]), -item[0]))[1]
 
 
 def _selected_run(state: TuiState) -> Optional[RunRecord]:
@@ -616,7 +628,10 @@ def _inspector_lines(state: TuiState, pal: Palette, run: Optional[RunRecord], ma
         _paint(pal, pal.dim(), "revision ") + _clean(run.revision or UNSET),
         _paint(pal, pal.dim(), "status   ")
         + _paint(pal, _status_style(pal, run.status), _STATUS_WORD.get(run.status, _clean(run.status)[:4])),
-        _paint(pal, pal.dim(), "counts   ") + f"{_counts(run)}  fail={run.fail_count} skip={run.skip_count}",
+        _paint(pal, pal.dim(), "counts   ")
+        + f"{_counts(run)}  fail={run.fail_count}"
+        + (f" err={run.error_count}" if run.error_count else "")
+        + f" skip={run.skip_count}",
         _paint(pal, pal.dim(), "duration ") + _fmt_duration(run.duration_ms),
     ]
     lines.extend(_wrap_field(pal, "failure", run.first_failure or UNSET, max_width))
@@ -644,7 +659,10 @@ def _detail_lines(state: TuiState, pal: Palette) -> List[str]:
         _paint(pal, pal.dim(), "revision ") + _clean(run.revision or UNSET),
         _paint(pal, pal.dim(), "status   ")
         + _paint(pal, _status_style(pal, run.status), _STATUS_WORD.get(run.status, run.status)),
-        _paint(pal, pal.dim(), "counts   ") + f"pass {run.pass_count}/{run.total_count}  fail={run.fail_count}  skip={run.skip_count}",
+        _paint(pal, pal.dim(), "counts   ")
+        + f"pass {run.pass_count}/{run.total_count}  fail={run.fail_count}"
+        + (f"  err={run.error_count}" if run.error_count else "")
+        + f"  skip={run.skip_count}",
         _paint(pal, pal.dim(), "duration ") + _fmt_duration(run.duration_ms),
         _paint(pal, pal.dim(), "failure  ") + _clean(run.first_failure or UNSET),
         _paint(pal, pal.dim(), "repro    ") + _clean(_repro_for(run) or UNSET),

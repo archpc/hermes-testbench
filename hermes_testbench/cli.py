@@ -374,32 +374,53 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 0
 
             if args.command == "messaging-verify":
+                from .discovery import detect_git_metadata
+                from .engine import host_environment_snapshot, messaging_paths
                 from .messaging_suite import run_agent_messaging_verification  # type: ignore
-                from .schema import RunRecord, new_run_id, utc_now_iso
+                from .schema import FailureKind, RunRecord, new_run_id, utc_now_iso
                 import time as _time
                 rid = new_run_id()
                 now = utc_now_iso()
-                art_root = Path("/Users/sein/.hermes/artifacts/agent-messaging")
+                art_root, ha_root = messaging_paths()
+                has_art_root = art_root.is_dir()
+                target_root = art_root if has_art_root else (ha_root if ha_root.is_dir() else Path.cwd())
+                rev, branch = detect_git_metadata(target_root)
+                ha_rev, _ha_br = detect_git_metadata(ha_root) if ha_root.is_dir() else ("unversioned", "")
+                env_snap = host_environment_snapshot()
+                env_snap["hermes_agent_revision"] = ha_rev
+                # Recorded so `reproduce` replays with identical artifact_root semantics.
+                env_snap["messaging_artifact_root"] = str(art_root) if has_art_root else ""
+                repro_argv = ["testbench", "messaging-verify"] + (["--hermes-pytest"] if args.hermes_pytest else [])
                 run = RunRecord(
                     run_id=rid,
                     project="agent-messaging",
-                    project_root=str(art_root if art_root.exists() else Path.cwd()),
-                    revision="verified",
+                    project_root=str(target_root),
+                    revision=rev,
+                    branch=branch,
                     profile="verification",
                     status=RunStatus.RUNNING,
+                    commands=[repro_argv],
                     created_at=now,
                     started_at=now,
+                    environment=env_snap,
                 )
                 store.create_run(run)
                 t0 = _time.monotonic()
-                with store.hold_run_lock(rid):
-                    suites = run_agent_messaging_verification(
-                        store.run_dir(rid),
-                        artifact_root=art_root if art_root.exists() else None,
-                        hermes_agent_root=Path("/Users/sein/.hermes/hermes-agent"),
-                        run_hermes_pytest=args.hermes_pytest,
-                    )
-                    done = eng._populate_and_finalize(run, suites, [], t0)
+                try:
+                    with store.hold_run_lock(rid):
+                        suites = run_agent_messaging_verification(
+                            store.run_dir(rid),
+                            artifact_root=art_root if has_art_root else None,
+                            hermes_agent_root=ha_root,
+                            run_hermes_pytest=args.hermes_pytest,
+                        )
+                        done = eng._populate_and_finalize(run, suites, [], t0)
+                except Exception as exc:
+                    run.status = RunStatus.ERROR
+                    run.failure_kind = FailureKind.HARNESS_ERROR
+                    run.error_count = 1
+                    run.first_failure = f"Messaging verification error: {exc}"[:300]
+                    done = store.finalize_run(run)
                 if args.json:
                     sys.stdout.write(render_run_json(done))
                 else:

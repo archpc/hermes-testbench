@@ -58,6 +58,49 @@ testbench prune --keep-last 50 --dry-run
 testbench prune --keep-last 50
 ```
 
-## 5. Optional Local MCP Registration
+## 5. Installed CLI vs Development Checkouts
+
+The installed CLI runs an immutable release snapshot, never a working checkout. A checkout or worktree under `~/Code/hermes-testbench*` can change branch, carry uncommitted edits, or be deleted without affecting `~/.local/bin/testbench`, the `hx:testbench` TUI, detached workers, or MCP.
+
+Layout:
+
+```
+~/.local/opt/testbench/releases/<sha>/   git archive of one commit (read-only by convention)
+~/.local/opt/testbench/current           symlink -> releases/<sha>
+~/.local/bin/testbench                   symlink -> ~/.local/opt/testbench/current/bin/testbench
+```
+
+`bin/testbench` resolves its own path, so the CLI, `_worker` (`PYTHONPATH=repo_package_root()`), and the TUI import from `releases/<sha>`. A worker spawned before a switch keeps the release it started from. The store (`~/.local/share/testbench`, `SCHEMA_VERSION`) is shared across releases; check `SCHEMA_VERSION` in `hermes_testbench/schema.py` before deploying, and never switch across a schema change without a migration.
+
+Deploy (from a clean, merged commit; `S` = a checkout, `R` = the commit):
+
+```sh
+S=~/Code/hermes-testbench; R=$(git -C "$S" rev-parse --short HEAD)
+O=~/.local/opt/testbench; mkdir -p "$O/releases"
+test -z "$(git -C "$S" status --porcelain)"                      # refuse dirty trees
+mkdir "$O/releases/$R.tmp" && git -C "$S" archive "$R" | tar -x -C "$O/releases/$R.tmp"
+mv "$O/releases/$R.tmp" "$O/releases/$R" && echo "$R" > "$O/releases/$R/RELEASE"
+testbench --home "$(mktemp -d ~/.hermes/cache/scratch/tb-predeploy.XXXX)" run "$O/releases/$R" --profile unit   # smoke from the release
+ln -s "releases/$R" "$O/current.new" && mv -h "$O/current.new" "$O/current"                                   # atomic switch
+```
+
+One-time launcher switch (replaces the checkout symlink; atomic):
+
+```sh
+ln -s ~/.local/opt/testbench/current/bin/testbench ~/.local/bin/testbench.new && mv -h ~/.local/bin/testbench.new ~/.local/bin/testbench
+```
+
+Rollback: point `current` at the previous release with the same `ln -s ... current.new && mv -h` pair. Rolling back the one-time launcher switch: `ln -s ~/Code/hermes-testbench/bin/testbench ~/.local/bin/testbench.new && mv -h ~/.local/bin/testbench.new ~/.local/bin/testbench`.
+
+TUI restart after a switch or rollback. The running TUI keeps the code it loaded; respawn only its own pane, found by window name, never by index:
+
+```sh
+P=$(tmux list-panes -a -F '#{window_name} #{pane_id}' | awk '$1=="hx:testbench"{print $2; exit}')
+tmux respawn-pane -k -t "$P" "$HOME/.local/bin/testbench tui"
+```
+
+`respawn-pane -k` keeps the window id and name, so `hermes-tmux` ownership and restore logic are unaffected. In-flight async runs are not interrupted. Retain the last three releases; delete older ones only when no `_worker` process references them (`ps -axo command | grep releases/<sha>`).
+
+## 6. Optional Local MCP Registration
 
 `testbench mcp` speaks stdio MCP JSON-RPC 2.0 (`2024-11-05` through `2025-11-25`, verified against Hermes's `mcp` 2.0 SDK client). It remains unregistered in live `~/.hermes/config.yaml` by default so CLI + skill workflows work with zero gateway config changes; to enable MCP tools (`testbench_discover`, `testbench_run`, `testbench_status`, `testbench_results`, `testbench_reproduce`, `testbench_cancel`, `testbench_benchmark`), register `command: ~/.local/bin/testbench`, `args: ["mcp"]` under `mcp_servers.testbench` and include `mcp-testbench` if `platform_toolsets.cli` uses an explicit MCP allowlist.
