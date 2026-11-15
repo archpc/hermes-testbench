@@ -173,6 +173,7 @@ def execute_suite(
     max_tokens: int = 0,
     cancel_flag_path: Optional[Path] = None,
     scratch_root: Optional[Path] = None,
+    on_spawn: Optional[Any] = None,
 ) -> Tuple[SuiteResult, Optional[Dict[str, Any]]]:
     """Run one suite exactly once under isolation and map its output to a result."""
     project_root = Path(project_root)
@@ -263,8 +264,9 @@ def execute_suite(
             env_overrides=suite.env_overrides,
             cancel_flag_path=cancel_flag_path,
             scratch_root=scratch_root,
+            on_spawn=on_spawn,
         )
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         result = _base_result(suite, cwd=cwd, status=RunStatus.ERROR, repro=repro, started_at=started_at)
         result.total_count = 1
         result.error_count = 1

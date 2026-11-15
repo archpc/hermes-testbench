@@ -106,24 +106,26 @@ def default_scratch_root() -> Path:
 
 def short_writable_tmux_base(preferred: Path) -> Path:
     """Return a writable directory short enough for macOS 104-byte sockaddr_un."""
-    candidates: List[Path] = []
     tb_sc = os.environ.get("TESTBENCH_SCRATCH_DIR", "").strip()
     if tb_sc:
         p = Path(tb_sc).expanduser().resolve()
-        candidates.extend([p.parent, p])
-    candidates.append((real_user_home() / ".hermes" / "cache" / "scratch").resolve())
+        if len(str(p)) <= 68 and _probe_writable_dir(p):
+            return p
+        if len(str(p.parent)) <= 68 and _probe_writable_dir(p.parent):
+            return p.parent
+    canonical_scratch = (real_user_home() / ".hermes" / "cache" / "scratch").resolve()
+    if len(str(canonical_scratch)) <= 68 and _probe_writable_dir(canonical_scratch):
+        return canonical_scratch
     pref_res = preferred.expanduser().resolve()
-    candidates.append(pref_res)
+    if len(str(pref_res)) <= 68 and _probe_writable_dir(pref_res):
+        return pref_res
     for anc in pref_res.parents:
-        if len(str(anc)) < 15:
+        # Never walk into ~/.hermes root or user home root
+        if anc in (real_user_home(), (real_user_home() / ".hermes").resolve()) or len(str(anc)) < 20:
             break
-        candidates.append(anc)
-    best: Optional[Path] = None
-    for cand in candidates:
-        if len(str(cand)) <= 74 and _probe_writable_dir(cand):
-            if best is None or len(str(cand)) < len(str(best)):
-                best = cand
-    return best if best is not None else pref_res
+        if len(str(anc)) <= 68 and _probe_writable_dir(anc):
+            return anc
+    return pref_res
 
 
 def _process_start_fingerprint(pid: int) -> Optional[str]:
@@ -169,8 +171,7 @@ def terminate_process_group(
         return True
     if expected_start_time is not None:
         live_fp = _process_start_fingerprint(pgid)
-        # If the leader is still alive with a different start fingerprint, PGID was recycled.
-        if live_fp is not None and live_fp != expected_start_time:
+        if live_fp != expected_start_time:
             return False
 
     try:
@@ -223,6 +224,85 @@ def _sb_quote(path: Path) -> str:
     return f'"{raw}"'
 
 
+def _sweep_sandbox_survivors(sandbox_dir: Path) -> Tuple[int, int]:
+    """Reap any daemonized/setsid descendants still holding files/cwd/argv inside sandbox_dir."""
+    if not sandbox_dir.exists():
+        return 0, 0
+    sb_str = str(sandbox_dir.resolve())
+    me = os.getpid()
+    pids: set[int] = set()
+    lsof_bin = "/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else shutil.which("lsof")
+    if lsof_bin:
+        try:
+            proc = subprocess.run(
+                [lsof_bin, "-t", "+D", sb_str],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+            for ln in (proc.stdout or "").splitlines():
+                ln = ln.strip()
+                if ln.isdigit():
+                    p = int(ln)
+                    if p > 1 and p != me:
+                        pids.add(p)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        ps_proc = subprocess.run(
+            ["/bin/ps", "-ax", "-o", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        for ln in (ps_proc.stdout or "").splitlines():
+            ln = ln.strip()
+            if not ln or sb_str not in ln:
+                continue
+            parts = ln.split(None, 1)
+            if parts and parts[0].isdigit():
+                p = int(parts[0])
+                if p > 1 and p != me:
+                    pids.add(p)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    if not pids:
+        return 0, 0
+
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + 0.25
+    while time.monotonic() < deadline:
+        if not any(_pid_alive(p) for p in pids):
+            break
+        time.sleep(0.02)
+    for p in pids:
+        if _pid_alive(p):
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+    time.sleep(0.05)
+    leaked = sum(1 for p in pids if _pid_alive(p))
+    return len(pids) - leaked, leaked
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
 def build_seatbelt_profile(
     *,
     sandbox_dir: Path,
@@ -230,54 +310,80 @@ def build_seatbelt_profile(
     extra_writable_dirs: Tuple[Path, ...] = (),
     allow_network: bool = False,
     allow_repo_write: bool = False,
+    allow_uv_cache_write: bool = False,
 ) -> str:
     u_home = real_user_home()
     hermes_dir = u_home / ".hermes"
     hxmail_support = u_home / "Library" / "Application Support" / "hxmail"
+    hxlab_dir = (hermes_dir / "cache" / "scratch" / "hxlab").resolve()
     resolved_sb = sandbox_dir.resolve()
     resolved_cwd = cwd.resolve()
 
+    uid = os.getuid()
     rules = [
         "(version 1)",
         "(allow default)",
         '(allow process-exec (literal "/bin/ps") (with no-sandbox))',
+        "(deny file-write*)",
+        f'(deny file-read* (subpath "/private/tmp/tmux-{uid}") (subpath "/private/var/tmp/tmux-{uid}"))',
     ]
     if not allow_network:
         rules.append("(deny network*)")
         rules.append("(allow network* (local unix))")
+        rules.append(
+            f'(deny network-outbound (remote unix-socket (literal "/private/var/run/mDNSResponder")) '
+            f'(remote unix-socket (subpath "/private/tmp/tmux-{uid}")) '
+            f'(remote unix-socket (subpath "/private/var/run/docker.sock")))'
+        )
         rules.append('(allow network-bind (local ip "localhost:*"))')
         rules.append('(allow network-inbound (local ip "localhost:*"))')
         rules.append('(allow network-outbound (remote ip "localhost:*"))')
-        rules.append('(deny network-outbound (remote ip "localhost:9119"))')
+        rules.append(
+            '(deny network-outbound (remote ip "localhost:9119") '
+            '(remote ip "localhost:9222") (remote ip "localhost:11434"))'
+        )
 
     rules.append(
         "(deny file-read-data "
         f"(subpath {_sb_quote(u_home / '.ssh')}) "
         f"(subpath {_sb_quote(u_home / '.aws')}) "
         f"(subpath {_sb_quote(u_home / '.gnupg')}) "
+        f"(subpath {_sb_quote(u_home / '.config' / 'gh')}) "
+        f"(subpath {_sb_quote(u_home / '.docker')}) "
+        f"(literal {_sb_quote(u_home / '.netrc')}) "
+        f"(literal {_sb_quote(u_home / '.npmrc')}) "
+        f"(subpath {_sb_quote(u_home / 'Library' / 'Keychains')}) "
         f"(literal {_sb_quote(u_home / '.cargo' / 'credentials.toml')}) "
         f"(literal {_sb_quote(u_home / '.cargo' / 'credentials')}) "
+        f"(literal {_sb_quote(hermes_dir / 'config.yaml')}) "
         f"(literal {_sb_quote(hermes_dir / '.env')}) "
         f"(literal {_sb_quote(hermes_dir / 'auth.json')}) "
+        f"(literal {_sb_quote(hermes_dir / 'state.db')}) "
+        f"(literal {_sb_quote(hermes_dir / 'state.db-wal')}) "
+        f"(literal {_sb_quote(hermes_dir / 'state.db-shm')}) "
+        f"(subpath {_sb_quote(hermes_dir / 'sessions')}) "
+        f"(subpath {_sb_quote(hermes_dir / 'profiles')}) "
+        f"(subpath {_sb_quote(hermes_dir / 'memories')}) "
+        f"(subpath {_sb_quote(hermes_dir / 'logs')}) "
         f"(subpath {_sb_quote(hermes_dir / 'mcp-tokens')}) "
         f"(subpath {_sb_quote(hxmail_support)}))"
     )
-    rules.append(
-        "(deny file-write* "
-        f"(subpath {_sb_quote(hermes_dir)}) "
-        f"(subpath {_sb_quote(u_home / '.cargo')}) "
-        f"(subpath {_sb_quote(u_home / '.rustup')}) "
-        f"(subpath {_sb_quote(hxmail_support)}))"
-    )
-    scratch_allow = _sb_quote((hermes_dir / "cache" / "scratch").resolve())
-    rules.append(f"(allow file-write* (subpath {scratch_allow}))")
-    if not allow_repo_write:
-        rules.append(f"(deny file-write* (subpath {_sb_quote(resolved_cwd)}))")
 
-    extra_allows = " ".join(f"(subpath {_sb_quote(p.resolve())})" for p in extra_writable_dirs)
-    rules.append(
-        f"(allow file-write* (subpath {_sb_quote(resolved_sb)}) {extra_allows} (subpath \"/dev\"))"
+    write_targets = [resolved_sb, hxlab_dir, *(p.resolve() for p in extra_writable_dirs)]
+    if allow_repo_write:
+        write_targets.append(resolved_cwd)
+    if allow_uv_cache_write and (u_home / ".cache" / "uv").is_dir():
+        write_targets.append((u_home / ".cache" / "uv").resolve())
+
+    # Preserve comment reference to .cargo for auditability while deny-by-default blocks ~/.cargo writes
+    rules.append(f"; deny-by-default protects {u_home / '.cargo'} and {hermes_dir}")
+    allow_subpaths = " ".join(f"(subpath {_sb_quote(p)})" for p in write_targets)
+    dev_allows = (
+        '(literal "/dev/null") (literal "/dev/zero") (literal "/dev/tty") '
+        '(literal "/dev/ptmx") (literal "/dev/urandom") (literal "/dev/random") '
+        '(literal "/dev/dtracehelper") (regex #"^/dev/ttys[0-9]+$") (regex #"^/dev/fd/[0-9]+$")'
     )
+    rules.append(f"(allow file-write* {allow_subpaths} {dev_allows})")
     return "\n".join(rules)
 
 
@@ -354,6 +460,7 @@ def build_isolated_env(
     clean["XDG_CACHE_HOME"] = str(subdirs["xdg_cache"])
     clean["TMPDIR"] = str(subdirs["tmp"])
     clean["TESTBENCH_SCRATCH_DIR"] = str(subdirs["tmp"])
+    clean["TESTBENCH_HOME"] = str(subdirs["xdg_data"] / "testbench")
     clean["CARGO_HOME"] = str(subdirs["cargo_home"])
     clean["CARGO_TARGET_DIR"] = str(subdirs["cargo_target"])
     if (u_home / ".rustup").is_dir():
@@ -467,9 +574,9 @@ def run_isolated_command(
     nonce = os.urandom(6).hex()
     sandbox_dir = sroot / f"tbw-{nonce[:4]}"
     # Keep Unix domain socket paths well under macOS sockaddr_un.sun_path (104 bytes)
-    tmux_socket = f"s{nonce[:4]}" if needs_tmux else ""
+    tmux_socket = f"s{nonce[:8]}" if needs_tmux else ""
     short_tmux_base = short_writable_tmux_base(sroot) if needs_tmux else sroot
-    tmux_tmpdir: Optional[Path] = (short_tmux_base / f"tx{nonce[:5]}") if needs_tmux else None
+    tmux_tmpdir: Optional[Path] = (short_tmux_base / f"tx{nonce[:6]}") if needs_tmux else None
 
     env = build_isolated_env(
         sandbox_dir,
@@ -489,12 +596,14 @@ def run_isolated_command(
             seatbelt_state = "unavailable"
         elif can_apply_seatbelt():
             extra_dirs = (tmux_tmpdir,) if tmux_tmpdir is not None else ()
+            uses_uv = Path(command[0]).name == "uv"
             profile = build_seatbelt_profile(
                 sandbox_dir=sandbox_dir,
                 cwd=resolved_cwd,
                 extra_writable_dirs=extra_dirs,
                 allow_network=allow_network,
                 allow_repo_write=allow_repo_write,
+                allow_uv_cache_write=uses_uv,
             )
             effective_argv = [sb_bin, "-p", profile, *effective_argv]
             env["TESTBENCH_SEATBELT_ACTIVE"] = "1"
@@ -522,6 +631,8 @@ def run_isolated_command(
     pty_master_fd = -1
     t0 = time.monotonic()
 
+    reaped_survivors = 0
+    leaked_children = 0
     try:
         with (
             _open_0600_write(stdout_path) as out_f,
@@ -634,10 +745,12 @@ def run_isolated_command(
                             continue
                         if stream_kind == "stdout":
                             decoded = stdout_dec.decode(chunk, final=False)
-                            _emit_out(stdout_redactor.feed(decoded))
+                            if stdout_mem_len < MAX_MEM_CAPTURE_CHARS or disk_bytes_written < MAX_DISK_LOG_BYTES:
+                                _emit_out(stdout_redactor.feed(decoded))
                         else:
                             decoded = stderr_dec.decode(chunk, final=False)
-                            _emit_err(stderr_redactor.feed(decoded))
+                            if stderr_mem_len < MAX_MEM_CAPTURE_CHARS or disk_bytes_written < MAX_DISK_LOG_BYTES:
+                                _emit_err(stderr_redactor.feed(decoded))
             finally:
                 sel.close()
                 if pty_master_fd >= 0:
@@ -676,7 +789,10 @@ def run_isolated_command(
         if needs_tmux and tmux_socket and tmux_tmpdir is not None:
             _kill_disposable_tmux(tmux_socket, tmux_tmpdir)
             _safe_rmtree_no_symlinks(tmux_tmpdir)
-        _safe_rmtree_no_symlinks(sandbox_dir)
+        if timed_out or cancelled or (exit_code is not None and exit_code != 0):
+            reaped_survivors, leaked_children = _sweep_sandbox_survivors(sandbox_dir)
+        if leaked_children == 0:
+            _safe_rmtree_no_symlinks(sandbox_dir)
 
     duration_ms = (time.monotonic() - t0) * 1000.0
     return IsolatedExecResult(
@@ -699,5 +815,7 @@ def run_isolated_command(
             "needs_tmux": needs_tmux,
             "needs_pty": needs_pty,
             "tmux_socket": tmux_socket or None,
+            "reaped_survivors": reaped_survivors,
+            "leaked_children": leaked_children,
         },
     )

@@ -329,7 +329,9 @@ def _overview_runs(state: TuiState) -> List[RunRecord]:
         (r for r in runs if r.status in RunStatus.ACTIVE),
         key=lambda r: (0 if r.status == RunStatus.RUNNING else 1, r.created_at),
     )
-    terminal = [r for r in runs if r.status not in RunStatus.ACTIVE]
+    terminal = [
+        r for r in runs if r.status not in RunStatus.ACTIVE and r.profile != ProfileName.BENCHMARK
+    ]
     latest: Dict[str, RunRecord] = {}
     for run in sorted(terminal, key=lambda r: r.created_at):
         latest[run.project] = run
@@ -409,6 +411,9 @@ def _repro_for(run: RunRecord) -> str:
 def _counts(run: RunRecord) -> str:
     total = run.total_count or 0
     passed = run.pass_count or 0
+    skipped = run.skip_count or 0
+    if (run.fail_count or 0) == 0 and (run.error_count or 0) == 0 and skipped > 0 and passed > 0:
+        return f"{passed}+{skipped}s"
     return f"{passed}/{total}"
 
 
@@ -568,26 +573,62 @@ def _empty_message(state: TuiState, marks: Dict[str, str]) -> str:
     return " no runs recorded - press r to run a profile"
 
 
-def _inspector_lines(state: TuiState, pal: Palette, run: Optional[RunRecord]) -> List[str]:
+def _wrap_field(pal: Palette, label: str, value: str, max_width: int) -> List[str]:
+    prefix_plain = f"{label:<9}"
+    avail = max(16, max_width - len(prefix_plain))
+    cleaned = _clean(value or UNSET)
+    if len(cleaned) <= avail:
+        return [_paint(pal, pal.dim(), prefix_plain) + cleaned]
+    chunks: List[str] = []
+    pos = 0
+    while pos < len(cleaned):
+        piece = cleaned[pos : pos + avail]
+        if pos == 0:
+            chunks.append(_paint(pal, pal.dim(), prefix_plain) + piece)
+        else:
+            chunks.append(" " * len(prefix_plain) + piece)
+        pos += avail
+    return chunks
+
+
+def _prioritized_logs(run: RunRecord, raw_logs: Sequence[str], limit: int = 4) -> List[str]:
+    if not raw_logs:
+        return []
+    if run.status in _FAILURE_STATUSES:
+        fail_lines = [
+            ln for ln in raw_logs
+            if any(tok in ln for tok in ("[FAIL]", "FAIL:", "ERROR:", "FAILED", "AssertionError", "Traceback"))
+        ]
+        other_tail = [ln for ln in raw_logs[-limit:] if ln not in fail_lines]
+        return (fail_lines + other_tail)[:limit]
+    return list(raw_logs[-limit:])
+
+
+def _inspector_lines(state: TuiState, pal: Palette, run: Optional[RunRecord], max_width: int = 64) -> List[str]:
     if run is None:
         return [_paint(pal, pal.dim(), "no run selected")]
-    delegated = f"[deleg:{_clean(run.delegation_id)}]" if run.delegation_id else UNSET
+    tb_repro = f"testbench reproduce {_clean(run.run_id)}"
+    raw_repro = _clean(_repro_for(run))
     lines = [
         _paint(pal, pal.bold(), "RUN ") + _clean(run.run_id),
         _paint(pal, pal.dim(), "project  ") + _clean(run.project),
         _paint(pal, pal.dim(), "profile  ") + _clean(run.profile),
         _paint(pal, pal.dim(), "revision ") + _clean(run.revision or UNSET),
         _paint(pal, pal.dim(), "status   ")
-        + _paint(pal, _status_style(pal, run.status), _STATUS_WORD.get(run.status, run.status)),
+        + _paint(pal, _status_style(pal, run.status), _STATUS_WORD.get(run.status, _clean(run.status)[:4])),
         _paint(pal, pal.dim(), "counts   ") + f"{_counts(run)}  fail={run.fail_count} skip={run.skip_count}",
         _paint(pal, pal.dim(), "duration ") + _fmt_duration(run.duration_ms),
-        _paint(pal, pal.dim(), "failure  ") + _clean(run.first_failure or UNSET),
-        _paint(pal, pal.dim(), "repro    ") + _clean(_repro_for(run) or UNSET),
-        _paint(pal, pal.dim(), "evidence ") + _clean(run.evidence_dir or UNSET),
-        _paint(pal, pal.dim(), "deleg    ") + delegated,
-        _paint(pal, pal.dim(), "log      ") + f"{len(state.log_lines.get(run.run_id, ()))} lines",
     ]
-    for log in list(state.log_lines.get(run.run_id, ()))[:3]:
+    lines.extend(_wrap_field(pal, "failure", run.first_failure or UNSET, max_width))
+    lines.extend(_wrap_field(pal, "repro", tb_repro, max_width))
+    if raw_repro:
+        lines.extend(_wrap_field(pal, "cmd", raw_repro, max_width))
+    lines.extend(_wrap_field(pal, "evidence", run.evidence_dir or UNSET, max_width))
+    if run.delegation_id:
+        lines.append(_paint(pal, pal.dim(), "deleg    ") + f"[deleg:{_clean(run.delegation_id)}]")
+    raw_logs = list(state.log_lines.get(run.run_id, ()))
+    lines.append(_paint(pal, pal.dim(), "log      ") + f"{len(raw_logs)} lines")
+    for log in _prioritized_logs(run, raw_logs, limit=4):
         lines.append("  " + _clean(log))
     return lines
 
@@ -694,10 +735,11 @@ def _header_line(state: TuiState, pal: Palette, width: int, marks: Dict[str, str
         + _paint(pal, pal.dim(), sep)
         + _paint(pal, pal.blue(), _clean(state.view))
     )
+    scope_runs = _overview_runs(state) if state.view == "overview" else _history_runs(state)
     running = sum(1 for r in state.runs if r.status == RunStatus.RUNNING)
     queued = sum(1 for r in state.runs if r.status == RunStatus.QUEUED)
-    passed = sum(1 for r in state.runs if r.status == RunStatus.PASS)
-    failed = sum(1 for r in state.runs if r.status == RunStatus.FAIL)
+    passed = sum(1 for r in scope_runs if r.status == RunStatus.PASS)
+    failed = sum(1 for r in scope_runs if r.status in _FAILURE_STATUSES)
     store = "unavailable" if state.error_banner else _clean(state.store_status or "ok")
     right_bits = [
         _paint(pal, pal.blue() if running or queued else pal.dim(), f"{running} running"),
@@ -986,12 +1028,12 @@ def render_frame(
     elif state.picker_open:
         body.extend(_fit_body(_picker_lines(state, pal, marks), remaining, width))
     elif width >= 120:
-        left_w = max(30, min(78, width // 2 + 2))
+        left_w = max(30, min(68, width // 2 - 2))
         right_w = max(10, width - left_w - 2)
         left_rows = _list_rows(state, pal, left_w, marks)
         if not left_rows:
             left_rows = [_paint(pal, pal.dim(), _empty_message(state, marks))]
-        right_rows = _inspector_lines(state, pal, _selected_run(state))
+        right_rows = _inspector_lines(state, pal, _selected_run(state), max_width=right_w)
         split: List[str] = []
         for index in range(remaining):
             left = left_rows[index] if index < len(left_rows) else ""
@@ -1002,6 +1044,9 @@ def render_frame(
         rows = _list_rows(state, pal, width, marks)
         if not rows:
             rows = [_paint(pal, pal.dim(), _empty_message(state, marks))]
+        sel_run = _selected_run(state)
+        if sel_run is not None and remaining >= len(rows) + 5:
+            rows = list(rows) + [""] + _inspector_lines(state, pal, sel_run, max_width=width)[: max(4, remaining - len(rows) - 1)]
         body.extend(_fit_body(rows, remaining, width))
 
     if len(body) > body_h:
@@ -1010,7 +1055,9 @@ def render_frame(
         body.append(blank)
     lines.extend(body)
 
-    lines.append(fit_cells(" " + HINTS_LINE, width) + "\033[0m")
+    compact_hints = "j/k move  Enter inspect  Tab view  p proj  r run  R rerun  x cancel  ? help"
+    hints_str = HINTS_LINE if width >= len(HINTS_LINE) + 2 else compact_hints
+    lines.append(fit_cells(" " + hints_str, width) + "\033[0m")
     lines.append(_minibuffer_line(state, pal, width))
     return lines
 

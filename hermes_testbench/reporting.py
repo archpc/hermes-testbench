@@ -31,23 +31,24 @@ def render_junit_xml(run: RunRecord) -> str:
         {
             "id": _clean_field(run.run_id),
             "name": _clean_field(f"{run.project}:{run.profile}"),
-            "tests": str(run.total_count),
-            "failures": str(run.fail_count),
-            "errors": str(run.error_count),
-            "skipped": str(run.skip_count),
+            "tests": "0",
+            "failures": "0",
+            "errors": "0",
+            "skipped": "0",
             "time": f"{(run.duration_ms or 0.0) / 1000.0:.3f}",
         },
     )
+    tot_t = tot_f = tot_e = tot_s = 0
     for suite in run.suites:
         ts_el = ET.SubElement(
             root,
             "testsuite",
             {
                 "name": _clean_field(suite.name),
-                "tests": str(suite.total_count),
-                "failures": str(suite.fail_count),
-                "errors": str(suite.error_count),
-                "skipped": str(suite.skip_count),
+                "tests": "0",
+                "failures": "0",
+                "errors": "0",
+                "skipped": "0",
                 "time": f"{suite.duration_ms / 1000.0:.3f}",
             },
         )
@@ -70,7 +71,7 @@ def render_junit_xml(run: RunRecord) -> str:
                     e_el = ET.SubElement(tc_el, "error", {"type": case.status, "message": msg[:500]})
                     e_el.text = msg
                 elif case.status in (RunStatus.SKIP, RunStatus.BLOCKED):
-                    ET.SubElement(tc_el, "skipped", {"message": msg[:500]})
+                    ET.SubElement(tc_el, "skipped", {"type": case.status, "message": msg[:500]})
         elif suite.failures:
             for fail in suite.failures:
                 tc_el = ET.SubElement(
@@ -79,8 +80,45 @@ def render_junit_xml(run: RunRecord) -> str:
                     {"classname": _clean_field(suite.name), "name": _clean_field(fail.case_name)},
                 )
                 msg = _clean_field(fail.message or fail.excerpt)
-                f_el = ET.SubElement(tc_el, "failure", {"type": _clean_field(fail.kind), "message": msg[:500]})
-                f_el.text = _clean_field(fail.excerpt or fail.message)
+                if suite.status in (RunStatus.TIMEOUT, RunStatus.ERROR) or fail.kind in ("timeout", "spawn_error", "harness_error", "signal_crash"):
+                    e_el = ET.SubElement(tc_el, "error", {"type": _clean_field(fail.kind), "message": msg[:500]})
+                    e_el.text = _clean_field(fail.excerpt or fail.message)
+                else:
+                    f_el = ET.SubElement(tc_el, "failure", {"type": _clean_field(fail.kind), "message": msg[:500]})
+                    f_el.text = _clean_field(fail.excerpt or fail.message)
+        elif suite.status in (RunStatus.SKIP, RunStatus.BLOCKED, RunStatus.CANCELLED):
+            tc_el = ET.SubElement(
+                ts_el,
+                "testcase",
+                {"classname": _clean_field(suite.name), "name": _clean_field(suite.name)},
+            )
+            msg = _clean_field(suite.summary_excerpt or suite.status)
+            ET.SubElement(tc_el, "skipped", {"type": _clean_field(suite.status), "message": msg[:500]})
+        elif suite.pass_count > 0:
+            tc_el = ET.SubElement(
+                ts_el,
+                "testcase",
+                {"classname": _clean_field(suite.name), "name": _clean_field(suite.name)},
+            )
+
+        s_cases = ts_el.findall("testcase")
+        s_f = sum(1 for c in s_cases if c.find("failure") is not None)
+        s_e = sum(1 for c in s_cases if c.find("error") is not None)
+        s_s = sum(1 for c in s_cases if c.find("skipped") is not None)
+        s_t = len(s_cases)
+        ts_el.attrib["tests"] = str(s_t)
+        ts_el.attrib["failures"] = str(s_f)
+        ts_el.attrib["errors"] = str(s_e)
+        ts_el.attrib["skipped"] = str(s_s)
+        tot_t += s_t
+        tot_f += s_f
+        tot_e += s_e
+        tot_s += s_s
+
+    root.attrib["tests"] = str(tot_t)
+    root.attrib["failures"] = str(tot_f)
+    root.attrib["errors"] = str(tot_e)
+    root.attrib["skipped"] = str(tot_s)
     xml_body = ET.tostring(root, encoding="unicode")
     return '<?xml version="1.0" encoding="utf-8"?>\n' + xml_body + "\n"
 

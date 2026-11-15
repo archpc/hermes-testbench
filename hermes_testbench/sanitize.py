@@ -50,6 +50,7 @@ class StreamRedactor:
     def __init__(self) -> None:
         self._buf: str = ""
         self._in_pem: Optional[str] = None
+        self._pem_redacted_emitted: bool = False
 
     def _redact_complete_lines(self, block: str) -> str:
         out_lines: List[str] = []
@@ -57,13 +58,16 @@ class StreamRedactor:
             if self._in_pem is not None:
                 m_end = _PEM_END_RE.search(line)
                 if m_end:
-                    out_lines.append("[REDACTED]\n")
+                    if not self._pem_redacted_emitted:
+                        out_lines.append("[REDACTED]\n")
                     out_lines.append(line)
                     self._in_pem = None
+                    self._pem_redacted_emitted = False
                 continue
             m_begin = _PEM_BEGIN_RE.search(line)
             if m_begin and not _PEM_END_RE.search(line):
                 self._in_pem = m_begin.group(1)
+                self._pem_redacted_emitted = False
                 out_lines.append(line)
                 continue
             out_lines.append(redact_secrets(line))
@@ -78,7 +82,14 @@ class StreamRedactor:
             complete = self._buf[: last_nl + 1]
             self._buf = self._buf[last_nl + 1 :]
             return self._redact_complete_lines(complete)
-        if len(self._buf) > self.MAX_BUFFER_CHARS and self._in_pem is None:
+        if len(self._buf) > self.MAX_BUFFER_CHARS:
+            if self._in_pem is not None:
+                # Cap memory inside an unclosed PEM stream while retaining tail for split END marker
+                self._buf = self._buf[-self.OVERLAP_TAIL :]
+                if not self._pem_redacted_emitted:
+                    self._pem_redacted_emitted = True
+                    return "[REDACTED]\n"
+                return ""
             # Flush safely past a whitespace boundary, retaining tail for split tokens
             cut = len(self._buf) - self.OVERLAP_TAIL
             ws = self._buf.rfind(" ", 0, cut)
@@ -94,9 +105,13 @@ class StreamRedactor:
         rem = self._buf
         self._buf = ""
         if self._in_pem is not None:
+            emitted = self._pem_redacted_emitted
             self._in_pem = None
-            return "[REDACTED]\n"
+            self._pem_redacted_emitted = False
+            return "" if emitted else "[REDACTED]\n"
         return redact_secrets(rem)
+
+    finish = flush
 
 
 def _is_forbidden_codepoint(cp: int) -> bool:

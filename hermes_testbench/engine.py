@@ -233,6 +233,7 @@ def _fallback_execute_suite(
     allow_billable: bool = False,
     max_tokens: int = 0,
     cancel_flag_path: Optional[Path] = None,
+    on_spawn: Optional[Any] = None,
 ) -> Tuple[SuiteResult, Optional[Dict[str, Any]]]:
     try:
         from .adapters import execute_suite  # type: ignore
@@ -245,6 +246,7 @@ def _fallback_execute_suite(
             allow_billable=allow_billable,
             max_tokens=max_tokens,
             cancel_flag_path=cancel_flag_path,
+            on_spawn=on_spawn,
         )
     except ImportError:
         pass
@@ -452,11 +454,20 @@ class TestBenchEngine:
         run.blocked_count = sum(s.blocked_count for s in suite_results)
         run.error_count = sum(s.error_count for s in suite_results)
         status, fkind = _aggregate_run_status(suite_results)
+        # Fencing against last-writer-wins: if cancel.flag was written or DB already records CANCELLED, keep CANCELLED
+        ev_cancel = (Path(run.evidence_dir) / "cancel.flag") if run.evidence_dir else (self.store.run_dir(run.run_id) / "cancel.flag")
+        existing = self.store.get_run(run.run_id)
+        if ev_cancel.exists() or (existing is not None and existing.status == RunStatus.CANCELLED):
+            status = RunStatus.CANCELLED
+            fkind = FailureKind.CANCELLED
         run.status = status
         run.failure_kind = fkind
 
         non_zero = [s.exit_code for s in suite_results if s.exit_code not in (None, 0)]
-        run.exit_code = non_zero[0] if non_zero else (0 if suite_results else None)
+        if status in (RunStatus.CANCELLED, RunStatus.TIMEOUT) and not non_zero:
+            run.exit_code = None
+        else:
+            run.exit_code = non_zero[0] if non_zero else (0 if suite_results else None)
 
         first_fail = ""
         for s in suite_results:
@@ -531,49 +542,81 @@ class TestBenchEngine:
             started_at=now,
             environment=host_environment_snapshot(),
             delegation_id=delegation_id or os.environ.get("HERMES_DELEGATION_ID") or None,
-            worker_pid=os.getpid(),
-            worker_pgid=os.getpgrp(),
+            worker_pid=None,
+            worker_pgid=None,
+            worker_start_time=None,
         )
         self.store.create_run(run)
         ev_dir = self.store.run_dir(rid)
         cancel_flag = ev_dir / "cancel.flag"
         t0 = time.monotonic()
 
-        with self.store.hold_run_lock(rid):
-            if not suites:
-                run.status = RunStatus.SKIP
-                run.summary = f"No suites matched profile={profile!r}"
-                return self.store.finalize_run(run)
+        def _record_child_spawn(cpid: int, cpgid: int, cfp: Optional[str]) -> None:
+            run.worker_pid = cpid
+            run.worker_pgid = cpgid
+            run.worker_start_time = cfp
+            self.store.update_run(run)
 
-            results: List[SuiteResult] = []
-            usages: List[Dict[str, Any]] = []
-            for s in suites:
-                if cancel_flag.exists():
-                    results.append(
-                        SuiteResult(
-                            name=s.name,
-                            adapter=s.adapter,
-                            profile=s.profile,
-                            command=list(s.command),
-                            cwd=str((resolved / s.cwd).resolve()),
-                            status=RunStatus.CANCELLED,
+        try:
+            with self.store.hold_run_lock(rid):
+                if not suites:
+                    run.status = RunStatus.SKIP
+                    run.summary = f"No suites matched profile={profile!r}"
+                    return self.store.finalize_run(run)
+
+                results: List[SuiteResult] = []
+                usages: List[Dict[str, Any]] = []
+                for s in suites:
+                    if cancel_flag.exists():
+                        results.append(
+                            SuiteResult(
+                                name=s.name,
+                                adapter=s.adapter,
+                                profile=s.profile,
+                                command=list(s.command),
+                                cwd=str((resolved / s.cwd).resolve()),
+                                status=RunStatus.CANCELLED,
+                            )
                         )
-                    )
-                    break
-                sres, usage = self._execute_suite_fn(
-                    s,
-                    project_root=resolved,
-                    evidence_dir=ev_dir,
-                    run_id=rid,
-                    trusted_manifest=spec.trusted,
-                    allow_billable=allow_billable,
-                    max_tokens=max_tokens,
-                    cancel_flag_path=cancel_flag,
-                )
-                results.append(sres)
-                if usage:
-                    usages.append(usage)
-            return self._populate_and_finalize(run, results, usages, t0)
+                        break
+                    try:
+                        sres, usage = self._execute_suite_fn(
+                            s,
+                            project_root=resolved,
+                            evidence_dir=ev_dir,
+                            run_id=rid,
+                            trusted_manifest=spec.trusted,
+                            allow_billable=allow_billable,
+                            max_tokens=max_tokens,
+                            cancel_flag_path=cancel_flag,
+                            on_spawn=_record_child_spawn,
+                        )
+                    except TypeError:
+                        # Custom injected _execute_suite_fn in unit tests without on_spawn kwarg
+                        sres, usage = self._execute_suite_fn(
+                            s,
+                            project_root=resolved,
+                            evidence_dir=ev_dir,
+                            run_id=rid,
+                            trusted_manifest=spec.trusted,
+                            allow_billable=allow_billable,
+                            max_tokens=max_tokens,
+                            cancel_flag_path=cancel_flag,
+                        )
+                    run.worker_pid = None
+                    run.worker_pgid = None
+                    run.worker_start_time = None
+                    results.append(sres)
+                    if usage:
+                        usages.append(usage)
+                return self._populate_and_finalize(run, results, usages, t0)
+        except Exception as exc:
+            run_err = self.store.get_run(rid) or run
+            run_err.status = RunStatus.ERROR
+            run_err.failure_kind = FailureKind.HARNESS_ERROR
+            run_err.error_count = max(1, run_err.error_count)
+            run_err.first_failure = f"Execution error: {exc}"[:300]
+            return self.store.finalize_run(run_err)
 
     def spawn_async(
         self,
@@ -651,8 +694,11 @@ class TestBenchEngine:
         # Reap our direct Popen handle in a tiny daemon thread so exited detached workers never become zombies
         import threading
         threading.Thread(target=proc.wait, daemon=True).start()
+        from .isolation import _process_start_fingerprint
         run.worker_pid = proc.pid
         run.worker_pgid = proc.pid
+        run.worker_start_time = _process_start_fingerprint(proc.pid)
+        self.store.update_run(run)
 
         bound = min(max(0.0, float(wait_up_to_s)), 30.0)
         deadline = time.monotonic() + bound
@@ -775,10 +821,18 @@ class TestBenchEngine:
                 break
             time.sleep(0.05)
 
-        # If still locked and owned worker_pgid is recorded, terminate only that owned group
+        # Only signal a dedicated TestBench-owned session group with a verified start fingerprint;
+        # NEVER signal our own caller process group or a group lacking worker_start_time!
         cur = self.store.get_run(run_id) or rec
-        if cur.status not in RunStatus.TERMINAL and self.store.is_run_locked(run_id) and cur.worker_pgid:
-            terminate_process_group(int(cur.worker_pgid), grace_s=0.5)
+        wpgid = int(cur.worker_pgid) if cur.worker_pgid else 0
+        if (
+            cur.status not in RunStatus.TERMINAL
+            and self.store.is_run_locked(run_id)
+            and wpgid > 1
+            and wpgid != os.getpgrp()
+            and bool(cur.worker_start_time)
+        ):
+            terminate_process_group(wpgid, expected_start_time=cur.worker_start_time, grace_s=0.5)
             time.sleep(0.1)
 
         cur = self.store.get_run(run_id) or rec
@@ -835,29 +889,36 @@ class TestBenchEngine:
             ev_dir = self.store.run_dir(rid)
             t0 = time.monotonic()
             trusted = self.store.is_manifest_trusted(resolved)
-            with self.store.hold_run_lock(rid):
-                results: List[SuiteResult] = []
-                for prev_s in orig.suites:
-                    spec_s = SuiteSpec(
-                        name=prev_s.name,
-                        adapter=prev_s.adapter,
-                        profile=prev_s.profile,
-                        command=list(prev_s.command),
-                        cwd=prev_s.cwd,
-                        needs_tmux=bool(prev_s.isolation_meta.get("needs_tmux", False)),
-                        needs_pty=bool(prev_s.isolation_meta.get("needs_pty", False)),
-                        allow_network=bool(prev_s.isolation_meta.get("allow_network", False)),
-                        allow_repo_write=bool(prev_s.isolation_meta.get("allow_repo_write", False)),
-                    )
-                    sres, _ = self._execute_suite_fn(
-                        spec_s,
-                        project_root=resolved,
-                        evidence_dir=ev_dir,
-                        run_id=rid,
-                        trusted_manifest=trusted,
-                    )
-                    results.append(sres)
-                done = self._populate_and_finalize(replay, results, [], t0)
+            try:
+                with self.store.hold_run_lock(rid):
+                    results: List[SuiteResult] = []
+                    for prev_s in orig.suites:
+                        spec_s = SuiteSpec(
+                            name=prev_s.name,
+                            adapter=prev_s.adapter,
+                            profile=prev_s.profile,
+                            command=list(prev_s.command),
+                            cwd=prev_s.cwd,
+                            needs_tmux=bool(prev_s.isolation_meta.get("needs_tmux", False)),
+                            needs_pty=bool(prev_s.isolation_meta.get("needs_pty", False)),
+                            allow_network=bool(prev_s.isolation_meta.get("allow_network", False)),
+                            allow_repo_write=bool(prev_s.isolation_meta.get("allow_repo_write", False)),
+                        )
+                        sres, _ = self._execute_suite_fn(
+                            spec_s,
+                            project_root=resolved,
+                            evidence_dir=ev_dir,
+                            run_id=rid,
+                            trusted_manifest=trusted,
+                        )
+                        results.append(sres)
+                    done = self._populate_and_finalize(replay, results, [], t0)
+            except Exception as exc:
+                replay.status = RunStatus.ERROR
+                replay.failure_kind = FailureKind.HARNESS_ERROR
+                replay.error_count = 1
+                replay.first_failure = f"Reproduce error: {exc}"[:300]
+                done = self.store.finalize_run(replay)
             return {
                 "source_run_id": orig.run_id,
                 "repro_run_id": done.run_id,
