@@ -25,6 +25,7 @@ The run record shows which case applied: each suite's `isolation_meta.seatbelt` 
 | Disposable `HOME`/`XDG_*`/`TMPDIR`/`TESTBENCH_HOME` | Enforced | Enforced (redirection only: absolute paths reach the real files) |
 | `setsid` process group, fingerprinted `SIGTERM` then `SIGKILL` on timeout/cancel | Enforced | Enforced (`ps -o lstart=` from procps; BusyBox `ps` disables the fingerprint check) |
 | `setsid`-survivor sweep on timeout, cancel, or non-zero exit | `lsof +D` and `ps` | Best effort: skipped when `lsof` or `/bin/ps` is absent |
+| Background processes left in the suite's own process group after it exits (any status) | Terminated (`SIGTERM`, then `SIGKILL`) | Same |
 | Private tmux socket and `kill-server` | Enforced | Enforced |
 | In-stream secret redaction before disk | Enforced | Enforced |
 | Trust gate (untrusted manifest requesting network or repo writes is `BLOCKED`) | Enforced | Gate enforced, but the default it protects (no network, read-only repo) does not exist on Linux |
@@ -32,6 +33,8 @@ The run record shows which case applied: each suite's `isolation_meta.seatbelt` 
 | TUI refresh | `kqueue` | `select` polling, same results |
 
 Env scrubbing matches names, not values: a secret in a variable whose name matches no pattern (for example `MYDBPASS`) is passed through on both platforms.
+
+Process cleanup on a clean exit covers only the suite's own process group: TestBench leaves the exited leader unreaped (`waitid(WNOWAIT)`) so its process-group id stays reserved, then signals that group. A descendant that called `setsid()` or `setpgid()` into a new group is outside it; on a clean exit such a process survives unless it was started within a timed-out, cancelled, or failed step (which also runs the sandbox-directory sweep).
 
 ## 2. Project Onboarding & `.testbench.toml`
 
