@@ -122,7 +122,11 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
             scratch_root=self.root,
         )
         self.assertEqual(r_net.exit_code, 0, r_net.stderr_text)
-        self.assertIn("LOOP=ok DASH_BLOCKED=True EXT_BLOCKED=True", r_net.stdout_text)
+        if shutil.which("sandbox-exec"):
+            self.assertIn("LOOP=ok DASH_BLOCKED=True EXT_BLOCKED=True", r_net.stdout_text)
+        else:
+            # No Seatbelt (Linux): network is not confined (OPERATING-GUIDE 1.1); loopback must still work.
+            self.assertIn("LOOP=ok", r_net.stdout_text)
 
         # Verify macOS setuid /bin/ps works inside Seatbelt (needed by hermes-tmux job/lock checks)
         r_ps = run_isolated_command(

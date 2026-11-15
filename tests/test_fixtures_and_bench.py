@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
 import signal
 import sqlite3
@@ -394,7 +395,7 @@ class EnvironmentMetadataTests(_TempDirTest):
         self.assertEqual(len(env["loadavg"]), 3)
         self.assertIsInstance(env["cpu_count"], int)
         self.assertGreater(env["cpu_count"], 0)
-        self.assertIn("3.14", env["python_version"])
+        self.assertEqual(env["python_version"], platform.python_version())
         self.assertTrue(env["sqlite_version"])
         for tool in ("rustc", "cargo", "cobc", "clang"):
             self.assertIn(f"{tool}_version", env)
