@@ -48,6 +48,48 @@ def repo_package_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def messaging_paths(home: Optional[Path] = None) -> Tuple[Path, Path]:
+    """Resolve the ``agent-messaging`` artifact root and ``hermes-agent`` checkout.
+
+    Derived from the real user home so neither the engine nor the CLI hard-codes a
+    host-specific ``/Users/<name>`` path. Shared by ``messaging-verify`` and by
+    ``reproduce`` so both surfaces look at exactly the same locations.
+    """
+    base = (Path(home).expanduser() if home is not None else real_user_home())
+    hermes = base / ".hermes"
+    return (hermes / "artifacts" / "agent-messaging"), (hermes / "hermes-agent")
+
+
+def base_profile(profile: str) -> str:
+    """Strip accumulated ``repro:`` prefixes so repro-of-repro never stacks them."""
+    name = profile or ""
+    while name.startswith("repro:"):
+        name = name[len("repro:"):]
+    return name
+
+
+def _recorded_artifact_root(
+    orig: RunRecord, resolved: Path, default_art_root: Path
+) -> Optional[Path]:
+    """Return the ``artifact_root`` the original messaging run actually used.
+
+    Runs recorded since the messaging path exists store it explicitly in
+    ``environment['messaging_artifact_root']`` (an empty string means "no
+    artifact root was used"). Older runs lack the marker, so fall back to the
+    recorded project_root only when it is in fact the artifact root.
+    """
+    env = orig.environment or {}
+    if "messaging_artifact_root" in env:
+        recorded = str(env.get("messaging_artifact_root") or "").strip()
+        return Path(recorded).expanduser() if recorded else None
+    try:
+        if resolved == default_art_root.resolve():
+            return resolved
+    except OSError:
+        return None
+    return None
+
+
 class AuthorizationError(PermissionError):
     """Raised when an interface attempts to access a path outside its scoped allowlist."""
 
@@ -894,35 +936,45 @@ class TestBenchEngine:
 
         target = Path(orig.project_root)
         resolved = self.resolve_target(target, enforce_scope=enforce_scope)
-        if orig.project == "agent-messaging" and orig.profile == "verification":
+        if orig.project == "agent-messaging" and base_profile(orig.profile) == "verification":
             from .messaging_suite import PYTEST_SUITE, run_agent_messaging_verification
             rid = new_run_id()
             now = utc_now_iso()
             use_pt = any(s.name == PYTEST_SUITE for s in orig.suites)
-            ha_root = Path("/Users/sein/.hermes/hermes-agent")
+            default_art_root, ha_root = messaging_paths()
+            art_root = _recorded_artifact_root(orig, resolved, default_art_root)
+            env_snap = host_environment_snapshot()
+            env_snap["messaging_artifact_root"] = str(art_root) if art_root is not None else ""
             replay_mv = RunRecord(
                 run_id=rid,
                 project=orig.project,
                 project_root=str(resolved),
                 revision=_fallback_git_metadata(resolved)[0],
-                profile="repro:verification",
+                profile="repro:" + base_profile(orig.profile),
                 status=RunStatus.RUNNING,
                 commands=list(orig.commands),
                 created_at=now,
                 started_at=now,
-                environment=host_environment_snapshot(),
+                environment=env_snap,
             )
             self.store.create_run(replay_mv)
             ev_mv = self.store.run_dir(rid)
             t0_mv = time.monotonic()
-            with self.store.hold_run_lock(rid):
-                mv_suites = run_agent_messaging_verification(
-                    ev_mv,
-                    artifact_root=resolved if resolved.exists() else None,
-                    hermes_agent_root=ha_root,
-                    run_hermes_pytest=use_pt,
-                )
-                done_mv = self._populate_and_finalize(replay_mv, mv_suites, [], t0_mv)
+            try:
+                with self.store.hold_run_lock(rid):
+                    mv_suites = run_agent_messaging_verification(
+                        ev_mv,
+                        artifact_root=art_root,
+                        hermes_agent_root=ha_root,
+                        run_hermes_pytest=use_pt,
+                    )
+                    done_mv = self._populate_and_finalize(replay_mv, mv_suites, [], t0_mv)
+            except Exception as exc:
+                replay_mv.status = RunStatus.ERROR
+                replay_mv.failure_kind = FailureKind.HARNESS_ERROR
+                replay_mv.error_count = 1
+                replay_mv.first_failure = f"Reproduce error: {exc}"[:300]
+                done_mv = self.store.finalize_run(replay_mv)
             return {
                 "source_run_id": orig.run_id,
                 "repro_run_id": done_mv.run_id,
