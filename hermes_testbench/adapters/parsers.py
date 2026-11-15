@@ -21,6 +21,15 @@ _COUNT_PATTERNS: Dict[str, re.Pattern[str]] = {
     "errors": re.compile(r"(\d+)\s+errors?\b", re.IGNORECASE),
 }
 
+# ``pytest -q`` prints its final summary without the ``=====`` rule, e.g.
+# "1 failed, 2 passed, 1 skipped, 1 xfailed, 1 error in 0.01s". Match the whole
+# line against pytest's grammar so prose that merely mentions counts never qualifies.
+_PYTEST_QUIET_SUMMARY_RE = re.compile(
+    r"^\d+ (?:passed|failed|skipped|deselected|xfailed|xpassed|warnings?|errors?|rerun)"
+    r"(?:, \d+ (?:passed|failed|skipped|deselected|xfailed|xpassed|warnings?|errors?|rerun))*"
+    r" in \d+(?:\.\d+)?s(?: \([0-9:.]+\))?$"
+)
+
 _SUMMARY_HINT_RE = re.compile(r"\d+\s+(?:tests?\s+)?(?:passed|failed|skipped|errors?)", re.IGNORECASE)
 _PASS_MARKER_RE = re.compile(r"^(?:PASS|TB-PASS|OK)(?::|\s)\s*(.*)$")
 _BARE_PASS_RE = re.compile(r"^(?:PASS|TB-PASS|OK)\s*$")
@@ -301,9 +310,8 @@ def parse_python_pytest(text: str) -> ParseOutcome:
     summary_line = ""
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped.startswith("=") or not stripped.endswith("="):
-            continue
-        if " in " not in stripped:
+        delimited = stripped.startswith("=") and stripped.endswith("=") and " in " in stripped
+        if not delimited and not _PYTEST_QUIET_SUMMARY_RE.match(stripped):
             continue
         found: Dict[str, int] = {}
         for key, pattern in _COUNT_PATTERNS.items():
