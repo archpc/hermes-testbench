@@ -6,8 +6,9 @@ Zero regex, XML, I/O, formatting, or runner dependencies (ADR-0004).
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
+import threading
 from typing import Any, Dict, List, Optional
 
 SCHEMA_VERSION = 1
@@ -50,6 +51,7 @@ class FailureKind:
     BLOCKED_POLICY = "blocked_policy"
     ABANDONED_WORKER = "abandoned_worker"
     UNTRUSTED_MANIFEST = "untrusted_manifest"
+    SANDBOX_DENIED = "sandbox_denied"
 
 
 @dataclass
@@ -179,13 +181,41 @@ class RunRecord:
     pinned: bool = False
 
 
+_CLOCK_LOCK = threading.Lock()
+_LAST_UTC_US = 0
+_LAST_RID_STAMP = ""
+_LAST_RID_SEQ = -1
+
+
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    global _LAST_UTC_US
+    with _CLOCK_LOCK:
+        now = datetime.now(timezone.utc)
+        us = int(now.timestamp() * 1_000_000)
+        if us <= _LAST_UTC_US:
+            us = _LAST_UTC_US + 1
+            now = datetime.fromtimestamp(0, tz=timezone.utc) + timedelta(microseconds=us)
+        _LAST_UTC_US = us
+    return now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def new_run_id() -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return f"tb_{stamp}_{os.urandom(4).hex()}"
+    global _LAST_RID_STAMP, _LAST_RID_SEQ
+    with _CLOCK_LOCK:
+        now = datetime.now(timezone.utc)
+        stamp = now.strftime("%Y%m%d_%H%M%S")
+        seq = min(0xFFFF, (now.microsecond * 65536) // 1_000_000)
+        if _LAST_RID_STAMP and (stamp, seq) <= (_LAST_RID_STAMP, _LAST_RID_SEQ):
+            stamp = _LAST_RID_STAMP
+            if _LAST_RID_SEQ < 0xFFFF:
+                seq = _LAST_RID_SEQ + 1
+            else:
+                dt = datetime.strptime(stamp, "%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc) + timedelta(seconds=1)
+                stamp = dt.strftime("%Y%m%d_%H%M%S")
+                seq = 0
+        _LAST_RID_STAMP = stamp
+        _LAST_RID_SEQ = seq
+    return f"tb_{stamp}_{seq:04x}{os.urandom(2).hex()}"
 
 
 def run_to_dict(run: RunRecord) -> Dict[str, Any]:

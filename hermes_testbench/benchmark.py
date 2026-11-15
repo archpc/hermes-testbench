@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import os
 import platform
+import shlex
 import shutil
 import sqlite3
 import statistics
@@ -271,7 +272,12 @@ def run_workload(
     )
     if not all_ok:
         run.first_failure = f"workload exit codes: {exit_codes}"
-    run.repro_instructions = run.summary
+    cmd_str = " ".join(shlex.quote(a) for a in command)
+    timeout_flag = f" --timeout {float(timeout_s):g}" if float(timeout_s) != 120.0 else ""
+    run.repro_instructions = (
+        f"testbench bench run {shlex.quote(str(work_dir))} "
+        f"--name {shlex.quote(name)} --warmup {int(warmup)} --repeats {int(repeats)}{timeout_flag} -- {cmd_str}"
+    )
     store.finalize_run(run)
 
     store.record_benchmark(

@@ -374,21 +374,33 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 0
 
             if args.command == "messaging-verify":
+                from .discovery import detect_git_metadata
+                from .engine import host_environment_snapshot
                 from .messaging_suite import run_agent_messaging_verification  # type: ignore
                 from .schema import RunRecord, new_run_id, utc_now_iso
                 import time as _time
                 rid = new_run_id()
                 now = utc_now_iso()
                 art_root = Path("/Users/sein/.hermes/artifacts/agent-messaging")
+                ha_root = Path("/Users/sein/.hermes/hermes-agent")
+                target_root = art_root if art_root.exists() else (ha_root if ha_root.exists() else Path.cwd())
+                rev, branch = detect_git_metadata(target_root)
+                ha_rev, _ha_br = detect_git_metadata(ha_root) if ha_root.exists() else ("unversioned", "")
+                env_snap = host_environment_snapshot()
+                env_snap["hermes_agent_revision"] = ha_rev
+                repro_argv = ["testbench", "messaging-verify"] + (["--hermes-pytest"] if args.hermes_pytest else [])
                 run = RunRecord(
                     run_id=rid,
                     project="agent-messaging",
-                    project_root=str(art_root if art_root.exists() else Path.cwd()),
-                    revision="verified",
+                    project_root=str(target_root),
+                    revision=rev,
+                    branch=branch,
                     profile="verification",
                     status=RunStatus.RUNNING,
+                    commands=[repro_argv],
                     created_at=now,
                     started_at=now,
+                    environment=env_snap,
                 )
                 store.create_run(run)
                 t0 = _time.monotonic()
@@ -396,7 +408,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     suites = run_agent_messaging_verification(
                         store.run_dir(rid),
                         artifact_root=art_root if art_root.exists() else None,
-                        hermes_agent_root=Path("/Users/sein/.hermes/hermes-agent"),
+                        hermes_agent_root=ha_root,
                         run_hermes_pytest=args.hermes_pytest,
                     )
                     done = eng._populate_and_finalize(run, suites, [], t0)

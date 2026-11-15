@@ -21,9 +21,11 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .schema import CaseResult, RunStatus, SuiteResult, utc_now_iso
+from .sanitize import redact_secrets, sanitize_terminal_text
+from .schema import CaseResult, FailureKind, FailureRecord, RunStatus, SuiteResult, utc_now_iso
+from .store import atomic_write_file
 
 CONTRACT_SUITE = "agent-messaging:contract"
 WIRING_SUITE = "agent-messaging:wiring"
@@ -209,19 +211,51 @@ def _suite(
     profile: str,
     cwd: Path,
     cases: List[CaseResult],
-    command: Optional[List[str]] = None,
+    command: Optional[Sequence[str]] = None,
     summary: str = "",
+    repro_command: str = "testbench messaging-verify",
+    evidence_dir: Optional[Path] = None,
     isolation_meta: Optional[Dict[str, Any]] = None,
 ) -> SuiteResult:
     pass_count = sum(1 for c in cases if c.status == RunStatus.PASS)
     fail_count = sum(1 for c in cases if c.status == RunStatus.FAIL)
     skip_count = sum(1 for c in cases if c.status == RunStatus.SKIP)
     error_count = sum(1 for c in cases if c.status == RunStatus.ERROR)
+    failures = [
+        FailureRecord(
+            suite=name,
+            case_name=c.name,
+            kind=FailureKind.ASSERTION if c.status == RunStatus.FAIL else FailureKind.HARNESS_ERROR,
+            message=c.message or c.status,
+        )
+        for c in cases
+        if c.status in (RunStatus.FAIL, RunStatus.ERROR)
+    ]
+    sanitized_path: Optional[str] = None
+    if evidence_dir is not None:
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "messaging"
+        log_file = Path(evidence_dir) / f"{slug}.sanitized.log"
+        log_lines = [
+            f"{c.status} {c.name}" + (f": {c.message}" if c.message else "")
+            for c in cases
+        ]
+        if summary:
+            log_lines.append(summary)
+        clean_log = sanitize_terminal_text(redact_secrets("\n".join(log_lines) + "\n"))
+        atomic_write_file(log_file, clean_log, mode=0o600)
+        sanitized_path = str(log_file)
+    meta = {
+        "mode": "offline_in_process",
+        "allow_network": False,
+        "allow_repo_write": False,
+    }
+    if isolation_meta:
+        meta.update(isolation_meta)
     return SuiteResult(
         name=name,
         adapter=adapter,
         profile=profile,
-        command=list(command or []),
+        command=list(command or ["testbench", "messaging-verify"]),
         cwd=str(cwd),
         status=_status_for(pass_count, fail_count, skip_count, error_count),
         started_at=utc_now_iso(),
@@ -231,9 +265,12 @@ def _suite(
         fail_count=fail_count,
         skip_count=skip_count,
         error_count=error_count,
+        sanitized_path=sanitized_path,
         summary_excerpt=summary,
+        repro_command=repro_command,
+        failures=failures,
         cases=cases,
-        isolation_meta=dict(isolation_meta or {}),
+        isolation_meta=meta,
     )
 
 
@@ -597,13 +634,14 @@ def _wiring_suite(artifact_root: Path, evidence_dir: Path) -> Optional[SuiteResu
         cases=cases,
         command=[sys.executable, str(script)],
         summary="wiring: artifact check-wiring.py exercised against synthetic wired and unwired homes",
+        evidence_dir=evidence_dir,
     )
 
 
 # ------------------------------------------------------------------------- pytest
 
 
-def _pytest_suite(hermes_agent_root: Optional[Path]) -> SuiteResult:
+def _pytest_suite(hermes_agent_root: Optional[Path], evidence_dir: Optional[Path] = None) -> SuiteResult:
     root = Path(hermes_agent_root) if hermes_agent_root is not None else None
     command: List[str] = []
     if root is not None:
@@ -621,6 +659,7 @@ def _pytest_suite(hermes_agent_root: Optional[Path]) -> SuiteResult:
             cwd=root or Path("."),
             cases=[case],
             command=command,
+            evidence_dir=evidence_dir,
             summary="pytest: skipped (no source-tree venv/bin/python)",
         )
 
@@ -645,15 +684,22 @@ def _pytest_suite(hermes_agent_root: Optional[Path]) -> SuiteResult:
         f"pytest exit={rc}: {output.strip()[:600]}",
         suite=PYTEST_SUITE,
     )
-    return _suite(
+    res = _suite(
         PYTEST_SUITE,
         adapter="pytest",
         profile="integration",
         cwd=root,
         cases=[case],
         command=command,
+        evidence_dir=evidence_dir,
         summary=f"pytest: hermetic bot-mode tests exit={rc}",
     )
+    if evidence_dir is not None and output.strip():
+        log_file = Path(evidence_dir) / "agent-messaging_pytest.sanitized.log"
+        clean_out = sanitize_terminal_text(redact_secrets(output))
+        atomic_write_file(log_file, clean_out, mode=0o600)
+        res.sanitized_path = str(log_file)
+    return res
 
 
 # ---------------------------------------------------------------------- entrypoint
@@ -672,6 +718,7 @@ def run_agent_messaging_verification(
 
     suites: List[SuiteResult] = []
 
+    repro = "testbench messaging-verify --hermes-pytest" if run_hermes_pytest else "testbench messaging-verify"
     contract_cases = _contract_cases(hermes_agent_root, artifact_root, evidence)
     contract_cwd = Path(hermes_agent_root) if hermes_agent_root is not None else evidence
     suites.append(
@@ -681,6 +728,9 @@ def run_agent_messaging_verification(
             profile="integration",
             cwd=contract_cwd,
             cases=contract_cases,
+            command=repro.split(),
+            repro_command=repro,
+            evidence_dir=evidence,
             summary=(
                 f"contract: {len(_REQUIRED_CASES)} required behaviors inspected offline; "
                 "mid-flight gateway restart explicitly skipped"
@@ -691,9 +741,12 @@ def run_agent_messaging_verification(
     if artifact_root is not None and Path(artifact_root).is_dir():
         wiring = _wiring_suite(Path(artifact_root), evidence)
         if wiring is not None:
+            wiring.repro_command = repro
             suites.append(wiring)
 
     if run_hermes_pytest:
-        suites.append(_pytest_suite(hermes_agent_root))
+        pt_suite = _pytest_suite(hermes_agent_root, evidence_dir=evidence)
+        pt_suite.repro_command = repro
+        suites.append(pt_suite)
 
     return suites

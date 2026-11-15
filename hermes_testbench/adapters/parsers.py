@@ -72,28 +72,58 @@ def _summarize_markers(text: str) -> Tuple[int, int, int, int, List[Dict[str, An
     passed = failed = skipped = 0
     failures: List[Dict[str, Any]] = []
     cases: List[Dict[str, Any]] = []
-    for raw_line in text.splitlines():
+    raw_lines = text.splitlines()
+    idx = 0
+    bullet_re = re.compile(r"^\s+(?:[-*]|\d+[.)])?\s*(\S.*)$")
+    while idx < len(raw_lines):
+        raw_line = raw_lines[idx]
         line = raw_line.strip()
         if not line:
+            idx += 1
             continue
         match = _FAIL_MARKER_RE.match(line)
         if match or _BARE_FAIL_RE.match(line):
-            name = (match.group(1) if match else "").strip() or f"case_{failed + 1}"
+            inline = (match.group(1) if match else "").strip()
+            if not inline:
+                bullets: List[str] = []
+                look = idx + 1
+                while look < len(raw_lines):
+                    cand = raw_lines[look]
+                    if not cand.strip():
+                        break
+                    bm = bullet_re.match(cand)
+                    if not bm:
+                        break
+                    bullets.append(bm.group(1).strip())
+                    look += 1
+                if bullets:
+                    for item in bullets:
+                        failed += 1
+                        cname = f"failure_{failed}"
+                        failures.append(_failure(cname, "assertion", item))
+                        cases.append({"name": cname, "status": "FAIL", "message": item})
+                    idx = look
+                    continue
+            name = inline or f"case_{failed + 1}"
+            msg = inline or line
             failed += 1
-            failures.append(_failure(name, "assertion", name))
-            cases.append({"name": name, "status": "FAIL", "message": name})
+            failures.append(_failure(name, "assertion", msg))
+            cases.append({"name": name, "status": "FAIL", "message": msg})
+            idx += 1
             continue
         match = _SKIP_MARKER_RE.match(line)
         if match or _BARE_SKIP_RE.match(line):
             name = (match.group(1) if match else "").strip() or f"case_{skipped + 1}"
             skipped += 1
             cases.append({"name": name, "status": "SKIP", "message": name})
+            idx += 1
             continue
         match = _PASS_MARKER_RE.match(line)
         if match or _BARE_PASS_RE.match(line):
             name = (match.group(1) if match else "").strip() or f"case_{passed + 1}"
             passed += 1
             cases.append({"name": name, "status": "PASS", "message": ""})
+        idx += 1
     return passed, failed, skipped, 0, failures, cases
 
 
@@ -154,7 +184,7 @@ def _apply_markers(outcome: ParseOutcome, text: str) -> bool:
 def parse_python_unittest(text: str) -> ParseOutcome:
     text = _clean(text)
     outcome = ParseOutcome()
-    ran = re.search(r"^Ran (\d+) tests? in ", text, re.MULTILINE)
+    ran = re.search(r"^Ran (\d+) tests? in [^\r\n]+", text, re.MULTILINE)
     total = int(ran.group(1)) if ran else 0
 
     ok_match = re.search(r"^OK(?: \(([^)]*)\))?\s*$", text, re.MULTILINE)
@@ -187,7 +217,12 @@ def parse_python_unittest(text: str) -> ParseOutcome:
 
     header_re = re.compile(r"^(FAIL|ERROR): (\S+) \((.*)\)\s*$")
     separator_re = re.compile(r"^(?:={5,}|-{5,})$")
+    verbose_re = re.compile(
+        r"^(\S+) \(([^)]+)\) \.\.\. (ok|FAIL|ERROR|skipped(?:\s+(?:['\"].*['\"]|\S.*))?|expected failure|unexpected success)\s*$"
+    )
     lines = text.splitlines()
+    fail_details: Dict[str, Tuple[str, str]] = {}
+    ordered_fail_names: List[str] = []
     for idx, line in enumerate(lines):
         header = header_re.match(line.strip())
         if not header:
@@ -202,10 +237,43 @@ def parse_python_unittest(text: str) -> ParseOutcome:
             end += 1
         block_lines = [part for part in lines[idx + 1 : end] if part.strip() and not separator_re.match(part.strip())]
         block = "\n".join(block_lines)
-        message = block_lines[-1].strip() if block_lines else status
+        exc_re = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_.]*\.)*[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception|Failure|Exit)(?::|\b)")
+        exc_line = next((part.strip() for part in reversed(block_lines) if exc_re.match(part.strip())), "")
+        message = exc_line or (block_lines[-1].strip() if block_lines else status)
         kind = "assertion" if status == "FAIL" else "harness_error"
         outcome.failures.append(_failure(display, kind, message, block or line))
-        outcome.cases.append({"name": display, "status": status, "message": message})
+        fail_details[display] = (status, message)
+        ordered_fail_names.append(display)
+
+    seen_cases: set[str] = set()
+    for line in lines:
+        vm = verbose_re.match(line.strip())
+        if not vm:
+            continue
+        func_name, loc, raw_state = vm.groups()
+        display = f"{func_name} ({loc})"
+        if display in seen_cases:
+            continue
+        seen_cases.add(display)
+        if display in fail_details:
+            st, msg = fail_details[display]
+            outcome.cases.append({"name": display, "status": st, "message": msg})
+        elif raw_state.startswith("skipped"):
+            reason = raw_state[len("skipped") :].strip().strip("'\"")
+            outcome.cases.append({"name": display, "status": "SKIP", "message": reason})
+        elif raw_state == "FAIL":
+            outcome.cases.append({"name": display, "status": "FAIL", "message": "FAIL"})
+        elif raw_state == "ERROR":
+            outcome.cases.append({"name": display, "status": "ERROR", "message": "ERROR"})
+        else:
+            outcome.cases.append({"name": display, "status": "PASS", "message": ""})
+
+    for display in ordered_fail_names:
+        if display not in seen_cases:
+            seen_cases.add(display)
+            st, msg = fail_details[display]
+            outcome.cases.append({"name": display, "status": st, "message": msg})
+
     outcome.structured = True
     return outcome
 
@@ -231,20 +299,36 @@ def parse_python_pytest(text: str) -> ParseOutcome:
     if counts:
         _apply_summary(outcome, counts, summary_line)
 
+    seen_cases: set[str] = set()
     for line in text.splitlines():
         match = re.match(r"^(FAILED|ERROR) (\S+)(?: - (.*))?$", line.strip())
         if not match:
             continue
         status, name, message = match.groups()
         kind = "assertion" if status == "FAILED" else "harness_error"
+        norm_status = "FAIL" if status == "FAILED" else "ERROR"
         outcome.failures.append(_failure(name, kind, message or status))
-        outcome.cases.append({"name": name, "status": status, "message": message or ""})
+        if name not in seen_cases:
+            seen_cases.add(name)
+            outcome.cases.append({"name": name, "status": norm_status, "message": message or ""})
         outcome.structured = True
         if status == "FAILED":
             outcome.failed = max(outcome.failed, 1)
         else:
             outcome.errors = max(outcome.errors, 1)
-    if outcome.failed and outcome.total < outcome.failed + outcome.errors:
+
+    verbose_pt_re = re.compile(r"^(\S+::\S+)\s+(PASSED|SKIPPED)(?:\s+\[[^\]]*\])?\s*$")
+    for line in text.splitlines():
+        vm = verbose_pt_re.match(line.strip())
+        if not vm:
+            continue
+        name, raw_st = vm.groups()
+        if name in seen_cases:
+            continue
+        seen_cases.add(name)
+        outcome.cases.append({"name": name, "status": "PASS" if raw_st == "PASSED" else "SKIP", "message": ""})
+
+    if (outcome.failed or outcome.errors) and outcome.total < outcome.failed + outcome.errors:
         outcome.total = outcome.failed + outcome.errors
     return outcome
 
@@ -266,13 +350,18 @@ def parse_cargo(text: str) -> ParseOutcome:
         outcome.failed += failed
         outcome.skipped += ignored
         outcome.total += passed + failed + ignored
-    fail_re = re.compile(r"^test (\S+) \.\.\. FAILED$")
+    case_re = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored)$")
     for line in text.splitlines():
-        match = fail_re.match(line.strip())
+        match = case_re.match(line.strip())
         if match:
-            name = match.group(1)
-            outcome.failures.append(_failure(name, "assertion", name))
-            outcome.cases.append({"name": name, "status": "FAIL", "message": name})
+            name, state = match.groups()
+            if state == "FAILED":
+                outcome.failures.append(_failure(name, "assertion", name))
+                outcome.cases.append({"name": name, "status": "FAIL", "message": name})
+            elif state == "ignored":
+                outcome.cases.append({"name": name, "status": "SKIP", "message": ""})
+            else:
+                outcome.cases.append({"name": name, "status": "PASS", "message": ""})
     if blocks:
         outcome.structured = True
         outcome.summary_line = f"{blocks} cargo test result block(s) aggregated"

@@ -370,6 +370,30 @@ def host_environment_snapshot() -> Dict[str, Any]:
     }
 
 
+def _blocked_failure_kind(suites: List[SuiteResult]) -> str:
+    for s in suites:
+        if s.status != RunStatus.BLOCKED:
+            continue
+        for f in s.failures:
+            if f.kind == FailureKind.UNTRUSTED_MANIFEST:
+                return FailureKind.UNTRUSTED_MANIFEST
+    return FailureKind.BLOCKED_POLICY
+
+
+def _failed_suite_kind(suites: List[SuiteResult]) -> str:
+    failing = [s for s in suites if s.status == RunStatus.FAIL]
+    kinds = [f.kind for s in failing for f in s.failures if f.kind]
+    if FailureKind.ASSERTION in kinds:
+        return FailureKind.ASSERTION
+    if FailureKind.SANDBOX_DENIED in kinds:
+        return FailureKind.SANDBOX_DENIED
+    if kinds:
+        return kinds[0]
+    if sum(s.error_count for s in failing) > 0 and sum(s.fail_count for s in failing) == 0:
+        return FailureKind.HARNESS_ERROR
+    return FailureKind.ASSERTION
+
+
 def _aggregate_run_status(suites: List[SuiteResult]) -> Tuple[str, Optional[str]]:
     if not suites:
         return RunStatus.SKIP, None
@@ -381,13 +405,13 @@ def _aggregate_run_status(suites: List[SuiteResult]) -> Tuple[str, Optional[str]
     if any(st == RunStatus.TIMEOUT for st in statuses):
         return RunStatus.TIMEOUT, FailureKind.TIMEOUT
     if any(st == RunStatus.FAIL for st in statuses):
-        return RunStatus.FAIL, FailureKind.ASSERTION
+        return RunStatus.FAIL, _failed_suite_kind(suites)
     if any(st == RunStatus.BLOCKED for st in statuses) and not any(st == RunStatus.PASS for st in statuses):
-        return RunStatus.BLOCKED, FailureKind.BLOCKED_POLICY
+        return RunStatus.BLOCKED, _blocked_failure_kind(suites)
     if all(st == RunStatus.SKIP for st in statuses):
         return RunStatus.SKIP, None
     if any(st == RunStatus.BLOCKED for st in statuses):
-        return RunStatus.BLOCKED, FailureKind.BLOCKED_POLICY
+        return RunStatus.BLOCKED, _blocked_failure_kind(suites)
     return RunStatus.PASS, None
 
 
@@ -483,10 +507,11 @@ class TestBenchEngine:
         repros = [s.repro_command for s in suite_results if s.repro_command and s.status != RunStatus.PASS]
         if not repros:
             repros = [s.repro_command for s in suite_results if s.repro_command]
-        run.repro_instructions = " && ".join(repros)
+        run.repro_instructions = " && ".join(dict.fromkeys(repros))
         run.summary = (
             f"{run.status}: {run.pass_count}/{run.total_count} passed, "
-            f"{run.fail_count} failed, {run.skip_count} skipped, {run.blocked_count} blocked"
+            f"{run.fail_count} failed, {run.error_count} errors, "
+            f"{run.skip_count} skipped, {run.blocked_count} blocked"
         )
 
         # Never fabricate model token usage; record only when measured
@@ -869,6 +894,44 @@ class TestBenchEngine:
 
         target = Path(orig.project_root)
         resolved = self.resolve_target(target, enforce_scope=enforce_scope)
+        if orig.project == "agent-messaging" and orig.profile == "verification":
+            from .messaging_suite import PYTEST_SUITE, run_agent_messaging_verification
+            rid = new_run_id()
+            now = utc_now_iso()
+            use_pt = any(s.name == PYTEST_SUITE for s in orig.suites)
+            ha_root = Path("/Users/sein/.hermes/hermes-agent")
+            replay_mv = RunRecord(
+                run_id=rid,
+                project=orig.project,
+                project_root=str(resolved),
+                revision=_fallback_git_metadata(resolved)[0],
+                profile="repro:verification",
+                status=RunStatus.RUNNING,
+                commands=list(orig.commands),
+                created_at=now,
+                started_at=now,
+                environment=host_environment_snapshot(),
+            )
+            self.store.create_run(replay_mv)
+            ev_mv = self.store.run_dir(rid)
+            t0_mv = time.monotonic()
+            with self.store.hold_run_lock(rid):
+                mv_suites = run_agent_messaging_verification(
+                    ev_mv,
+                    artifact_root=resolved if resolved.exists() else None,
+                    hermes_agent_root=ha_root,
+                    run_hermes_pytest=use_pt,
+                )
+                done_mv = self._populate_and_finalize(replay_mv, mv_suites, [], t0_mv)
+            return {
+                "source_run_id": orig.run_id,
+                "repro_run_id": done_mv.run_id,
+                "status": done_mv.status,
+                "pass_count": done_mv.pass_count,
+                "fail_count": done_mv.fail_count,
+                "first_failure": done_mv.first_failure,
+                "evidence_dir": done_mv.evidence_dir,
+            }
         # Replay recorded suites directly without rediscovery if suites were persisted
         if orig.suites:
             rid = new_run_id()

@@ -52,53 +52,118 @@ def render_junit_xml(run: RunRecord) -> str:
                 "time": f"{suite.duration_ms / 1000.0:.3f}",
             },
         )
-        if suite.cases:
-            for case in suite.cases:
-                tc_el = ET.SubElement(
-                    ts_el,
-                    "testcase",
-                    {
-                        "classname": _clean_field(case.suite or suite.name),
-                        "name": _clean_field(case.name),
-                        "time": f"{case.duration_ms / 1000.0:.3f}",
-                    },
-                )
-                msg = _clean_field(case.message)
-                if case.status == RunStatus.FAIL:
-                    f_el = ET.SubElement(tc_el, "failure", {"message": msg[:500]})
-                    f_el.text = msg
-                elif case.status in (RunStatus.ERROR, RunStatus.TIMEOUT, RunStatus.CANCELLED):
-                    e_el = ET.SubElement(tc_el, "error", {"type": case.status, "message": msg[:500]})
-                    e_el.text = msg
-                elif case.status in (RunStatus.SKIP, RunStatus.BLOCKED):
-                    ET.SubElement(tc_el, "skipped", {"type": case.status, "message": msg[:500]})
-        elif suite.failures:
-            for fail in suite.failures:
-                tc_el = ET.SubElement(
-                    ts_el,
-                    "testcase",
-                    {"classname": _clean_field(suite.name), "name": _clean_field(fail.case_name)},
-                )
-                msg = _clean_field(fail.message or fail.excerpt)
-                if suite.status in (RunStatus.TIMEOUT, RunStatus.ERROR) or fail.kind in ("timeout", "spawn_error", "harness_error", "signal_crash"):
-                    e_el = ET.SubElement(tc_el, "error", {"type": _clean_field(fail.kind), "message": msg[:500]})
-                    e_el.text = _clean_field(fail.excerpt or fail.message)
-                else:
-                    f_el = ET.SubElement(tc_el, "failure", {"type": _clean_field(fail.kind), "message": msg[:500]})
-                    f_el.text = _clean_field(fail.excerpt or fail.message)
-        elif suite.status in (RunStatus.SKIP, RunStatus.BLOCKED, RunStatus.CANCELLED):
+        emitted_names: set[str] = set()
+        for case in suite.cases:
+            emitted_names.add(case.name)
             tc_el = ET.SubElement(
                 ts_el,
                 "testcase",
-                {"classname": _clean_field(suite.name), "name": _clean_field(suite.name)},
+                {
+                    "classname": _clean_field(case.suite or suite.name),
+                    "name": _clean_field(case.name),
+                    "time": f"{case.duration_ms / 1000.0:.3f}",
+                },
+            )
+            msg = _clean_field(case.message)
+            if case.status in (RunStatus.FAIL, "FAILED"):
+                f_el = ET.SubElement(tc_el, "failure", {"message": msg[:500]})
+                f_el.text = msg
+            elif case.status in (RunStatus.ERROR, RunStatus.TIMEOUT, RunStatus.CANCELLED):
+                e_el = ET.SubElement(tc_el, "error", {"type": case.status, "message": msg[:500]})
+                e_el.text = msg
+            elif case.status in (RunStatus.SKIP, RunStatus.BLOCKED, "SKIPPED"):
+                ET.SubElement(tc_el, "skipped", {"type": case.status, "message": msg[:500]})
+
+        for fail in suite.failures:
+            if fail.case_name in emitted_names:
+                continue
+            emitted_names.add(fail.case_name)
+            tc_el = ET.SubElement(
+                ts_el,
+                "testcase",
+                {"classname": _clean_field(suite.name), "name": _clean_field(fail.case_name)},
+            )
+            msg = _clean_field(fail.message or fail.excerpt)
+            if suite.status in (RunStatus.BLOCKED, RunStatus.SKIP, RunStatus.CANCELLED) or fail.kind in (
+                "blocked_policy",
+                "untrusted_manifest",
+            ):
+                ET.SubElement(tc_el, "skipped", {"type": _clean_field(fail.kind or suite.status), "message": msg[:500]})
+            elif suite.status in (RunStatus.TIMEOUT, RunStatus.ERROR) or fail.kind in (
+                "timeout",
+                "spawn_error",
+                "harness_error",
+                "sandbox_denied",
+                "signal_crash",
+                "abandoned_worker",
+            ):
+                e_el = ET.SubElement(tc_el, "error", {"type": _clean_field(fail.kind), "message": msg[:500]})
+                e_el.text = _clean_field(fail.excerpt or fail.message)
+            else:
+                f_el = ET.SubElement(tc_el, "failure", {"type": _clean_field(fail.kind), "message": msg[:500]})
+                f_el.text = _clean_field(fail.excerpt or fail.message)
+
+        existing = ts_el.findall("testcase")
+        cur_f = sum(1 for c in existing if c.find("failure") is not None)
+        cur_e = sum(1 for c in existing if c.find("error") is not None)
+        cur_s = sum(1 for c in existing if c.find("skipped") is not None)
+        cur_p = len(existing) - cur_f - cur_e - cur_s
+
+        target_skip = max(0, int(suite.skip_count or 0) + int(suite.blocked_count or 0))
+        if target_skip == 0 and len(existing) == 0 and suite.status in (RunStatus.SKIP, RunStatus.BLOCKED, RunStatus.CANCELLED):
+            target_skip = 1
+        for idx in range(max(0, target_skip - cur_s)):
+            name = suite.name if (target_skip == 1 and len(ts_el.findall("testcase")) == 0) else f"{suite.name}:skip_{idx + 1}"
+            tc_el = ET.SubElement(
+                ts_el,
+                "testcase",
+                {"classname": _clean_field(suite.name), "name": _clean_field(name)},
             )
             msg = _clean_field(suite.summary_excerpt or suite.status)
             ET.SubElement(tc_el, "skipped", {"type": _clean_field(suite.status), "message": msg[:500]})
-        elif suite.pass_count > 0:
+
+        missing_e = max(0, int(suite.error_count or 0) - cur_e)
+        for idx in range(missing_e):
             tc_el = ET.SubElement(
                 ts_el,
                 "testcase",
-                {"classname": _clean_field(suite.name), "name": _clean_field(suite.name)},
+                {"classname": _clean_field(suite.name), "name": _clean_field(f"{suite.name}:error_{idx + 1}")},
+            )
+            msg = _clean_field(suite.summary_excerpt or "error")
+            e_el = ET.SubElement(tc_el, "error", {"type": "error", "message": msg[:500]})
+            e_el.text = msg
+
+        total_bad = int(suite.fail_count or 0) + int(suite.error_count or 0)
+        missing_f = max(0, total_bad - (cur_f + cur_e + missing_e))
+        for idx in range(missing_f):
+            tc_el = ET.SubElement(
+                ts_el,
+                "testcase",
+                {"classname": _clean_field(suite.name), "name": _clean_field(f"{suite.name}:fail_{idx + 1}")},
+            )
+            msg = _clean_field(suite.summary_excerpt or suite.status)
+            if suite.status in (RunStatus.TIMEOUT, RunStatus.ERROR):
+                e_el = ET.SubElement(tc_el, "error", {"type": _clean_field(suite.status.lower()), "message": msg[:500]})
+                e_el.text = msg
+            else:
+                f_el = ET.SubElement(tc_el, "failure", {"type": "assertion", "message": msg[:500]})
+                f_el.text = msg
+
+        missing_p = max(0, int(suite.pass_count or 0) - cur_p)
+        for idx in range(missing_p):
+            name = suite.name if (int(suite.pass_count or 0) == 1 and len(ts_el.findall("testcase")) == 0) else f"{suite.name}:pass_{idx + 1}"
+            ET.SubElement(
+                ts_el,
+                "testcase",
+                {"classname": _clean_field(suite.name), "name": _clean_field(name)},
+            )
+
+        now_len = len(ts_el.findall("testcase"))
+        for idx in range(max(0, int(suite.total_count or 0) - now_len)):
+            ET.SubElement(
+                ts_el,
+                "testcase",
+                {"classname": _clean_field(suite.name), "name": _clean_field(f"{suite.name}:case_{now_len + idx + 1}")},
             )
 
         s_cases = ts_el.findall("testcase")

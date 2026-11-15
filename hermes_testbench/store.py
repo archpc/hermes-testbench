@@ -430,24 +430,35 @@ class TestBenchStore:
             params.append(status)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(max(1, int(limit)))
+        order_ts = "CASE WHEN instr(created_at, '.') > 0 THEN created_at ELSE replace(created_at, 'Z', '.000000Z') END"
         rows = self._conn.execute(
-            f"SELECT payload_json FROM runs {where} ORDER BY created_at DESC, run_id DESC LIMIT ?",
+            f"SELECT payload_json FROM runs {where} ORDER BY {order_ts} DESC, rowid DESC, run_id DESC LIMIT ?",
             tuple(params),
         ).fetchall()
         return [run_from_dict(json.loads(r["payload_json"])) for r in rows]
 
     def last_verified_per_project(self) -> Dict[str, RunRecord]:
+        key_expr = (
+            "printf('%s|%020d|%s', "
+            "CASE WHEN instr(created_at, '.') > 0 THEN created_at ELSE replace(created_at, 'Z', '.000000Z') END, "
+            "rowid, run_id)"
+        )
+        key_expr_r = (
+            "printf('%s|%020d|%s', "
+            "CASE WHEN instr(r.created_at, '.') > 0 THEN r.created_at ELSE replace(r.created_at, 'Z', '.000000Z') END, "
+            "r.rowid, r.run_id)"
+        )
         rows = self._conn.execute(
-            """
+            f"""
             SELECT r.payload_json
             FROM runs r
             INNER JOIN (
-                SELECT project, MAX(created_at || '|' || run_id) AS max_key
+                SELECT project, MAX({key_expr}) AS max_key
                 FROM runs
                 WHERE status IN ('PASS', 'FAIL', 'SKIP', 'BLOCKED', 'TIMEOUT', 'CANCELLED', 'ERROR')
                 GROUP BY project
             ) latest
-            ON r.project = latest.project AND (r.created_at || '|' || r.run_id) = latest.max_key
+            ON r.project = latest.project AND {key_expr_r} = latest.max_key
             """
         ).fetchall()
         out: Dict[str, RunRecord] = {}
@@ -610,8 +621,9 @@ class TestBenchStore:
             params.append(workload)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(max(1, int(limit)))
+        order_ts = "CASE WHEN instr(created_at, '.') > 0 THEN created_at ELSE replace(created_at, 'Z', '.000000Z') END"
         rows = self._conn.execute(
-            f"SELECT * FROM benchmarks {where} ORDER BY created_at DESC LIMIT ?",
+            f"SELECT * FROM benchmarks {where} ORDER BY {order_ts} DESC, rowid DESC LIMIT ?",
             tuple(params),
         ).fetchall()
         out: List[Dict[str, Any]] = []
@@ -628,11 +640,12 @@ class TestBenchStore:
         older_than_days: Optional[int] = None,
         dry_run: bool = False,
     ) -> List[str]:
+        order_ts = "CASE WHEN instr(created_at, '.') > 0 THEN created_at ELSE replace(created_at, 'Z', '.000000Z') END"
         rows = self._conn.execute(
-            """
+            f"""
             SELECT run_id, created_at, pinned, status
             FROM runs
-            ORDER BY created_at DESC, run_id DESC
+            ORDER BY {order_ts} DESC, rowid DESC, run_id DESC
             """
         ).fetchall()
         cutoff: Optional[datetime] = None
