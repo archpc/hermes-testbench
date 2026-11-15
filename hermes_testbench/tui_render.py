@@ -424,9 +424,29 @@ def _counts(run: RunRecord) -> str:
     total = run.total_count or 0
     passed = run.pass_count or 0
     skipped = run.skip_count or 0
+    if run.status in RunStatus.ACTIVE and total == 0:
+        # Adapters only know the counts once the run finishes.
+        return "pending"
     if (run.fail_count or 0) == 0 and (run.error_count or 0) == 0 and skipped > 0 and passed > 0:
         return f"{passed}+{skipped}s"
     return f"{passed}/{total}"
+
+
+def _counts_detail(run: RunRecord) -> str:
+    if run.status in RunStatus.ACTIVE and not (run.total_count or 0):
+        return "pending (counts arrive when the run finishes)"
+    return (
+        f"pass {run.pass_count}/{run.total_count}  fail={run.fail_count}"
+        + (f"  err={run.error_count}" if run.error_count else "")
+        + f"  skip={run.skip_count}"
+    )
+
+
+def _last_activity(state: TuiState, run: RunRecord) -> str:
+    for line in reversed(state.log_lines.get(run.run_id, ())):
+        if line.strip():
+            return line
+    return ""
 
 
 def _overview_row(state: TuiState, pal: Palette, run: RunRecord, selected: bool, marks: Dict[str, str], width: int) -> str:
@@ -447,6 +467,9 @@ def _overview_row(state: TuiState, pal: Palette, run: RunRecord, selected: bool,
     ]
     if run.status in RunStatus.ACTIVE:
         parts.extend([" ", _paint(pal, pal.blue(), _elapsed_label(state, run))])
+        last = _last_activity(state, run)
+        if last:
+            parts.extend(["  ", _paint(pal, pal.dim(), fit_cells(_clean(last), 40))])
     if run.delegation_id:
         parts.extend([" ", _paint(pal, pal.dim(), f"[deleg:{_clean(run.delegation_id)}]")])
     if run.status in _FAILURE_STATUSES and run.first_failure:
@@ -659,10 +682,7 @@ def _detail_lines(state: TuiState, pal: Palette) -> List[str]:
         _paint(pal, pal.dim(), "revision ") + _clean(run.revision or UNSET),
         _paint(pal, pal.dim(), "status   ")
         + _paint(pal, _status_style(pal, run.status), _STATUS_WORD.get(run.status, run.status)),
-        _paint(pal, pal.dim(), "counts   ")
-        + f"pass {run.pass_count}/{run.total_count}  fail={run.fail_count}"
-        + (f"  err={run.error_count}" if run.error_count else "")
-        + f"  skip={run.skip_count}",
+        _paint(pal, pal.dim(), "counts   ") + _counts_detail(run),
         _paint(pal, pal.dim(), "duration ") + _fmt_duration(run.duration_ms),
         _paint(pal, pal.dim(), "failure  ") + _clean(run.first_failure or UNSET),
         _paint(pal, pal.dim(), "repro    ") + _clean(_repro_for(run) or UNSET),
@@ -673,7 +693,9 @@ def _detail_lines(state: TuiState, pal: Palette) -> List[str]:
     ]
     log_lines = list(state.log_lines.get(run.run_id, ()))
     if not log_lines:
-        lines.append(_paint(pal, pal.dim(), " (no captured log lines)"))
+        lines.append(_paint(pal, pal.dim(),
+                            " (no output yet)" if run.status in RunStatus.ACTIVE
+                            else " (no captured log lines)"))
     for number, log in enumerate(log_lines, start=1):
         lines.append(f" {number:03d} {_clean(log)}")
     lines.append("")
