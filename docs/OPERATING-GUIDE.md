@@ -34,7 +34,7 @@ The run record shows which case applied: each suite's `isolation_meta.seatbelt` 
 
 Env scrubbing matches names, not values: a secret in a variable whose name matches no pattern (for example `MYDBPASS`) is passed through on both platforms.
 
-Process cleanup on a clean exit covers only the suite's own process group: TestBench leaves the exited leader unreaped (`waitid(WNOWAIT)`) so its process-group id stays reserved, then signals that group. A descendant that called `setsid()` or `setpgid()` into a new group is outside it; on a clean exit such a process survives unless it was started within a timed-out, cancelled, or failed step (which also runs the sandbox-directory sweep).
+Process cleanup on a clean exit covers only the suite's own process group: TestBench leaves the exited leader unreaped (`waitid(WNOWAIT)`) so its process-group id stays reserved, then signals that group. Where `os.waitid` is unavailable (macOS on Python < 3.13) the leader is reaped first; the group id then stays reserved only while a member is alive, and the group is re-checked for live members immediately before each signal. A descendant that called `setsid()` or `setpgid()` into a new group is outside it; on a clean exit such a process survives unless it was started within a timed-out, cancelled, or failed step (which also runs the sandbox-directory sweep).
 
 ## 2. Project Onboarding & `.testbench.toml`
 

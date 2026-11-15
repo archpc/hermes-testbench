@@ -207,14 +207,21 @@ def terminate_process_group(
     return not pgroup_alive(pgid)
 
 
-def _leader_exited(pid: int) -> bool:
-    """True once ``pid`` (our direct child) has exited, WITHOUT reaping it.
+_HAS_WAITID_NOWAIT = hasattr(os, "waitid") and hasattr(os, "WNOWAIT")
 
-    Leaving the leader an unreaped zombie keeps its pid, and so its process-group id,
-    reserved by the kernel: a later ``killpg(pgid)`` can only reach that group.
+
+def _leader_exited(proc: "subprocess.Popen[Any]") -> bool:
+    """True once the suite leader (our direct child) has exited.
+
+    With ``waitid(WNOWAIT)`` the leader stays an unreaped zombie, so its pid, and with it the
+    process-group id, cannot be reused: a later ``killpg(pgid)`` reaches only that group.
+    Without it (macOS on Python < 3.13) the leader is reaped here; the pgid then stays
+    reserved only while some member of the group is still alive.
     """
+    if not _HAS_WAITID_NOWAIT:
+        return proc.poll() is not None
     try:
-        return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        return os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
     except ChildProcessError:
         return True
 
@@ -245,13 +252,16 @@ def _live_group_members(pgid: int, leader: int) -> List[int]:
 def _reap_group_after_leader_exit(pgid: int, grace_s: float = 0.5) -> int:
     """Terminate what is left of the suite's own process group after its leader exited.
 
-    Call only while the leader is an unreaped zombie (see ``_leader_exited``). Returns the
-    number of surviving members that were signalled.
+    The group is re-checked for live members immediately before each signal, so ``killpg``
+    only runs while the pgid is held by the leader's zombie or by a live member of the suite's
+    own session. Returns the number of surviving members that were signalled.
     """
     members = _live_group_members(pgid, pgid)
     if not members:
         return 0
     for sig, wait_s in ((signal.SIGTERM, grace_s), (signal.SIGKILL, 0.5)):
+        if not _live_group_members(pgid, pgid):
+            return len(members)
         try:
             os.killpg(pgid, sig)
         except OSError:
@@ -776,7 +786,7 @@ def run_isolated_command(
                     sel.register(proc.stderr.fileno(), selectors.EVENT_READ, data="stderr")
 
                 deadline = t0 + max(0.05, float(timeout_s))
-                while sel.get_map() or not _leader_exited(proc.pid):
+                while sel.get_map() or not _leader_exited(proc):
                     now = time.monotonic()
                     if cancel_flag_path is not None and cancel_flag_path.exists():
                         cancelled = True
@@ -789,7 +799,7 @@ def run_isolated_command(
 
                     wait_s = min(0.05, max(0.005, deadline - now))
                     events = sel.select(timeout=wait_s)
-                    if not events and _leader_exited(proc.pid):
+                    if not events and _leader_exited(proc):
                         # Process exited; do one non-blocking drain and break
                         events = sel.select(timeout=0.0)
                         if not events:
@@ -830,7 +840,7 @@ def run_isolated_command(
                 if proc.stderr is not None:
                     proc.stderr.close()
 
-            if not (timed_out or cancelled) and _leader_exited(proc.pid):
+            if not (timed_out or cancelled) and _leader_exited(proc):
                 # Leader exited on its own (any exit status): reap its leftover group members
                 # while the zombie still pins the pgid, then reap the leader.
                 reaped_survivors += _reap_group_after_leader_exit(pgid)
