@@ -29,6 +29,14 @@ _BARE_FAIL_RE = re.compile(r"^(?:FAIL|TB-FAIL|FAILED)\s*$")
 _SKIP_MARKER_RE = re.compile(r"^SKIP(?::|\s)\s*(.*)$")
 _BARE_SKIP_RE = re.compile(r"^SKIP\s*$")
 
+# A list item must carry an explicit bullet or number: an indented continuation
+# line (traceback frame, assertion detail) is part of one failure, not a new one.
+_BULLET_ITEM_RE = re.compile(r"^(?:[-*]|\d+[.)])\s+(\S.*)$")
+_ANY_MARKER_RE = re.compile(r"^(?:PASS|TB-PASS|OK|FAIL|TB-FAIL|FAILED|SKIP)(?::|\s|$)")
+_EXC_LINE_RE = re.compile(
+    r"^(?:[A-Za-z_][A-Za-z0-9_.]*\.)*[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception|Failure|Exit)(?::|\b)"
+)
+
 _SANITIZER_DIAG_RES = (
     re.compile(r"^\s*(?:==\d+==)?ERROR:\s*AddressSanitizer:\s*(?P<msg>.*)$"),
     re.compile(r"^\s*(?:==\d+==)?ERROR:\s*LeakSanitizer:\s*(?P<msg>.*)$"),
@@ -74,7 +82,6 @@ def _summarize_markers(text: str) -> Tuple[int, int, int, int, List[Dict[str, An
     cases: List[Dict[str, Any]] = []
     raw_lines = text.splitlines()
     idx = 0
-    bullet_re = re.compile(r"^\s+(?:[-*]|\d+[.)])?\s*(\S.*)$")
     while idx < len(raw_lines):
         raw_line = raw_lines[idx]
         line = raw_line.strip()
@@ -85,23 +92,33 @@ def _summarize_markers(text: str) -> Tuple[int, int, int, int, List[Dict[str, An
         if match or _BARE_FAIL_RE.match(line):
             inline = (match.group(1) if match else "").strip()
             if not inline:
-                bullets: List[str] = []
+                block: List[str] = []
                 look = idx + 1
                 while look < len(raw_lines):
                     cand = raw_lines[look]
-                    if not cand.strip():
+                    if not cand.strip() or not cand[:1].isspace():
                         break
-                    bm = bullet_re.match(cand)
-                    if not bm:
+                    # Indented markers are their own cases, never excerpt text.
+                    if _ANY_MARKER_RE.match(cand.strip()):
                         break
-                    bullets.append(bm.group(1).strip())
+                    block.append(cand.strip())
                     look += 1
+                bullets = [bm.group(1).strip() for bm in map(_BULLET_ITEM_RE.match, block) if bm]
                 if bullets:
                     for item in bullets:
                         failed += 1
                         cname = f"failure_{failed}"
                         failures.append(_failure(cname, "assertion", item))
                         cases.append({"name": cname, "status": "FAIL", "message": item})
+                    idx = look
+                    continue
+                if block:
+                    excerpt = "\n".join(block)
+                    msg = next((part for part in reversed(block) if _EXC_LINE_RE.match(part)), block[-1])
+                    name = f"case_{failed + 1}"
+                    failed += 1
+                    failures.append(_failure(name, "assertion", msg, excerpt))
+                    cases.append({"name": name, "status": "FAIL", "message": msg})
                     idx = look
                     continue
             name = inline or f"case_{failed + 1}"
@@ -237,8 +254,7 @@ def parse_python_unittest(text: str) -> ParseOutcome:
             end += 1
         block_lines = [part for part in lines[idx + 1 : end] if part.strip() and not separator_re.match(part.strip())]
         block = "\n".join(block_lines)
-        exc_re = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_.]*\.)*[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception|Failure|Exit)(?::|\b)")
-        exc_line = next((part.strip() for part in reversed(block_lines) if exc_re.match(part.strip())), "")
+        exc_line = next((part.strip() for part in reversed(block_lines) if _EXC_LINE_RE.match(part.strip())), "")
         message = exc_line or (block_lines[-1].strip() if block_lines else status)
         kind = "assertion" if status == "FAIL" else "harness_error"
         outcome.failures.append(_failure(display, kind, message, block or line))
