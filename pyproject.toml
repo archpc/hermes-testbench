@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-testbench"
+dynamic = ["version"]
+description = "Isolated test, benchmark, and verification engine with persisted evidence (CLI, MCP, TUI)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.scripts]
+testbench = "hermes_testbench.cli:main"
+
+[tool.hatch.version]
+path = "hermes_testbench/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hermes_testbench"]

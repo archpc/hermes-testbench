@@ -1,7 +1,19 @@
-#!/Users/sein/.local/bin/python3.14
-"""Standalone launcher for Hermes TestBench (pinned to Python >=3.11 for tomllib)."""
+#!/bin/sh
+""":"
+# Source-tree and release-snapshot launcher. Selects the first interpreter >= 3.11
+# (tomllib) and re-executes this file under it. Installed wheels use the console script
+# generated from pyproject.toml instead, which is bound to its own environment.
+for py in "${TESTBENCH_PYTHON:-}" python3.14 python3.13 python3.12 python3.11 python3 \
+          "$HOME/.local/bin/python3" /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+  [ -n "$py" ] || continue
+  command -v "$py" >/dev/null 2>&1 || continue
+  "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null || continue
+  exec "$py" "$0" "$@"
+done
+echo "testbench: no Python >= 3.11 found (set TESTBENCH_PYTHON)" >&2
+exit 127
+":"""
 
-import os
 from pathlib import Path
 import sys
 

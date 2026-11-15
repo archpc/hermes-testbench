@@ -255,9 +255,9 @@ class IsolationTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "macOS sandbox-exec unavailable")
     def test_nested_process_inherits_effective_seatbelt_restrictions_and_detects_outer_sandbox(self) -> None:
-        from hermes_testbench.isolation import can_apply_seatbelt
-        real_hermes_probe = Path("/Users/sein/.hermes/_tb_nested_effective_probe")
-        real_ssh_dir = Path("/Users/sein/.ssh")
+        from hermes_testbench.isolation import can_apply_seatbelt, real_user_home
+        real_hermes_probe = real_user_home() / ".hermes" / "_tb_nested_effective_probe"
+        real_ssh_dir = real_user_home() / ".ssh"
         repo_root_dir = Path(__file__).resolve().parent.parent
         # When already inside an outer TestBench Seatbelt, repo_root_dir is the protected read-only repo
         protected_repo = self.repo if can_apply_seatbelt() else repo_root_dir

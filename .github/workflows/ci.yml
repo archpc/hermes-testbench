@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: source tree / ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: tmux
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update -q && sudo apt-get install -yq tmux; else brew list tmux >/dev/null 2>&1 || brew install tmux; fi
+      - name: unittest (source checkout)
+        env:
+          TESTBENCH_SCRATCH_DIR: ${{ runner.temp }}/tb-scratch
+        run: |
+          mkdir -p "$TESTBENCH_SCRATCH_DIR"
+          python -W default -m unittest discover -s tests -p 'test_*.py' -v
+
+  installed:
+    name: installed wheel / ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: build sdist and wheel
+        run: uv build --out-dir dist
+      - name: install the wheel as a tool (isolated venv, not the source tree)
+        run: |
+          uv tool install --python "${{ matrix.python }}" dist/*.whl
+          echo "$(uv tool dir --bin)" >> "$GITHUB_PATH"
+      - name: installed-artifact smoke (runs only against the installed binary)
+        env:
+          TESTBENCH_SCRATCH_DIR: ${{ runner.temp }}/tb-scratch
+        run: |
+          mkdir -p "$TESTBENCH_SCRATCH_DIR"
+          export TESTBENCH_INSTALLED_BIN="$(command -v testbench)"
+          testbench --version
+          cd "$RUNNER_TEMP" && python "$GITHUB_WORKSPACE/tests/test_installed_artifact.py" -v
+      - name: sdist builds the same wheel contents
+        run: |
+          mkdir sd && tar -xzf dist/*.tar.gz -C sd --strip-components=1
+          (cd sd && uv build --wheel --out-dir ../dist-sd)
+          diff <(unzip -Z1 dist/*.whl | sort) <(unzip -Z1 dist-sd/*.whl | sort)
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'ubuntu-24.04' && matrix.python == '3.14'
+        with:
+          name: dist
+          path: dist/

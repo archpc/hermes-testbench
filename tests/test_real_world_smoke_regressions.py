@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import sys
 import unittest
 
 from hermes_testbench.adapters import execute_suite
@@ -69,7 +70,7 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
             "subprocess.run(['tmux','-L',s,'-f','/dev/null','new-session','-d','-s','ok'], check=True)"
         )
         res2 = run_isolated_command(
-            ["/Users/sein/.local/bin/python3.14", "-c", sock_script],
+            [sys.executable, "-c", sock_script],
             cwd=self.root,
             evidence_dir=self.root / "ev2",
             step_name="deep_tmux_sock",
@@ -112,7 +113,7 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
             "print(f'LOOP=ok DASH_BLOCKED={dash_blocked} EXT_BLOCKED={ext_blocked}')\n"
         )
         r_net = run_isolated_command(
-            ["/Users/sein/.local/bin/python3.14", "-c", probe_py],
+            [sys.executable, "-c", probe_py],
             cwd=self.root,
             evidence_dir=self.root / "ev_net",
             step_name="net_loopback",
@@ -244,7 +245,7 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
                     "--repeats",
                     "2",
                     "--",
-                    "/Users/sein/.local/bin/python3.14",
+                    sys.executable,
                     "-c",
                     "x = sum(range(1000))",
                 ]
@@ -269,7 +270,7 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
                     "--repeats",
                     "2",
                     "--",
-                    "/Users/sein/.local/bin/python3.14",
+                    sys.executable,
                     "-c",
                     "x = sum(range(1000))",
                 ]
