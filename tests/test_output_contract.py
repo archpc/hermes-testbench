@@ -145,6 +145,10 @@ class DiagnosticParserAndShellIntegrationTests(unittest.TestCase):
             fc.parse_filecheck_diagnostics("foo.c:10:5: error: use of undeclared identifier 'x'\n"),
             [],
         )
+        self.assertEqual(
+            fc.parse_filecheck_diagnostics("conf.check:3:1: error: unexpected token\n"),
+            [],
+        )
         bare = "error: no check strings found with prefix 'CHECK:'\n"
         record = fc.parse_filecheck_diagnostics(bare)[0]
         self.assertEqual(record["kind"], FailureKind.ASSERTION)

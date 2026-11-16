@@ -382,7 +382,7 @@ def parse_filecheck_diagnostics(text: str) -> List[Dict[str, Any]]:
             rest = bare.group("rest").strip()
 
         directive_match = _FC_DIRECTIVE_RE.match(rest)
-        is_fc_error = bool(directive_match) or bool(_FC_GLOBAL_ERR_RE.search(rest)) or file_field.endswith(".check")
+        is_fc_error = bool(directive_match) or bool(_FC_GLOBAL_ERR_RE.search(rest))
         if not is_fc_error:
             index += 1
             continue

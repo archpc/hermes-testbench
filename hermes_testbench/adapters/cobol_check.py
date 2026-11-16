@@ -486,7 +486,7 @@ def _detail(lines: List[str], text: str, *, indent: str = "    ") -> None:
     if not body:
         body = ["<empty>"]
     for chunk in body[:_MAX_DETAIL_LINES]:
-        lines.append(indent + chunk[:_MAX_DETAIL_CHARS])
+        lines.append(indent + "| " + chunk[:_MAX_DETAIL_CHARS])
 
 
 def _first_difference(expected: str, actual: str) -> str:

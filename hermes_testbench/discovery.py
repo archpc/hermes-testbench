@@ -492,7 +492,7 @@ for src in "$@"; do
   log="$TMPDIR/cobol_$name.compile.log"
   if ! cobc -O2 -debug -x -o "$bin" "$src" >"$log" 2>&1; then
     echo "TB-FAIL cobol:$src compile"
-    sed -n '1,20p' "$log" | sed 's/^/  /'
+    sed -n '1,20p' "$log" | sed 's/^/  | /'
     err=$(grep -m1 ': error: ' "$log" || true)
     echo "  compile failed: ${err:-see compiler output above}"
     rc=1
@@ -503,7 +503,8 @@ for src in "$@"; do
   status=$?
   if [ "$status" -ne 0 ]; then
     echo "TB-FAIL cobol:$src rc=$status"
-    sed -n '1,10p' "$TMPDIR/cobol_$name.stderr" | sed 's/^/  /'
+    sed -n '1,10p' "$TMPDIR/cobol_$name.stderr" | sed 's/^/  | /'
+    echo "  process exited with status $status"
     rc=1
     continue
   fi
@@ -512,7 +513,7 @@ for src in "$@"; do
       echo "TB-PASS cobol:$src"
     else
       echo "TB-FAIL cobol:$src output"
-      diff -u "$src.expected" "$out" | sed -n '1,24p' | sed 's/^/  /'
+      diff -u "$src.expected" "$out" | sed -n '1,24p' | sed 's/^/  | /'
       echo "  output differs from $src.expected: expected [$(sed -n '1p' "$src.expected")] got [$(sed -n '1p' "$out")]"
       rc=1
     fi

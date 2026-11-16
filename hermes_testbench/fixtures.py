@@ -1504,23 +1504,32 @@ def _haunted_cell_width(ch: str) -> int:
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
-def _haunted_run_record() -> RunRecord:
+def _haunted_run_record(text: str = "haunted") -> RunRecord:
+    flat = text.replace("\n", " ") or "haunted"
     return RunRecord(
         run_id="tb_haunted_phase1c",
-        project="haunted",
+        project=flat,
         project_root=".",
         revision="0000000",
         profile=ProfileName.TERMINAL,
         status=RunStatus.FAIL,
-        first_failure="hostile terminal corpus",
+        first_failure=flat,
         created_at="2026-01-01T00:00:00.000000Z",
     )
 
 
 def _haunted_state(text: str) -> TuiState:
-    run = _haunted_run_record()
+    run = _haunted_run_record(text)
     lines = tuple(text.splitlines()) or ("",)
-    return TuiState(runs=(run,), log_lines={run.run_id: lines}, view="overview")
+    flat = text.replace("\n", " ") or "ready"
+    return TuiState(
+        runs=(run,),
+        log_lines={run.run_id: lines},
+        view="overview",
+        detail_open=True,
+        detail_scroll=13,
+        minibuffer=flat,
+    )
 
 
 def haunted_render_frame(text: str, width: int, height: int) -> List[str]:

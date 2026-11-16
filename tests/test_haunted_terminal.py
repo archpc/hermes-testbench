@@ -189,7 +189,13 @@ class HauntedCheckerTests(unittest.TestCase):
         for entry in haunted_invisible_control_corpus() + haunted_wide_corpus():
             for width in (10, 12, 24):
                 frame = haunted_render_frame(entry.text, width, 6)
+                plain_frame = haunted_render_frame("plain", width, 6)
                 self.assertEqual(len(frame), 6)
+                self.assertNotEqual(
+                    frame,
+                    plain_frame,
+                    f"frame at width {width} ignored payload {entry.name}",
+                )
                 self.assertEqual(check_haunted_frame(frame, width, height=6), [], entry.name)
 
     def test_check_text_flags_controls_that_never_may_reach_a_terminal(self) -> None:

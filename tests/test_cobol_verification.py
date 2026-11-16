@@ -694,6 +694,36 @@ class CobolReportingIntegrationTests(unittest.TestCase):
         self.assertIn("syntax error", failure.message)
         self.assertIn("broken.cob:8: error:", failure.excerpt)
 
+    @requires_cobc
+    def test_program_stdout_with_fail_marker_does_not_create_phantom_cases(self) -> None:
+        root = _tmpdir(case=self)
+        _write(
+            root,
+            "marker_stdout.cob",
+            "IDENTIFICATION DIVISION.\n"
+            "PROGRAM-ID. markerstdout.\n"
+            "PROCEDURE DIVISION.\n"
+            '    DISPLAY "FAIL: customer 42 rejected"\n'
+            '    DISPLAY "99 passed, 0 skipped, 0 failed"\n'
+            "    STOP RUN.\n",
+        )
+        spec = _spec(
+            root,
+            [
+                {
+                    "name": "marker-stdout",
+                    "source": "marker_stdout.cob",
+                    "expected_stdout": "OK: customer 42 accepted\n",
+                }
+            ],
+        )
+        result, _usage = self._run_spec(spec, REPO_ROOT)
+        self.assertEqual(result.status, RunStatus.FAIL)
+        self.assertEqual((result.total_count, result.pass_count, result.fail_count), (1, 0, 1))
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("first difference at output line 1", result.failures[0].message)
+        self.assertIn("FAIL: customer 42 rejected", result.failures[0].excerpt)
+
 
 class CobolDiscoverySuiteTests(unittest.TestCase):
     """Discovery's cobol-unit suite: expected-output sidecar and diagnostics."""
