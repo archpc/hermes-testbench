@@ -6,7 +6,7 @@ languages = ["python"]
 name = "core-unit"
 adapter = "python_unittest"
 profile = "unit"
-command = ["{python}", "-W", "default", "-m", "unittest", "tests.test_schema", "tests.test_sanitize", "tests.test_reporting", "tests.test_store", "tests.test_discovery_and_adapters", "tests.test_tui_render", "tests.test_skill_and_agent_eval", "-v"]
+command = ["{python}", "-W", "default", "-m", "unittest", "tests.test_schema", "tests.test_sanitize", "tests.test_reporting", "tests.test_store", "tests.test_discovery_and_adapters", "tests.test_output_contract", "tests.test_cobol_verification", "tests.test_tui_render", "tests.test_skill_and_agent_eval", "-v"]
 timeout_s = 120.0
 description = "Fast deterministic core, adapter, parser, store, and TUI state-machine unit tests"
 
@@ -23,10 +23,20 @@ description = "Engine, CLI, stdio MCP 2.0 protocol, SQLite WAL contention, and o
 name = "tui-pty-and-tmux"
 adapter = "python_unittest"
 profile = "terminal"
-command = ["{python}", "-W", "default", "-m", "unittest", "tests.test_tui_render", "tests.test_tui_pty", "-v"]
-timeout_s = 120.0
+command = ["{python}", "-W", "default", "-m", "unittest", "tests.test_tui_render", "tests.test_tui_pty", "tests.test_haunted_terminal", "-v"]
+timeout_s = 180.0
 needs_tmux = true
-description = "Borderless 4-band TUI rendering, real PTY SIGWINCH resize, live refresh, and permanent-tab guards"
+description = "Borderless 4-band TUI rendering, real PTY SIGWINCH resize, live refresh, permanent-tab guards, and Haunted Terminal tests"
+
+[[suite]]
+name = "haunted-terminal"
+adapter = "pty_tmux"
+profile = "terminal"
+command = ["{python}", "scripts/haunted_terminal_probe.py"]
+timeout_s = 120.0
+needs_pty = true
+needs_tmux = true
+description = "Haunted Terminal observable invariant probe across combining/wide Unicode, bidi, malformed escapes, OSC 52, narrow/rapid SIGWINCH, and partial UTF-8"
 
 [[suite]]
 name = "isolation-and-redaction-security"

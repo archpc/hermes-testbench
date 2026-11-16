@@ -402,6 +402,76 @@ def parse_cargo(text: str) -> ParseOutcome:
     return outcome
 
 
+_COBOL_DIAG_RE = re.compile(
+    r"^(?P<file>\S+\.(?:cob|cbl|cpy)):(?P<line>\d+):\s*"
+    r"(?P<severity>error|warning|note):\s*(?P<message>.+)$"
+)
+
+
+def _cobol_compile_errors(text: str) -> List[Dict[str, Any]]:
+    """``cobc`` errors as ``file:line: error: message`` records.
+
+    Only used when no harness marker supplied per-case results, so a harness that
+    prints its own TB-PASS/TB-FAIL lines stays the single source of truth.
+    """
+    found: List[Dict[str, Any]] = []
+    for raw in text.splitlines():
+        match = _COBOL_DIAG_RE.match(raw.strip())
+        if not match or match.group("severity") != "error":
+            continue
+        found.append(
+            {
+                "file": match.group("file"),
+                "line": int(match.group("line")),
+                "message": match.group("message").strip(),
+                "rendered": raw.strip()[:300],
+            }
+        )
+    return found
+
+
+def _cobol_inline_details(text: str) -> Dict[str, List[str]]:
+    """Map an inline ``TB-FAIL <label>`` marker to the indented block under it.
+
+    The shared marker scanner treats an inline marker as a complete one-line
+    failure, which is right for ``cargo``/``shell`` output. GnuCOBOL verification
+    writes the label inline and the evidence (expected vs actual, compiler
+    diagnostics) as an indented block, so the block is folded back into the same
+    failure here instead of being lost.
+    """
+    details: Dict[str, List[str]] = {}
+    pending: Optional[str] = None
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if raw[:1].isspace():
+            if pending is None:
+                continue
+            if _ANY_MARKER_RE.match(stripped):
+                pending = None
+                continue
+            details.setdefault(pending, []).append(stripped)
+            continue
+        match = _FAIL_MARKER_RE.match(stripped)
+        pending = match.group(1).strip() if match and match.group(1).strip() else None
+    return details
+
+
+def _apply_cobol_details(outcome: ParseOutcome, text: str) -> None:
+    """Fold indented evidence into the failure whose inline marker owns it."""
+    details = _cobol_inline_details(text)
+    if not details:
+        return
+    for failure in outcome.failures:
+        block = details.get(str(failure.get("case_name", "")))
+        if not block:
+            continue
+        failure["excerpt"] = "\n".join(block)[:800]
+        # The most specific line of the block is the actionable reason.
+        failure["message"] = block[-1][:800]
+
+
 def parse_cobol(text: str) -> ParseOutcome:
     cleaned = _clean(text)
     if re.search(r"^Ran \d+ tests? in ", cleaned, re.M):
@@ -409,6 +479,8 @@ def parse_cobol(text: str) -> ParseOutcome:
     text = cleaned
     outcome = ParseOutcome()
     markers = _apply_markers(outcome, text)
+    if markers:
+        _apply_cobol_details(outcome, text)
     success_re = re.compile(r"\b(?:ALL TESTS PASSED|TESTS PASSED|SELFTEST OK)\b")
     success = bool(success_re.search(text))
     counts, line = _summary_counts(text)
@@ -419,7 +491,30 @@ def parse_cobol(text: str) -> ParseOutcome:
         outcome.passed = max(outcome.passed, 1)
     if success and outcome.failed:
         outcome.summary_line = "cobol selftest reported success but also failures"
-    outcome.structured = outcome.structured or success or markers
+    compile_errors = [] if markers else _cobol_compile_errors(text)
+    if compile_errors and not outcome.failed:
+        # A bare cobc failure has no runner summary: turn its diagnostics into
+        # attributable failures instead of a generic "exit status 1".
+        for diag in compile_errors[:10]:
+            outcome.failures.append(
+                _failure(
+                    f"cobol:{diag['file']}:{diag['line']}",
+                    "harness_error",
+                    f"cobc error: {diag['message']}",
+                    diag["rendered"],
+                )
+            )
+            outcome.cases.append(
+                {
+                    "name": f"{diag['file']}:{diag['line']}",
+                    "status": "FAIL",
+                    "message": f"cobc error: {diag['message']}",
+                }
+            )
+        outcome.failed = max(outcome.failed, len(compile_errors))
+        outcome.total = max(outcome.total, outcome.failed)
+        outcome.summary_line = f"cobc compile failed: {compile_errors[0]['rendered']}"
+    outcome.structured = outcome.structured or success or markers or bool(compile_errors)
     return outcome
 
 
@@ -458,9 +553,33 @@ def parse_c_sanitizer(text: str) -> ParseOutcome:
 
 
 def parse_shell(text: str) -> ParseOutcome:
+    from .filecheck import parse_filecheck_diagnostics
+
     text = _clean(text)
     outcome = ParseOutcome()
     markers = _apply_markers(outcome, text)
+    if not markers:
+        fc_diags = parse_filecheck_diagnostics(text)
+        if fc_diags:
+            outcome.failures.extend(fc_diags)
+            for item in fc_diags:
+                outcome.cases.append(
+                    {
+                        "name": item["case_name"],
+                        "status": "FAIL",
+                        "message": item["message"],
+                        "file": item.get("file"),
+                        "line": item.get("line"),
+                    }
+                )
+            outcome.failed = len(fc_diags)
+            outcome.total = len(fc_diags)
+            first = fc_diags[0]["message"]
+            outcome.summary_line = (
+                first if len(fc_diags) == 1 else f"{first} (+{len(fc_diags) - 1} more)"
+            )[:800]
+            outcome.structured = True
+            return outcome
     counts, line = _summary_counts(text)
     if counts:
         _apply_summary(outcome, counts, line)
