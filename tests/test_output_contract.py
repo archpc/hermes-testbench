@@ -1,10 +1,10 @@
-"""Output-contract assertions: FileCheck-backed and literal fallback paths.
+"""Output-contract assertions through LLVM FileCheck and TestBench's shell adapter.
 
-Every end-to-end control runs through TestBench's real ``execute_suite`` (shell
-adapter, isolation, evidence capture) and through the reporting pipeline
-(``render_run_json`` / ``render_junit_xml`` written by ``TestBenchStore.finalize_run``).
-The FileCheck-path controls are skipped only when LLVM FileCheck is not installed;
-the fallback controls always run so the contract never depends on optional tools.
+Every execution runs through TestBench's real ``execute_suite`` (``shell`` adapter,
+isolation, Seatbelt confinement, evidence capture, and ``Gate 3`` ``SKIP`` when
+``FileCheck`` is absent) and through ``TestBenchStore.finalize_run`` reporting
+(``run.json`` and ``junit.xml``). Parser and contract-construction tests run
+unconditionally even on hosts without LLVM installed.
 """
 
 from __future__ import annotations
@@ -12,14 +12,16 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from hermes_testbench.adapters import filecheck as fc
+from hermes_testbench.adapters import execute_suite, filecheck as fc
+from hermes_testbench.adapters.parsers import parse_shell
 from hermes_testbench.isolation import default_scratch_root
 from hermes_testbench.reporting import parse_junit_xml_bounded
-from hermes_testbench.schema import FailureKind, RunRecord, RunStatus
+from hermes_testbench.schema import FailureKind, RunRecord, RunStatus, SuiteSpec
 from hermes_testbench.store import TestBenchStore
 
 FILECHECK = fc.find_filecheck()
@@ -60,26 +62,25 @@ class ContractValidationTests(unittest.TestCase):
         self.assertIn("CHECK: second", steps[1].check_text)
         self.assertIn("CHECK-COUNT-2: token", steps[2].check_text)
         self.assertIn("CHECK-NOT: token", steps[2].check_text)
-        # Zero-count assertions cannot use CHECK-COUNT-0 (FileCheck rejects it).
         self.assertEqual(steps[3].check_text.strip(), "CHECK-NOT: never")
-        # Forbidden patterns are global command-line flags plus a zero-width anchor.
+        self.assertEqual(steps[3].extra_args, ("--allow-empty",))
         self.assertEqual(steps[4].check_text.strip(), "CHECK: {{^}}")
-        self.assertEqual(steps[4].extra_args, ("--implicit-check-not=FORBIDDEN",))
+        self.assertEqual(steps[4].extra_args, ("--allow-empty", "--implicit-check-not=FORBIDDEN"))
 
     def test_command_carries_step_flags_and_input_file(self) -> None:
         steps = fc.build_check_steps(FULL_CONTRACT)
         argv = fc.filecheck_command(
             steps[0], input_path=Path("in.txt"), check_file=Path("c.check"), executable="/bin/FileCheck"
         )
-        self.assertEqual(argv, ["/bin/FileCheck", "--input-file=in.txt", "c.check"])
+        self.assertEqual(argv, ["/bin/FileCheck", "--allow-empty", "--input-file=in.txt", "c.check"])
         forbidden = fc.filecheck_command(
             steps[4], input_path=Path("in.txt"), check_file=Path("f.check"), executable="/bin/FileCheck"
         )
-        self.assertEqual(forbidden[1], "--implicit-check-not=FORBIDDEN")
+        self.assertEqual(forbidden[1:3], ["--allow-empty", "--implicit-check-not=FORBIDDEN"])
         self.assertEqual(forbidden[-2:], ["--input-file=in.txt", "f.check"])
 
 
-class DiagnosticParserTests(unittest.TestCase):
+class DiagnosticParserAndShellIntegrationTests(unittest.TestCase):
     def test_extracts_actionable_record_from_missing_check(self) -> None:
         text = (
             "demo.check:1:11: error: CHECK: expected string not found in input\n"
@@ -135,26 +136,51 @@ class DiagnosticParserTests(unittest.TestCase):
         )
         record = fc.parse_filecheck_diagnostics(implicit_text)[0]
         self.assertEqual(record["case_name"], "IMPLICIT-CHECK-NOT: beta")
-        self.assertIsNone(record["file"])  # "command line" is not a real source file
+        self.assertIsNone(record["file"])
         self.assertIsNone(record["line"])
 
-    def test_ignores_unrelated_text_and_dedupes_identical_errors(self) -> None:
-        self.assertEqual(fc.parse_filecheck_diagnostics("all good\nnote: nothing\n"), [])
+    def test_ignores_benign_warnings_and_unrelated_compiler_errors(self) -> None:
+        self.assertEqual(fc.parse_filecheck_diagnostics("warning: deprecated flag\nall good\n"), [])
+        self.assertEqual(
+            fc.parse_filecheck_diagnostics("foo.c:10:5: error: use of undeclared identifier 'x'\n"),
+            [],
+        )
         bare = "error: no check strings found with prefix 'CHECK:'\n"
         record = fc.parse_filecheck_diagnostics(bare)[0]
         self.assertEqual(record["kind"], FailureKind.ASSERTION)
         self.assertIsNone(record["file"])
-        self.assertIsNone(record["line"])
         self.assertIn("no check strings", record["message"])
-        duplicated = bare + bare
-        self.assertEqual(len(fc.parse_filecheck_diagnostics(duplicated)), 1)
+        self.assertEqual(len(fc.parse_filecheck_diagnostics(bare + bare)), 1)
+
+    def test_parse_shell_handles_filecheck_input_dump_without_false_error_counts(self) -> None:
+        raw_fc_dump = (
+            "rules.check:1:8: error: CHECK: expected string not found in input\n"
+            "CHECK: MUST_EXIST\n"
+            "       ^\n"
+            "in.txt:1:1: note: scanning from here\n"
+            "actual line\n"
+            "^\n"
+            "Input was:\n"
+            "<<<<<<\n"
+            "           1: actual line\n"
+            "check:1'0    {            } search range (exclusive bounds)\n"
+            "check:1'1                   error: no match found in search range\n"
+            ">>>>>>\n"
+        )
+        outcome = parse_shell(raw_fc_dump)
+        self.assertTrue(outcome.structured)
+        self.assertEqual(outcome.errors, 0)
+        self.assertEqual(outcome.failed, 1)
+        self.assertEqual(outcome.total, 1)
+        self.assertEqual(len(outcome.failures), 1)
+        self.assertEqual(outcome.failures[0]["case_name"], "CHECK: MUST_EXIST")
+        self.assertEqual(outcome.failures[0]["file"], "rules.check")
+        self.assertEqual(outcome.failures[0]["line"], 1)
 
 
-class FileCheckEndToEndTests(unittest.TestCase):
-    """Positive/negative controls through execute_suite and the shell adapter."""
-
+class AbsentToolAndOverrideTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory(dir=str(default_scratch_root()), prefix="tb-fc-")
+        self.tmp = tempfile.TemporaryDirectory(dir=str(default_scratch_root()), prefix="tb-fc-skip-")
         self.root = Path(self.tmp.name)
         self.proj = self.root / "proj"
         self.proj.mkdir()
@@ -163,167 +189,22 @@ class FileCheckEndToEndTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def _run(self, name: str, contract: fc.OutputContract, text: str, *, prefer: bool = True):
-        return fc.execute_output_contract(
-            name,
-            contract=contract,
-            project_root=self.proj,
-            evidence_dir=self.evidence,
-            run_id=f"tb_fc_{name}",
-            input_text=text,
-            prefer_filecheck=prefer,
-        )
-
-    @requires_filecheck
-    def test_positive_control_passes_through_shell_adapter(self) -> None:
-        result = self._run("positive", FULL_CONTRACT, SATISFIED)
-        self.assertEqual(result.status, RunStatus.PASS)
-        self.assertEqual(result.exit_code, 0)
-        self.assertEqual((result.total_count, result.pass_count, result.fail_count), (1, 1, 0))
-        self.assertEqual(result.failures, [])
-        self.assertEqual(result.metrics["output_contract_engine"], "filecheck")
-        self.assertEqual(result.metrics["filecheck_binary"], fc.find_filecheck())
-        self.assertEqual(result.metrics["output_contract_steps"], 5)
-        check_dir = Path(result.metrics["check_dir"])
-        self.assertIn("CHECK-DAG: alpha", (check_dir / "step0.check").read_text(encoding="utf-8"))
-        self.assertTrue((check_dir / "run.sh").is_file())
-        self.assertTrue(Path(result.stdout_path).is_file())
-
-    @requires_filecheck
-    def test_missing_required_pattern_reports_actionable_failure(self) -> None:
-        result = self._run("missing", fc.OutputContract(required=("MISSING_MARKER",)), "hello\n")
-        self.assertEqual(result.status, RunStatus.FAIL)
-        self.assertGreaterEqual(result.total_count, 1)
-        self.assertEqual(result.fail_count, 1)
-        failure = result.failures[0]
-        self.assertEqual(failure.kind, FailureKind.ASSERTION)
-        self.assertEqual(failure.case_name, "CHECK-DAG: MISSING_MARKER")
-        self.assertIn("expected string not found", failure.message)
-        self.assertTrue(str(failure.file).endswith("step0.check"), failure.file)
-        self.assertEqual(failure.line, 1)
-        self.assertIn("MISSING_MARKER", failure.excerpt)
-
-    @requires_filecheck
-    def test_ordered_violation_reports_the_expected_next_pattern(self) -> None:
-        result = self._run("ordered", fc.OutputContract(ordered=("first", "second")), "second\nfirst\n")
-        self.assertEqual(result.status, RunStatus.FAIL)
-        failure = result.failures[0]
-        self.assertEqual(failure.case_name, "CHECK: second")
-        self.assertIn("expected string not found", failure.message)
-
-    @requires_filecheck
-    def test_forbidden_pattern_fails_the_run(self) -> None:
-        contract = fc.OutputContract(required=("alpha",), forbidden=("BANNED",))
-        result = self._run("forbidden", contract, "alpha\nBANNED\n")
-        self.assertEqual(result.status, RunStatus.FAIL)
-        failure = result.failures[0]
-        self.assertEqual(failure.case_name, "IMPLICIT-CHECK-NOT: BANNED")
-        self.assertIsNone(failure.file)
-        self.assertIsNone(failure.line)
-        self.assertIn("BANNED", failure.excerpt)
-
-    @requires_filecheck
-    def test_multiple_independent_assertions_all_report_failures(self) -> None:
-        contract = fc.OutputContract(
-            required=("MISSING_MARKER",), forbidden=("BANNED",), counts=(("token", 1),)
-        )
-        result = self._run("multi_fail", contract, "alpha\nBANNED\ntoken\ntoken\n")
-        self.assertEqual(result.status, RunStatus.FAIL)
-        names = {failure.case_name for failure in result.failures}
-        self.assertIn("CHECK-DAG: MISSING_MARKER", names)
-        self.assertIn("IMPLICIT-CHECK-NOT: BANNED", names)
-        self.assertIn("token", " ".join(names))
-        self.assertEqual(result.fail_count, len(result.failures))
-        self.assertGreaterEqual(result.fail_count, 3)
-
-    @requires_filecheck
-    def test_required_and_ordered_are_independent(self) -> None:
-        contract = fc.OutputContract(required=("late",), ordered=("first", "second"))
-        result = self._run("independent", contract, "first\nsecond\nlate\n")
-        self.assertEqual(result.status, RunStatus.PASS)
-        self.assertEqual(result.failures, [])
-
-    @requires_filecheck
-    def test_forbidden_only_contract(self) -> None:
-        contract = fc.OutputContract(forbidden=("BANNED",))
-        self.assertEqual(self._run("forb_ok", contract, "alpha\nbeta\n").status, RunStatus.PASS)
-        result = self._run("forb_bad", contract, "BANNED\nalpha\n")
-        self.assertEqual(result.status, RunStatus.FAIL)
-        self.assertEqual(result.failures[0].case_name, "IMPLICIT-CHECK-NOT: BANNED")
-        self.assertIn("BANNED", result.failures[0].excerpt)
-
-    @requires_filecheck
-    def test_exact_occurrence_counts_reject_extra_occurrences(self) -> None:
-        contract = fc.OutputContract(counts=(("token", 2),))
-        self.assertEqual(self._run("count_two", contract, "token\ntoken\n").status, RunStatus.PASS)
-        extra = self._run("count_three", contract, "token\ntoken\ntoken\n")
-        self.assertEqual(extra.status, RunStatus.FAIL)
-        self.assertIn("token", extra.failures[0].case_name)
-        self.assertIn("excluded string found", extra.failures[0].message)
-
-        zero = fc.OutputContract(counts=(("never", 0),))
-        self.assertEqual(self._run("absent_ok", zero, "alpha\n").status, RunStatus.PASS)
-        present = self._run("absent_bad", zero, "alpha\nnever\n")
-        self.assertEqual(present.status, RunStatus.FAIL)
-        self.assertEqual(present.failures[0].case_name, "CHECK-NOT: never")
-
-
-class LiteralFallbackTests(unittest.TestCase):
-    """The fallback must keep contracts usable when FileCheck is absent."""
-
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory(dir=str(default_scratch_root()), prefix="tb-fc-")
-        self.root = Path(self.tmp.name)
-        self.proj = self.root / "proj"
-        self.proj.mkdir()
-        self.evidence = self.root / "evidence"
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def _run(self, name: str, contract: fc.OutputContract, text: str, **kwargs):
-        return fc.execute_output_contract(
-            name,
-            contract=contract,
-            project_root=self.proj,
-            evidence_dir=self.evidence,
-            run_id=f"tb_fc_{name}",
-            input_text=text,
-            **kwargs,
-        )
-
-    def test_fallback_positive_control(self) -> None:
-        result = self._run("fallback_ok", FULL_CONTRACT, SATISFIED, prefer_filecheck=False)
-        self.assertEqual(result.status, RunStatus.PASS)
-        self.assertEqual(result.metrics["output_contract_engine"], "literal-fallback")
-        self.assertEqual(result.total_count, FULL_CONTRACT.assertion_count())
-        self.assertEqual(result.pass_count, FULL_CONTRACT.assertion_count())
-        self.assertEqual(result.fail_count, 0)
-        self.assertEqual(len(result.cases), FULL_CONTRACT.assertion_count())
-        self.assertTrue(all(case.status == RunStatus.PASS for case in result.cases))
-
-    def test_fallback_negative_control_reports_every_violation(self) -> None:
-        text = "beta\nalpha\nsecond\nfirst\ntoken\ntoken\ntoken\nFORBIDDEN\n"
-        result = self._run("fallback_bad", FULL_CONTRACT, text, prefer_filecheck=False)
-        self.assertEqual(result.status, RunStatus.FAIL)
-        names = [failure.case_name for failure in result.failures]
-        self.assertIn("CHECK: second", names)
-        self.assertIn("IMPLICIT-CHECK-NOT: FORBIDDEN", names)
-        self.assertIn("CHECK-COUNT-2: token", names)
-        self.assertEqual(len(result.failures), 3)
-        self.assertEqual(result.total_count, FULL_CONTRACT.assertion_count())
-        self.assertEqual(result.pass_count, FULL_CONTRACT.assertion_count() - 3)
-        self.assertTrue(all(f.kind == FailureKind.ASSERTION for f in result.failures))
-        forbidden = next(f for f in result.failures if "FORBIDDEN" in f.case_name)
-        self.assertEqual(forbidden.line, 8)
-        self.assertTrue(str(forbidden.file).endswith(".input.txt"))
-
-    def test_absent_tool_falls_back_instead_of_failing(self) -> None:
-        with mock.patch.object(fc, "find_filecheck", return_value=None):
-            result = self._run("tool_absent", FULL_CONTRACT, SATISFIED)
-        self.assertEqual(result.status, RunStatus.PASS)
-        self.assertEqual(result.metrics["output_contract_engine"], "literal-fallback")
-        self.assertFalse(result.metrics["filecheck_used"])
+    def test_missing_filecheck_skips_cleanly_via_gate3_without_custom_fallback(self) -> None:
+        with (
+            mock.patch.object(fc, "find_filecheck", return_value=None),
+            mock.patch("hermes_testbench.adapters._missing_binary", return_value="FileCheck"),
+        ):
+            result = fc.execute_output_contract(
+                "absent_fc",
+                contract=FULL_CONTRACT,
+                project_root=self.proj,
+                evidence_dir=self.evidence,
+                run_id="tb_fc_skip",
+                input_text=SATISFIED,
+            )
+        self.assertEqual(result.status, RunStatus.SKIP)
+        self.assertEqual(result.skip_count, 1)
+        self.assertIn("FileCheck", result.summary_excerpt)
 
     def test_override_disables_tool_and_valid_override_is_used(self) -> None:
         old = os.environ.get("TESTBENCH_FILECHECK")
@@ -341,18 +222,10 @@ class LiteralFallbackTests(unittest.TestCase):
             else:
                 os.environ["TESTBENCH_FILECHECK"] = old
 
-    def test_check_text_is_pure_and_reports_lines(self) -> None:
-        records = fc.check_text(fc.OutputContract(required=("late",)), "one\nlate\n", source_label="out.txt")
-        self.assertEqual(records, [])
-        records = fc.check_text(fc.OutputContract(required=("missing",)), "one\nlate\n", source_label="out.txt")
-        self.assertEqual(len(records), 1)
-        self.assertIsNone(records[0]["line"])
-        records = fc.check_text(fc.OutputContract(forbidden=("late",)), "one\nlate\n", source_label="out.txt")
-        self.assertEqual(records[0]["line"], 2)
 
-
-class ReportingPipelineTests(unittest.TestCase):
-    """run.json and junit.xml must carry the actionable assertion failures."""
+@requires_filecheck
+class FileCheckEndToEndTests(unittest.TestCase):
+    """Positive and negative controls through execute_suite and reporting."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(dir=str(default_scratch_root()), prefix="tb-fc-")
@@ -365,9 +238,148 @@ class ReportingPipelineTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def _export(self, result, run_id: str) -> RunRecord:
+    def _run(self, name: str, contract: fc.OutputContract, text: Optional[str] = None, **kwargs):
+        return fc.execute_output_contract(
+            name,
+            contract=contract,
+            project_root=self.proj,
+            evidence_dir=self.evidence,
+            run_id=f"tb_fc_{name}",
+            input_text=text,
+            **kwargs,
+        )
+
+    def test_positive_control_passes_through_shell_adapter(self) -> None:
+        result = self._run("positive", FULL_CONTRACT, SATISFIED)
+        self.assertEqual(result.status, RunStatus.PASS)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual((result.total_count, result.pass_count, result.fail_count), (1, 1, 0))
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.metrics["output_contract_engine"], "filecheck")
+        self.assertEqual(result.metrics["output_contract_steps"], 5)
+        self.assertTrue(Path(result.stdout_path or "").is_file())
+        self.assertTrue(Path(result.sanitized_path or "").is_file())
+
+    def test_producer_command_runs_once_under_isolation_and_checks_output(self) -> None:
+        marker = self.proj / "producer.py"
+        marker.write_text(
+            'print("header")\nprint("item")\nprint("item")\nprint("footer")\n',
+            encoding="utf-8",
+        )
+        contract = fc.OutputContract(
+            ordered=("header", "footer"),
+            forbidden=("ERROR",),
+            counts=(("item", 2),),
+        )
+        result = self._run("producer_ok", contract, producer_command=[sys.executable, str(marker)])
+        self.assertEqual(result.status, RunStatus.PASS)
+
+        bad_contract = fc.OutputContract(counts=(("item", 1),))
+        bad_res = self._run("producer_bad", bad_contract, producer_command=[sys.executable, str(marker)])
+        self.assertEqual(bad_res.status, RunStatus.FAIL)
+        self.assertEqual(bad_res.failures[0].kind, FailureKind.ASSERTION)
+        self.assertIn("item", bad_res.failures[0].case_name)
+
+    def test_missing_required_pattern_reports_actionable_failure(self) -> None:
+        result = self._run("missing", fc.OutputContract(required=("MISSING_MARKER",)), "hello\n")
+        self.assertEqual(result.status, RunStatus.FAIL)
+        self.assertEqual(result.fail_count, 1)
+        failure = result.failures[0]
+        self.assertEqual(failure.kind, FailureKind.ASSERTION)
+        self.assertEqual(failure.case_name, "CHECK-DAG: MISSING_MARKER")
+        self.assertIn("expected string not found", failure.message)
+        self.assertTrue(str(failure.file).endswith("step0.check"), failure.file)
+        self.assertEqual(failure.line, 1)
+        self.assertIn("MISSING_MARKER", failure.excerpt)
+
+    def test_ordered_violation_reports_the_expected_next_pattern(self) -> None:
+        result = self._run("ordered", fc.OutputContract(ordered=("first", "second")), "second\nfirst\n")
+        self.assertEqual(result.status, RunStatus.FAIL)
+        failure = result.failures[0]
+        self.assertEqual(failure.case_name, "CHECK: second")
+        self.assertIn("expected string not found", failure.message)
+
+    def test_forbidden_pattern_fails_the_run(self) -> None:
+        contract = fc.OutputContract(required=("alpha",), forbidden=("BANNED",))
+        result = self._run("forbidden", contract, "alpha\nBANNED\n")
+        self.assertEqual(result.status, RunStatus.FAIL)
+        failure = result.failures[0]
+        self.assertEqual(failure.case_name, "IMPLICIT-CHECK-NOT: BANNED")
+        self.assertIsNone(failure.file)
+        self.assertIsNone(failure.line)
+        self.assertIn("BANNED", failure.excerpt)
+
+    def test_empty_output_passes_forbidden_and_reports_assertion_on_missing_required(self) -> None:
+        ok_empty = self._run("forb_empty", fc.OutputContract(forbidden=("NOPE",)), "")
+        self.assertEqual(ok_empty.status, RunStatus.PASS)
+        self.assertEqual(ok_empty.failures, [])
+
+        bad_empty = self._run("req_empty", fc.OutputContract(required=("MUST_PRINT",)), "")
+        self.assertEqual(bad_empty.status, RunStatus.FAIL)
+        self.assertEqual(bad_empty.error_count, 0)
+        failure = bad_empty.failures[0]
+        self.assertEqual(failure.kind, FailureKind.ASSERTION)
+        self.assertEqual(failure.case_name, "CHECK-DAG: MUST_PRINT")
+        self.assertTrue(str(failure.file).endswith("step0.check"), failure.file)
+        self.assertEqual(failure.line, 1)
+
+    def test_exact_occurrence_counts_reject_extra_and_fewer_occurrences(self) -> None:
+        contract = fc.OutputContract(counts=(("token", 2),))
+        self.assertEqual(self._run("count_two", contract, "token\ntoken\n").status, RunStatus.PASS)
+        fewer = self._run("count_one", contract, "token\n")
+        self.assertEqual(fewer.status, RunStatus.FAIL)
+        extra = self._run("count_three", contract, "token\ntoken\ntoken\n")
+        self.assertEqual(extra.status, RunStatus.FAIL)
+        self.assertIn("token", extra.failures[0].case_name)
+        self.assertIn("excluded string found", extra.failures[0].message)
+
+        zero = fc.OutputContract(counts=(("never", 0),))
+        self.assertEqual(self._run("absent_ok", zero, "alpha\n").status, RunStatus.PASS)
+        self.assertEqual(self._run("empty_ok", zero, "").status, RunStatus.PASS)
+        present = self._run("absent_bad", zero, "alpha\nnever\n")
+        self.assertEqual(present.status, RunStatus.FAIL)
+        self.assertEqual(present.failures[0].case_name, "CHECK-NOT: never")
+
+    def test_multiple_independent_assertions_all_report_failures(self) -> None:
+        contract = fc.OutputContract(
+            required=("MISSING_MARKER",), forbidden=("BANNED",), counts=(("token", 1),)
+        )
+        result = self._run("multi_fail", contract, "alpha\nBANNED\ntoken\ntoken\n")
+        self.assertEqual(result.status, RunStatus.FAIL)
+        names = {failure.case_name for failure in result.failures}
+        self.assertIn("CHECK-DAG: MISSING_MARKER", names)
+        self.assertIn("IMPLICIT-CHECK-NOT: BANNED", names)
+        self.assertEqual(result.fail_count, len(result.failures))
+        self.assertGreaterEqual(result.fail_count, 3)
+
+    def test_raw_filecheck_via_shell_adapter_surfaces_assertion_failure_and_junit(self) -> None:
+        assert FILECHECK is not None
+        chk = self.proj / "direct.check"
+        chk.write_text("CHECK: EXPECTED_HEADER\n", encoding="utf-8")
+        inp = self.proj / "out.txt"
+        inp.write_text("wrong header\n", encoding="utf-8")
+        suite = SuiteSpec(
+            name="direct-filecheck",
+            adapter="shell",
+            profile="unit",
+            command=[FILECHECK, f"--input-file={inp}", str(chk)],
+        )
+        result, _ = execute_suite(
+            suite,
+            project_root=self.proj,
+            evidence_dir=self.evidence,
+            run_id="tb_direct_fc",
+        )
+        self.assertEqual(result.status, RunStatus.FAIL)
+        self.assertEqual(result.error_count, 0)
+        self.assertEqual(result.fail_count, 1)
+        self.assertEqual(len(result.failures), 1)
+        self.assertEqual(result.failures[0].kind, FailureKind.ASSERTION)
+        self.assertEqual(result.failures[0].case_name, "CHECK: EXPECTED_HEADER")
+        self.assertEqual(result.failures[0].line, 1)
+
         run = RunRecord(
-            run_id=run_id,
+            run_id="tb_direct_fc",
             project="output-contract",
             project_root=str(self.proj),
             revision="deadbeef",
@@ -384,93 +396,11 @@ class ReportingPipelineTests(unittest.TestCase):
         )
         with TestBenchStore(self.tb_home) as store:
             store.finalize_run(run)
-        return run
-
-    def _run_json(self, run: RunRecord) -> dict:
-        self.assertIsNotNone(run.run_json_path)
-        return json.loads(Path(str(run.run_json_path)).read_text(encoding="utf-8"))
-
-    def _junit_xml(self, run: RunRecord) -> str:
-        self.assertIsNotNone(run.junit_xml_path)
-        return Path(str(run.junit_xml_path)).read_text(encoding="utf-8")
-
-    def test_fallback_failure_lands_in_run_json_and_junit_xml(self) -> None:
-        contract = fc.OutputContract(required=("MISSING_MARKER",), forbidden=("BANNED",))
-        result = fc.execute_output_contract(
-            "reported",
-            contract=contract,
-            project_root=self.proj,
-            evidence_dir=self.evidence,
-            run_id="tb_fc_report_bad",
-            input_text="alpha\nBANNED\n",
-            prefer_filecheck=False,
-        )
-        run = self._export(result, "tb_fc_report_bad")
-
-        data = self._run_json(run)
-        suite = data["suites"][0]
-        self.assertEqual(data["status"], RunStatus.FAIL)
-        self.assertEqual(suite["fail_count"], result.fail_count)
-        self.assertEqual(suite["total_count"], result.total_count)
-        cases = {item["case_name"]: item for item in suite["failures"]}
-        self.assertIn("CHECK-DAG: MISSING_MARKER", cases)
-        self.assertIn("IMPLICIT-CHECK-NOT: BANNED", cases)
-        self.assertEqual(cases["IMPLICIT-CHECK-NOT: BANNED"]["kind"], FailureKind.ASSERTION)
-        self.assertEqual(cases["IMPLICIT-CHECK-NOT: BANNED"]["line"], 2)
-
-        xml = self._junit_xml(run)
+        data = json.loads(Path(str(run.run_json_path)).read_text(encoding="utf-8"))
+        self.assertEqual(data["suites"][0]["failures"][0]["kind"], FailureKind.ASSERTION)
+        xml = Path(str(run.junit_xml_path)).read_text(encoding="utf-8")
         parsed = parse_junit_xml_bounded(xml.encode("utf-8"))
-        self.assertEqual(parsed["failures"], 2)
-        self.assertEqual(parsed["errors"], 0)
-        self.assertEqual(parsed["tests"], result.total_count)
-        self.assertIn("<failure", xml)
-        self.assertIn("MISSING_MARKER", xml)
-        self.assertIn("BANNED", xml)
-
-    @requires_filecheck
-    def test_filecheck_failure_lands_in_run_json_and_junit_xml(self) -> None:
-        contract = fc.OutputContract(required=("present",), counts=(("token", 2),))
-        result = fc.execute_output_contract(
-            "filecheck_reported",
-            contract=contract,
-            project_root=self.proj,
-            evidence_dir=self.evidence,
-            run_id="tb_fc_report_fc",
-            input_text="present\ntoken\ntoken\ntoken\n",
-        )
-        self.assertEqual(result.status, RunStatus.FAIL)
-        run = self._export(result, "tb_fc_report_fc")
-
-        data = self._run_json(run)
-        failure = data["suites"][0]["failures"][0]
-        self.assertEqual(failure["kind"], FailureKind.ASSERTION)
-        self.assertEqual(failure["line"], 2)
-        self.assertIn("token", failure["case_name"])
-        self.assertIn("excluded string found", failure["message"])
-
-        xml = self._junit_xml(run)
-        self.assertIn("type=\"assertion\"", xml)
-        parsed = parse_junit_xml_bounded(xml.encode("utf-8"))
-        self.assertEqual(parsed["failures"], 1)
-        self.assertEqual(parsed["errors"], 0)
-
-    def test_positive_control_exports_clean_reports(self) -> None:
-        result = fc.execute_output_contract(
-            "reported_ok",
-            contract=fc.OutputContract(required=("alpha",)),
-            project_root=self.proj,
-            evidence_dir=self.evidence,
-            run_id="tb_fc_report_ok",
-            input_text="alpha\n",
-            prefer_filecheck=False,
-        )
-        self.assertEqual(result.status, RunStatus.PASS)
-        run = self._export(result, "tb_fc_report_ok")
-        data = self._run_json(run)
-        self.assertEqual(data["status"], RunStatus.PASS)
-        self.assertEqual(data["suites"][0]["failures"], [])
-        parsed = parse_junit_xml_bounded(self._junit_xml(run).encode("utf-8"))
-        self.assertEqual((parsed["tests"], parsed["failures"], parsed["errors"]), (1, 0, 0))
+        self.assertEqual((parsed["tests"], parsed["failures"], parsed["errors"]), (1, 1, 0))
 
 
 if __name__ == "__main__":

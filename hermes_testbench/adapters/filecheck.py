@@ -16,25 +16,15 @@ binary:
 Each independent intent runs as its own FileCheck invocation because FileCheck treats
 multiple prefixes as one interleaved sequence (a trailing ``CHECK-DAG`` group also
 suppresses implicit-NOT regions). One generated ``/bin/sh`` script runs all steps and
-is then executed through TestBench's existing ``shell`` adapter (``execute_suite``), so
-isolation, timeouts, evidence capture, redaction, exit-status accounting, and reporting
-are reused unchanged and several failing assertions are reported in a single run. No
-matching language is implemented here: FileCheck owns pattern semantics (including its
-``{{regex}}`` and ``[[var]]`` extensions).
+is executed through TestBench's existing ``shell`` adapter (``execute_suite``), so
+isolation, Seatbelt confinement, timeouts, evidence capture, in-stream secret
+redaction, exit-status accounting, and ``SKIP`` gating when ``FileCheck`` is absent
+are reused unchanged. No custom matching engine or FileCheck clone is implemented.
 
-``FileCheck`` is optional. When it is not installed (for example a CI image without
-LLVM), ``execute_output_contract`` falls back to ``check_text``: a deliberately
-minimal, pure-stdlib literal-substring evaluator for the same four intents. The
-fallback exists only so output contracts stay usable without a toolchain; it is
-line-oriented, literal (no FileCheck regex/variables), and its diagnostics are shaped
-like FileCheck's so the reporting path is identical. Prefer FileCheck whenever it is
-present. Count assertions need a FileCheck with ``CHECK-COUNT`` support; the fallback
-has no version floor.
-
-``parse_filecheck_diagnostics`` is a pure text parser (no I/O, no spawning) that turns
-raw FileCheck error output into ``FailureRecord``-shaped dicts, so the coordinator can
-also wire plain ``FileCheck`` invocations into ``parse_shell`` without this module's
-``execute_output_contract`` wrapper.
+``parse_filecheck_diagnostics`` is a pure text parser (no I/O, no spawning) wired
+into ``parsers.parse_shell`` so both ``execute_output_contract`` and direct
+``FileCheck`` pipelines in ``shell`` suites produce ``FailureRecord`` entries with
+``kind="assertion"``, source file, line number, and diagnostic excerpt.
 """
 
 from __future__ import annotations
@@ -47,30 +37,17 @@ import shlex
 import shutil
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from ..schema import (
-    CaseResult,
-    FailureKind,
-    FailureRecord,
-    ProfileName,
-    RunStatus,
-    SuiteResult,
-    SuiteSpec,
-    utc_now_iso,
-)
+from ..schema import FailureKind, ProfileName, SuiteResult, SuiteSpec
 
 __all__ = [
     "OutputCheckStep",
     "OutputContract",
     "build_check_steps",
-    "check_text",
     "execute_output_contract",
     "filecheck_command",
     "find_filecheck",
     "parse_filecheck_diagnostics",
 ]
-
-# FileCheck's default ``CHECK`` prefix also accepts ``CHECK-DAG``, ``CHECK-COUNT-N`` and
-# ``CHECK-NOT`` directives, so each independent assertion needs no custom prefix.
 
 _DISABLE_VALUES = frozenset({"", "0", "off", "none", "false", "no"})
 
@@ -82,9 +59,8 @@ _MAX_EXCERPT = 800
 class OutputContract:
     """Declarative output assertions; an empty contract is rejected.
 
-    Patterns are passed to FileCheck verbatim (so its ``{{regex}}`` and
-    ``[[variable]]`` syntax keeps working). The literal fallback treats them as
-    plain substrings and does not interpret FileCheck syntax.
+    Patterns are passed to LLVM FileCheck verbatim, so FileCheck's native
+    ``{{regex}}`` and ``[[variable]]`` directives remain available.
     """
 
     required: Tuple[str, ...] = ()
@@ -151,7 +127,7 @@ def _normalise_counts(counts: Iterable[Tuple[str, int]]) -> Tuple[Tuple[str, int
 
 
 # --------------------------------------------------------------------------------------
-# FileCheck discovery (optional tool, never required)
+# FileCheck discovery (optional tool; missing binary triggers standard Gate 3 SKIP)
 
 
 def _brew_prefixes() -> List[Path]:
@@ -162,6 +138,10 @@ def _brew_prefixes() -> List[Path]:
     brew = shutil.which("brew")
     if brew:
         prefixes.append(Path(brew).resolve().parent.parent)
+    for std_prefix in ("/opt/homebrew", "/usr/local"):
+        cand = Path(std_prefix)
+        if cand.is_dir():
+            prefixes.append(cand)
     unique: List[Path] = []
     for prefix in prefixes:
         if prefix not in unique:
@@ -170,22 +150,21 @@ def _brew_prefixes() -> List[Path]:
 
 
 def _llvm_filecheck_candidates() -> List[str]:
-    """Absolute FileCheck paths from keg-only/Linux LLVM installs.
-
-    Built from Homebrew prefixes and standard Linux keg directories; no
-    machine-specific user path is embedded. Cached by the caller's module state.
-    """
+    """Absolute FileCheck paths from keg-only Homebrew and Linux LLVM installs."""
     found: List[str] = []
     for prefix in _brew_prefixes():
         opt = prefix / "opt"
         if opt.is_dir():
-            for cand in sorted(opt.glob("llvm*/bin/FileCheck"), key=lambda p: (p.parent.parent.name != "llvm", p.parent.parent.name)):
+            for cand in sorted(
+                opt.glob("llvm*/bin/FileCheck"),
+                key=lambda p: (p.parent.parent.name != "llvm", p.parent.parent.name),
+            ):
                 if cand.is_file() and os.access(cand, os.X_OK):
                     found.append(str(cand))
         plain = prefix / "bin" / "FileCheck"
         if plain.is_file() and os.access(plain, os.X_OK):
             found.append(str(plain))
-    for cand in sorted(Path("/usr/lib").glob("llvm-*/bin/FileCheck")):
+    for cand in sorted(Path("/usr/lib").glob("llvm-*/bin/FileCheck"), reverse=True):
         if cand.is_file() and os.access(cand, os.X_OK):
             found.append(str(cand))
     unique: List[str] = []
@@ -213,8 +192,7 @@ def find_filecheck() -> Optional[str]:
         cand = Path(stripped).expanduser()
         if cand.is_file() and os.access(cand, os.X_OK):
             return str(cand)
-        resolved = shutil.which(stripped)
-        return resolved
+        return shutil.which(stripped)
 
     for name in ["FileCheck"] + [f"FileCheck-{n}" for n in range(30, 9, -1)]:
         path = shutil.which(name)
@@ -246,39 +224,48 @@ def build_check_steps(contract: OutputContract) -> Tuple[OutputCheckStep, ...]:
     FileCheck evaluates multiple ``--check-prefix`` groups as *one interleaved
     sequence* (verified on LLVM 23): a trailing DAG group also suppresses
     ``--implicit-check-not`` regions. Keeping each intent in its own invocation is
-    therefore the only way to make the four assertions independent. The steps are
-    executed by a single generated ``/bin/sh`` script under one isolated suite, so
-    several failing assertions still produce several diagnostics in one run.
+    therefore required for independent assertions. All steps execute inside one
+    generated ``/bin/sh`` script in a single isolated ``execute_suite`` call.
     """
     steps: List[OutputCheckStep] = []
 
     if contract.required:
         body = "".join(f"CHECK-DAG: {pattern}\n" for pattern in contract.required)
-        steps.append(OutputCheckStep(case_name="CHECK-DAG", check_text=body))
+        steps.append(
+            OutputCheckStep(case_name="CHECK-DAG", check_text=body, extra_args=("--allow-empty",))
+        )
 
     if contract.ordered:
         body = "".join(f"CHECK: {pattern}\n" for pattern in contract.ordered)
-        steps.append(OutputCheckStep(case_name="CHECK", check_text=body))
+        steps.append(
+            OutputCheckStep(case_name="CHECK", check_text=body, extra_args=("--allow-empty",))
+        )
 
     for pattern, count in contract.counts:
         if count == 0:
             steps.append(
-                OutputCheckStep(case_name=f"CHECK-NOT: {pattern}", check_text=f"CHECK-NOT: {pattern}\n")
+                OutputCheckStep(
+                    case_name=f"CHECK-NOT: {pattern}",
+                    check_text=f"CHECK-NOT: {pattern}\n",
+                    extra_args=("--allow-empty",),
+                )
             )
             continue
-        # COUNT walks from the start of the input and stops after the Nth match, so the
-        # trailing NOT (its region runs to EOF) proves there is no (N+1)th occurrence.
         body = f"CHECK-COUNT-{count}: {pattern}\nCHECK-NOT: {pattern}\n"
-        steps.append(OutputCheckStep(case_name=f"CHECK-COUNT-{count}: {pattern}", check_text=body))
+        steps.append(
+            OutputCheckStep(
+                case_name=f"CHECK-COUNT-{count}: {pattern}",
+                check_text=body,
+                extra_args=("--allow-empty",),
+            )
+        )
 
     for pattern in contract.forbidden:
-        # A zero-width anchor at the start makes the implicit NOT region cover the
-        # whole input, including the first line.
         steps.append(
             OutputCheckStep(
                 case_name=f"IMPLICIT-CHECK-NOT: {pattern}",
                 check_text="CHECK: {{^}}\n",
-                extra_args=(f"--implicit-check-not={pattern}",),
+                extra_args=("--allow-empty", f"--implicit-check-not={pattern}"),
             )
         )
 
@@ -306,20 +293,25 @@ def filecheck_command(
 
 
 _DIAG_RE = re.compile(
-    r"^(?P<file>.+?):(?P<line>\d+):(?P<col>\d+):\s*(?P<sev>error|warning):\s*(?P<rest>.+)$"
+    r"^(?P<file>.+?):(?P<line>\d+):(?P<col>\d+):\s*error:\s*(?P<rest>.+)$"
 )
-_BARE_ERROR_RE = re.compile(r"^(?P<sev>error|warning):\s*(?P<rest>.+)$")
-_DIRECTIVE_RE = re.compile(r"^(?P<directive>[A-Z][A-Z0-9_-]*):\s*(?P<msg>.*)$")
-_SNIPPET_RE = re.compile(r"^\s*(?://|;|#)?\s*(?P<directive>[A-Za-z][A-Za-z0-9_-]*):\s*(?P<pattern>.+?)\s*$")
+_BARE_ERROR_RE = re.compile(r"^(?:FileCheck\s+)?error:\s*(?P<rest>.+)$")
+_FC_DIRECTIVE_RE = re.compile(
+    r"^(?P<directive>(?:[A-Z][A-Z0-9_-]*-)?(?:CHECK(?:-(?:NEXT|SAME|NOT|DAG|COUNT(?:-\d+)?|LABEL|EMPTY))?|IMPLICIT-CHECK-NOT"
+    r"|NEXT|SAME|NOT|DAG|COUNT(?:-\d+)?|LABEL|EMPTY)):\s*(?P<msg>.*)$"
+)
+_FC_GLOBAL_ERR_RE = re.compile(
+    r"(?:check strings found with prefix|FileCheck error:|invalid check|unable to open check-file"
+    r"|supplied check-prefix|found 'CHECK-)",
+    re.IGNORECASE,
+)
+_SNIPPET_RE = re.compile(
+    r"^\s*(?://|;|#)?\s*(?P<directive>[A-Za-z][A-Za-z0-9_-]*):\s*(?P<pattern>.+?)\s*$"
+)
 _IMPLICIT_SNIPPET_RE = re.compile(
     r"-implicit-check-not=(?:'(?P<single>[^']*)'|\"(?P<double>[^\"]*)\"|(?P<bare>\S+))"
 )
 _PSEUDO_FILES = frozenset({"command line", "<command line>", "command-line"})
-
-
-def _display_directive(directive: str) -> str:
-    """Return the directive name exactly as FileCheck printed it."""
-    return directive
 
 
 def _window(lines: Sequence[str], start: int) -> List[str]:
@@ -338,7 +330,9 @@ def _pattern_from_window(window: Sequence[str], directive: str) -> Tuple[str, st
         for line in window[1:]:
             match = _IMPLICIT_SNIPPET_RE.search(line)
             if match:
-                pattern = match.group("single") or match.group("double") or match.group("bare") or ""
+                pattern = (
+                    match.group("single") or match.group("double") or match.group("bare") or ""
+                )
                 return directive, pattern
     fallback: Tuple[str, str] = (directive, "")
     for line in window[1:]:
@@ -346,10 +340,10 @@ def _pattern_from_window(window: Sequence[str], directive: str) -> Tuple[str, st
         if not match:
             continue
         full = match.group("directive")
-        if full.lower() in ("note", "error", "warning"):
-            continue
-        # Prefer a snippet whose directive family agrees with the reported error.
-        candidate = (_display_directive(full), match.group("pattern").strip())
+        if full.lower() in ("note", "error", "warning", "input", "check"):
+            if full != "CHECK":
+                continue
+        candidate = (full, match.group("pattern").strip())
         if directive == "CHECK-COUNT" or "-COUNT" in full.upper():
             return candidate
         if full.upper().startswith(directive.split("-")[0]):
@@ -360,11 +354,11 @@ def _pattern_from_window(window: Sequence[str], directive: str) -> Tuple[str, st
 
 
 def parse_filecheck_diagnostics(text: str) -> List[Dict[str, Any]]:
-    """Extract actionable failure dicts from raw FileCheck error output.
+    """Extract actionable failure dicts from LLVM FileCheck error output.
 
-    Every returned dict matches ``FailureRecord`` fields except ``suite``:
-    ``case_name``, ``kind`` (always ``"assertion"``), ``message``, ``file``,
-    ``line``, ``excerpt``. Pure: no I/O, no spawning, no re-runs.
+    Matches only genuine FileCheck ``error:`` diagnostics (never ``warning:`` or
+    unrelated compiler errors) so ``parsers.parse_shell`` can invoke this safely on
+    every shell suite's captured output.
     """
     lines = (text or "").splitlines()
     results: List[Dict[str, Any]] = []
@@ -381,26 +375,23 @@ def parse_filecheck_diagnostics(text: str) -> List[Dict[str, Any]]:
             file_field = match.group("file").strip()
             line_no: Optional[int] = int(match.group("line"))
             rest = match.group("rest").strip()
-        elif bare is not None:
+        else:
+            assert bare is not None
             file_field = ""
             line_no = None
             rest = bare.group("rest").strip()
-        else:
+
+        directive_match = _FC_DIRECTIVE_RE.match(rest)
+        is_fc_error = bool(directive_match) or bool(_FC_GLOBAL_ERR_RE.search(rest)) or file_field.endswith(".check")
+        if not is_fc_error:
             index += 1
             continue
-        source_file = None if file_field.lower() in _PSEUDO_FILES else (file_field or None)
-        if bare is not None:
-            line_no = None
 
-        directive_match = _DIRECTIVE_RE.match(rest)
+        source_file = None if file_field.lower() in _PSEUDO_FILES else (file_field or None)
         directive = directive_match.group("directive") if directive_match else "FILECHECK"
         window = _window(lines, index)
         shown, pattern = _pattern_from_window(window, directive)
-        shown = _display_directive(shown)
-        if pattern:
-            case_name = f"{shown}: {pattern}"
-        else:
-            case_name = shown
+        case_name = f"{shown}: {pattern}" if pattern else shown
         case_name = case_name[:200]
 
         record = {
@@ -420,265 +411,12 @@ def parse_filecheck_diagnostics(text: str) -> List[Dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------------------
-# Minimal literal fallback (only used when FileCheck is unavailable)
-
-
-def _line_of(text: str, offset: int) -> int:
-    return text.count("\n", 0, max(0, offset)) + 1
-
-
-def _context(text: str, offset: int) -> str:
-    if offset < 0:
-        return ""
-    lines = text.splitlines()
-    line_index = min(max(0, _line_of(text, offset) - 1), max(0, len(lines) - 1))
-    if not lines:
-        return ""
-    lo = max(0, line_index - 1)
-    hi = min(len(lines), line_index + 2)
-    return "\n".join(lines[lo:hi])[:_MAX_EXCERPT]
-
-
-def _literal_failure(
-    case_name: str,
-    message: str,
-    text: str,
-    offset: Optional[int],
-    source_label: Optional[str],
-) -> Dict[str, Any]:
-    if offset is not None and offset >= 0:
-        line = _line_of(text, offset)
-        excerpt = _context(text, offset)
-    else:
-        line = None
-        excerpt = ""
-    return {
-        "case_name": case_name,
-        "kind": FailureKind.ASSERTION,
-        "message": message[:_MAX_MESSAGE],
-        "file": source_label,
-        "line": line,
-        "excerpt": excerpt[:_MAX_EXCERPT],
-    }
-
-
-def _literal_cases(
-    contract: OutputContract, text: str, source_label: Optional[str]
-) -> List[Tuple[str, Optional[Dict[str, Any]]]]:
-    """Evaluate every assertion literally; return (case_name, failure|None) pairs."""
-    cases: List[Tuple[str, Optional[Dict[str, Any]]]] = []
-
-    for pattern in contract.required:
-        offset = text.find(pattern)
-        failure = None
-        if offset < 0:
-            failure = _literal_failure(
-                f"CHECK-DAG: {pattern}", "expected string not found in input", text, None, source_label
-            )
-        cases.append((f"CHECK-DAG: {pattern}", failure))
-
-    cursor = 0
-    for pattern in contract.ordered:
-        offset = text.find(pattern, cursor)
-        failure = None
-        if offset < 0:
-            failure = _literal_failure(
-                f"CHECK: {pattern}",
-                "expected string not found in input (ordered after the previous match)",
-                text,
-                None,
-                source_label,
-            )
-        else:
-            cursor = offset + len(pattern)
-        cases.append((f"CHECK: {pattern}", failure))
-
-    for pattern in contract.forbidden:
-        offset = text.find(pattern)
-        failure = None
-        if offset >= 0:
-            failure = _literal_failure(
-                f"IMPLICIT-CHECK-NOT: {pattern}", "excluded string found in input", text, offset, source_label
-            )
-        cases.append((f"IMPLICIT-CHECK-NOT: {pattern}", failure))
-
-    for pattern, expected in contract.counts:
-        found = text.count(pattern)
-        failure = None
-        if found != expected:
-            if expected == 0:
-                name = f"CHECK-NOT: {pattern}"
-            else:
-                name = f"CHECK-COUNT-{expected}: {pattern}"
-            failure = _literal_failure(
-                name,
-                f"expected exactly {expected} occurrence(s) of pattern, found {found}",
-                text,
-                text.find(pattern) if found else None,
-                source_label,
-            )
-        else:
-            name = f"CHECK-NOT: {pattern}" if expected == 0 else f"CHECK-COUNT-{expected}: {pattern}"
-        cases.append((name, failure))
-
-    return cases
-
-
-def check_text(
-    contract: OutputContract, text: str, *, source_label: Optional[str] = None
-) -> List[Dict[str, Any]]:
-    """Literal in-process evaluation of ``contract`` against ``text``.
-
-    This is the FileCheck-less fallback: plain substring matching with 1-based line
-    numbers. It intentionally supports no FileCheck regex/variable syntax.
-    """
-    return [failure for _name, failure in _literal_cases(contract, text, source_label) if failure]
-
-
-# --------------------------------------------------------------------------------------
 # Execution through the existing shell adapter
 
 
 def _safe_slug(name: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", name or "contract").strip("._") or "contract"
     return slug[:60]
-
-
-def _read_captured(result: SuiteResult) -> str:
-    parts: List[str] = []
-    for raw in (result.stdout_path, result.stderr_path):
-        if not raw:
-            continue
-        try:
-            parts.append(Path(raw).read_text(encoding="utf-8", errors="replace"))
-        except OSError:
-            continue
-    return "\n".join(parts)
-
-
-def _apply_contract_failures(result: SuiteResult, diagnostics: List[Dict[str, Any]]) -> None:
-    records = [
-        FailureRecord(
-            suite=result.name,
-            case_name=item["case_name"],
-            kind=FailureKind.ASSERTION,
-            message=item.get("message", ""),
-            file=item.get("file"),
-            line=item.get("line"),
-            excerpt=item.get("excerpt", ""),
-        )
-        for item in diagnostics
-    ]
-    result.failures = records
-    result.fail_count = max(1, len(records))
-    result.pass_count = 0
-    result.skip_count = 0
-    result.error_count = 0
-    result.status = RunStatus.FAIL
-    result.total_count = max(result.total_count, result.fail_count)
-    first = records[0].message if records else "output contract not satisfied"
-    summary = first if len(records) == 1 else f"{first} (+{len(records) - 1} more)"
-    result.summary_excerpt = summary[:_MAX_MESSAGE]
-
-
-def _literal_result(
-    name: str,
-    contract: OutputContract,
-    *,
-    project_root: Path,
-    profile: str,
-    input_path: Path,
-) -> SuiteResult:
-    try:
-        text = input_path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        result = SuiteResult(
-            name=name,
-            adapter="shell",
-            profile=profile,
-            command=[],
-            cwd=str(project_root),
-            status=RunStatus.ERROR,
-            exit_code=None,
-            started_at=utc_now_iso(),
-            finished_at=utc_now_iso(),
-            total_count=1,
-            error_count=1,
-            summary_excerpt=f"cannot read output file: {exc}",
-            failures=[
-                FailureRecord(
-                    suite=name,
-                    case_name="<input>",
-                    kind=FailureKind.HARNESS_ERROR,
-                    message=str(exc),
-                )
-            ],
-        )
-        result.metrics = {
-            "output_contract_engine": "literal-fallback",
-            "output_contract_assertions": contract.assertion_count(),
-            "filecheck_used": False,
-        }
-        return result
-
-    cases: List[CaseResult] = []
-    failures: List[FailureRecord] = []
-    for case_name, failure in _literal_cases(contract, text, str(input_path)):
-        if failure is None:
-            cases.append(CaseResult(name=case_name, suite=name, status=RunStatus.PASS))
-            continue
-        failures.append(
-            FailureRecord(
-                suite=name,
-                case_name=failure["case_name"],
-                kind=failure["kind"],
-                message=failure["message"],
-                file=failure.get("file"),
-                line=failure.get("line"),
-                excerpt=failure.get("excerpt", ""),
-            )
-        )
-        cases.append(
-            CaseResult(
-                name=case_name,
-                suite=name,
-                status=RunStatus.FAIL,
-                message=failure["message"],
-                file=failure.get("file"),
-                line=failure.get("line"),
-            )
-        )
-
-    total = len(cases)
-    failed = len(failures)
-    started = utc_now_iso()
-    result = SuiteResult(
-        name=name,
-        adapter="shell",
-        profile=profile,
-        command=[],
-        cwd=str(Path(project_root).expanduser().resolve()),
-        status=RunStatus.FAIL if failed else RunStatus.PASS,
-        exit_code=None,
-        started_at=started,
-        finished_at=utc_now_iso(),
-        total_count=total,
-        pass_count=total - failed,
-        fail_count=failed,
-        summary_excerpt=(
-            failures[0].message
-            if failures
-            else f"{total} output assertion(s) satisfied (literal fallback; FileCheck unavailable)"
-        )[: _MAX_MESSAGE],
-        failures=failures,
-        cases=cases,
-    )
-    result.metrics = {
-        "output_contract_engine": "literal-fallback",
-        "output_contract_assertions": contract.assertion_count(),
-        "filecheck_used": False,
-    }
-    return result
 
 
 def execute_output_contract(
@@ -690,20 +428,23 @@ def execute_output_contract(
     run_id: str,
     input_text: Optional[str] = None,
     input_path: Optional[Path] = None,
+    producer_command: Optional[Sequence[str]] = None,
     profile: str = ProfileName.UNIT,
     timeout_s: float = 60.0,
     executable: Optional[str] = None,
-    prefer_filecheck: bool = True,
     scratch_root: Optional[Path] = None,
 ) -> SuiteResult:
-    """Run one output contract, preferring FileCheck through the ``shell`` adapter.
+    """Run one output contract through ``execute_suite`` and TestBench's ``shell`` adapter.
 
-    Exactly one of ``input_text`` / ``input_path`` supplies the output to check.
-    ``prefer_filecheck=False`` forces the literal fallback (useful for deterministic
-    CI without LLVM). An explicit ``executable`` wins over discovery.
+    Pass exactly one input source: ``input_text``, ``input_path``, or ``producer_command``
+    (executed once inside the isolated sandbox with combined stdout/stderr checked).
+    When ``FileCheck`` is unavailable, ``execute_suite`` Gate 3 returns ``RunStatus.SKIP``.
     """
-    if (input_text is None) == (input_path is None):
-        raise ValueError("pass exactly one of input_text or input_path")
+    sources = sum(x is not None for x in (input_text, input_path, producer_command))
+    if sources != 1:
+        raise ValueError("pass exactly one of input_text, input_path, or producer_command")
+    if producer_command is not None and not list(producer_command):
+        raise ValueError("producer_command must not be empty")
 
     project_root = Path(project_root).expanduser().resolve()
     evidence_dir = Path(evidence_dir)
@@ -711,25 +452,17 @@ def execute_output_contract(
     work_dir.mkdir(parents=True, exist_ok=True)
     slug = _safe_slug(name)
 
+    output_file: Optional[Path] = None
     if input_text is not None:
         output_file = work_dir / f"{slug}.input.txt"
         output_file.write_text(input_text, encoding="utf-8")
-    else:
+    elif input_path is not None:
         output_file = Path(str(input_path)).expanduser().resolve()
         if not output_file.is_file():
             raise FileNotFoundError(f"output file not found: {output_file}")
 
-    filecheck = str(executable) if executable else None
-    if filecheck is None and prefer_filecheck:
-        filecheck = find_filecheck()
-    if filecheck is not None:
-        candidate = Path(filecheck)
-        usable = (candidate.is_file() and os.access(candidate, os.X_OK)) or bool(shutil.which(filecheck))
-        if not usable:
-            filecheck = None
-
-    if filecheck is None:
-        return _literal_result(name, contract, project_root=project_root, profile=profile, input_path=output_file)
+    filecheck = str(executable) if executable else find_filecheck()
+    required_bin = filecheck if filecheck else "FileCheck"
 
     check_dir = work_dir / slug
     check_dir.mkdir(parents=True, exist_ok=True)
@@ -737,14 +470,32 @@ def execute_output_contract(
     script_lines = [
         "#!/bin/sh",
         "# Generated by hermes_testbench.adapters.filecheck; do not edit.",
-        "# One FileCheck invocation per independent assertion; keep going to collect all.",
+        "set -u",
         "rc=0",
     ]
+    if producer_command is not None:
+        script_lines.append('input_file="$TMPDIR/fc_captured.txt"')
+        script_lines.append(f'{shlex.join(list(producer_command))} >"$input_file" 2>&1 || rc=$?')
+        input_ref = "$input_file"
+    else:
+        assert output_file is not None
+        input_ref = str(output_file)
+
+    exec_str = filecheck if filecheck else "FileCheck"
     for index, step in enumerate(steps):
         check_file = check_dir / f"step{index}.check"
         check_file.write_text(step.check_text, encoding="utf-8")
-        argv = filecheck_command(step, input_path=output_file, check_file=check_file, executable=filecheck)
-        script_lines.append(f"{shlex.join(argv)} || rc=1")
+        if producer_command is not None:
+            extra = (" " + shlex.join(step.extra_args)) if step.extra_args else ""
+            script_lines.append(
+                f'{shlex.quote(exec_str)}{extra} --input-file="{input_ref}" {shlex.quote(str(check_file))} || rc=1'
+            )
+        else:
+            assert output_file is not None
+            argv = filecheck_command(
+                step, input_path=output_file, check_file=check_file, executable=exec_str
+            )
+            script_lines.append(f"{shlex.join(argv)} || rc=1")
     script_lines.append("exit $rc")
     script = check_dir / "run.sh"
     script.write_text("\n".join(script_lines) + "\n", encoding="utf-8")
@@ -757,14 +508,13 @@ def execute_output_contract(
         command=["/bin/sh", str(script)],
         cwd=str(project_root),
         timeout_s=timeout_s,
-        required_binaries=[filecheck],
+        required_binaries=[required_bin],
         description=(
             f"output contract ({contract.assertion_count()} assertion(s), "
             f"{len(steps)} FileCheck step(s))"
         ),
     )
 
-    # Local import keeps adapters/__init__ free to import this module later without a cycle.
     from . import execute_suite
 
     result, _usage = execute_suite(
@@ -774,16 +524,14 @@ def execute_output_contract(
         run_id=run_id,
         scratch_root=scratch_root,
     )
-    diagnostics = parse_filecheck_diagnostics(_read_captured(result))
-    if diagnostics:
-        _apply_contract_failures(result, diagnostics)
-    result.metrics.update(
-        {
-            "output_contract_engine": "filecheck",
-            "output_contract_assertions": contract.assertion_count(),
-            "output_contract_steps": len(steps),
-            "filecheck_binary": filecheck,
-            "check_dir": str(check_dir),
-        }
-    )
+    if result.status != "SKIP":
+        result.metrics.update(
+            {
+                "output_contract_engine": "filecheck",
+                "output_contract_assertions": contract.assertion_count(),
+                "output_contract_steps": len(steps),
+                "filecheck_binary": exec_str,
+                "check_dir": str(check_dir),
+            }
+        )
     return result

@@ -2462,7 +2462,7 @@ def _haunted_process_cases(fault_injection: bool) -> List[HauntedCase]:
 def _haunted_geometry_failures(
     report: Dict[str, Any], schedule: Sequence[Tuple[int, int]], label: str
 ) -> List[str]:
-    """Invariants shared by the real PTY and disposable-tmux transports."""
+    """Frame-tracking invariants shared by real PTY and disposable-tmux transports."""
     problems: List[str] = []
     state = report.get("state") or {}
     raw = report.get("raw", b"")
@@ -2481,15 +2481,28 @@ def _haunted_geometry_failures(
     observed = sorted({f["cols"] for f in rulers})
     if len(observed) < 3:
         problems.append("%s: geometry never changed (cols=%s)" % (label, observed))
+    if int(state.get("sigwinch_count", 0)) < 1:
+        problems.append("%s: no SIGWINCH observed" % label)
+    if b"\x1b" in raw or b"\x07" in raw:
+        problems.append("%s: control bytes reached the terminal" % label)
+    return problems
+
+
+def _haunted_final_geometry_failures(
+    report: Dict[str, Any], schedule: Sequence[Tuple[int, int]], label: str
+) -> List[str]:
+    """Final geometry convergence after a rapid resize schedule."""
+    problems: List[str] = []
+    state = report.get("state") or {}
+    applied = report.get("applied_resizes") or []
+    expected_applied = [[int(cols), int(rows)] for cols, rows in schedule[1:]]
+    if applied != expected_applied:
+        problems.append("%s: applied %d/%d scheduled resizes" % (label, len(applied), len(expected_applied)))
     if list(state.get("final") or [0, 0]) != list(schedule[-1]):
         problems.append(
             "%s: final geometry %s != last resize %s"
             % (label, list(state.get("final") or [0, 0]), list(schedule[-1]))
         )
-    if int(state.get("sigwinch_count", 0)) < 1:
-        problems.append("%s: no SIGWINCH observed" % label)
-    if b"\x1b" in raw or b"\x07" in raw:
-        problems.append("%s: control bytes reached the terminal" % label)
     return problems
 
 
@@ -2653,7 +2666,7 @@ def run_haunted_terminal_probe(
                     "; ".join(problems[:4]),
                 )
             )
-            final_problems = _haunted_geometry_failures(pty_report, schedule, "pty-final")
+            final_problems = _haunted_final_geometry_failures(pty_report, schedule, "pty")
             cases.append(
                 _haunted_case(
                     "rapid_resize_final_geometry_matches_last",
@@ -2664,11 +2677,17 @@ def run_haunted_terminal_probe(
             )
 
         if use_tmux:
-            socket = os.environ.get("TESTBENCH_TMUX_SOCKET", "").strip()
-            if len(str(base.resolve())) > 68:
+            from .isolation import _probe_writable_dir, short_writable_tmux_base
+
+            env_tmux_dir = os.environ.get("TMUX_TMPDIR", "").strip()
+            if env_tmux_dir and len(env_tmux_dir) <= 68 and _probe_writable_dir(Path(env_tmux_dir)):
+                short_base = Path(env_tmux_dir).resolve()
+            else:
+                short_base = short_writable_tmux_base(base)
+            if len(str(short_base)) > 68:
                 tmux_error = "scratch path too long for a unix socket"
             else:
-                tmux_work = base / ("hx" + os.urandom(3).hex())
+                tmux_work = short_base / ("hx" + os.urandom(3).hex())
                 try:
                     tmux_work.mkdir(parents=True, exist_ok=False)
                     tmux_report = _run_haunted_tmux_child(
@@ -2676,7 +2695,7 @@ def run_haunted_terminal_probe(
                         tmux_schedule,
                         partial=True,
                         cache_geometry=fault_injection,
-                        socket=socket,
+                        socket="",
                     )
                     if not tmux_report.get("available"):
                         tmux_error = tmux_report.get("reason", "")

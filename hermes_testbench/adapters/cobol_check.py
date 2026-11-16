@@ -696,8 +696,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("0 passed, 0 skipped, 1 failed")
         return 1
 
-    workdir = Path(args.workdir) if args.workdir else Path(tempfile.mkdtemp(prefix="tb-cobol-"))
-    report = verify_cases(cases, workdir, timeout_s=args.timeout)
+    if args.workdir:
+        report = verify_cases(cases, Path(args.workdir), timeout_s=args.timeout)
+    else:
+        from ..isolation import default_scratch_root
+
+        with tempfile.TemporaryDirectory(
+            prefix="tb-cobol-", dir=str(default_scratch_root())
+        ) as tmpdir:
+            report = verify_cases(cases, Path(tmpdir), timeout_s=args.timeout)
     print(report.text())
     return 0 if report.ok else 1
 

@@ -45,20 +45,19 @@ from hermes_testbench.fixtures import (
     haunted_wide_corpus,
     run_haunted_terminal_probe,
 )
+from hermes_testbench.isolation import default_scratch_root
 from hermes_testbench.schema import RunStatus, SuiteSpec
 from hermes_testbench.tui_render import display_width
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROBE = REPO_ROOT / "scripts" / "haunted_terminal_probe.py"
 PY = sys.executable
-SCRATCH = Path.home() / ".hermes" / "cache" / "scratch"
 
 _CACHE = {}
 
 
 def _scratch() -> Path:
-    SCRATCH.mkdir(parents=True, exist_ok=True)
-    return SCRATCH
+    return default_scratch_root()
 
 
 def _positive_report():
@@ -246,6 +245,18 @@ class HauntedProbePositiveTests(unittest.TestCase):
         self.assertFalse(report["fault_injection"])
         self.assertEqual(report["failed"], 0)
         self.assertEqual(list(scratch.iterdir()), [], "probe left scratch entries behind")
+
+    @unittest.skipUnless(shutil.which("tmux"), "tmux unavailable")
+    def test_deeply_nested_scratch_root_still_runs_disposable_tmux(self) -> None:
+        deep = Path(tempfile.mkdtemp(dir=str(_scratch()), prefix="tb-hndeep-")) / ("nested_level_" * 6) / "sub"
+        deep.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(shutil.rmtree, deep.parents[1], True)
+        self.assertGreater(len(str(deep)), 115)
+        report = run_haunted_terminal_probe(scratch_root=deep, use_tmux=True)
+        self.assertTrue(report["tmux"]["available"], report["tmux"]["error"])
+        self.assertTrue(report["tmux"]["server_gone"])
+        self.assertTrue(report["scratch_clean"])
+        self.assertEqual(report["failed"], 0)
 
 
 class HauntedProbeNegativeControlTests(unittest.TestCase):

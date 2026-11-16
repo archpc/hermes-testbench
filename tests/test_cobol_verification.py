@@ -16,11 +16,13 @@ import json
 import os
 from decimal import Decimal
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
 
 from hermes_testbench.adapters import cobol_check, execute_suite
+from hermes_testbench.isolation import default_scratch_root
 from hermes_testbench.adapters.cobol_check import (
     CobolCase,
     Field,
@@ -49,8 +51,11 @@ COBC = cobol_check.find_cobc()
 requires_cobc = unittest.skipUnless(COBC, "cobc (GnuCOBOL) not installed")
 
 
-def _tmpdir(prefix: str = "tb-cobol-") -> Path:
-    return Path(tempfile.mkdtemp(prefix=prefix, dir=os.environ.get("TMPDIR")))
+def _tmpdir(prefix: str = "tb-cobol-", case: unittest.TestCase | None = None) -> Path:
+    path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(default_scratch_root())))
+    if case is not None:
+        case.addCleanup(shutil.rmtree, path, True)
+    return path
 
 
 def _suite(**kwargs) -> SuiteSpec:
@@ -414,7 +419,7 @@ class CobolDiagnosticParsingTests(unittest.TestCase):
 class CobolVerificationCaseTests(unittest.TestCase):
     @requires_cobc
     def test_correct_ledger_program_passes_with_exact_output(self) -> None:
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(root, "ledger_ok.cob", LEDGER_OK)
         expected = _ledger_expected(LEDGER_INPUT)
         self.assertEqual(expected, "COUNT=003\nTOTAL=+0000007.30\n")
@@ -437,7 +442,7 @@ class CobolVerificationCaseTests(unittest.TestCase):
     @requires_cobc
     def test_exit_zero_with_wrong_result_fails_verification(self) -> None:
         """Compiles, exits 0, wrong total: must FAIL with an actionable diff."""
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(root, "ledger_wrong.cob", LEDGER_WRONG)
         expected = _ledger_expected(LEDGER_INPUT)
         build = root / "build"
@@ -473,7 +478,7 @@ class CobolVerificationCaseTests(unittest.TestCase):
 
     @requires_cobc
     def test_compile_failure_reports_file_line_and_message(self) -> None:
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(root, "broken.cob", COMPILE_ERROR)
 
         report = verify_cases(
@@ -488,7 +493,7 @@ class CobolVerificationCaseTests(unittest.TestCase):
 
     @requires_cobc
     def test_nonzero_runtime_exit_fails_verification(self) -> None:
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(
             root,
             "refuse.cob",
@@ -508,7 +513,7 @@ class CobolVerificationCaseTests(unittest.TestCase):
 
     @requires_cobc
     def test_rounding_program_passes_and_truncating_variant_fails(self) -> None:
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(root, "round_ok.cob", ROUNDING_OK)
         _write(root, "round_trunc.cob", ROUNDING_TRUNC)
         expected = (
@@ -536,7 +541,7 @@ class CobolVerificationCaseTests(unittest.TestCase):
 
     @requires_cobc
     def test_overflow_is_caught_when_wrapped_and_accepted_when_guarded(self) -> None:
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(root, "overflow_wrap.cob", OVERFLOW_WRAP)
         _write(root, "overflow_guard.cob", OVERFLOW_GUARD)
         with self.assertRaises(PictureOverflowError):
@@ -563,7 +568,7 @@ class CobolVerificationCaseTests(unittest.TestCase):
 
     @requires_cobc
     def test_malformed_record_is_rejected_by_both_oracle_and_program(self) -> None:
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(root, "ledger_guard.cob", LEDGER_GUARD)
         malformed = "AAAAX001050\n"
         with self.assertRaises(MalformedRecordError):
@@ -593,7 +598,7 @@ class CobolVerificationCaseTests(unittest.TestCase):
 
     @requires_cobc
     def test_aggregate_report_totals_are_exact(self) -> None:
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(root, "ledger_ok.cob", LEDGER_OK)
         _write(root, "ledger_wrong.cob", LEDGER_WRONG)
         expected = _ledger_expected(LEDGER_INPUT)
@@ -617,7 +622,7 @@ class CobolReportingIntegrationTests(unittest.TestCase):
     """The verification helper reports through the existing cobol adapter."""
 
     def setUp(self) -> None:
-        self.evidence = _tmpdir("tb-cobol-ev-")
+        self.evidence = _tmpdir("tb-cobol-ev-", case=self)
 
     def _run_spec(self, spec: Path, project_root: Path):
         suite = _suite(
@@ -634,7 +639,7 @@ class CobolReportingIntegrationTests(unittest.TestCase):
 
     @requires_cobc
     def test_passing_case_reports_one_pass_through_execute_suite(self) -> None:
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(root, "ledger_ok.cob", LEDGER_OK)
         spec = _spec(
             root,
@@ -655,7 +660,7 @@ class CobolReportingIntegrationTests(unittest.TestCase):
 
     @requires_cobc
     def test_wrong_result_with_zero_exit_fails_through_execute_suite(self) -> None:
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(root, "ledger_wrong.cob", LEDGER_WRONG)
         spec = _spec(
             root,
@@ -678,7 +683,7 @@ class CobolReportingIntegrationTests(unittest.TestCase):
 
     @requires_cobc
     def test_compile_failure_reaches_failure_excerpt_with_file_and_line(self) -> None:
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(root, "broken.cob", COMPILE_ERROR)
         spec = _spec(root, [{"name": "broken", "source": "broken.cob"}])
         result, _usage = self._run_spec(spec, REPO_ROOT)
@@ -694,7 +699,7 @@ class CobolDiscoverySuiteTests(unittest.TestCase):
     """Discovery's cobol-unit suite: expected-output sidecar and diagnostics."""
 
     def setUp(self) -> None:
-        self.evidence = _tmpdir("tb-cobol-disc-")
+        self.evidence = _tmpdir("tb-cobol-disc-", case=self)
 
     def _run_discovery(self, root: Path):
         spec = discover_project(root)
@@ -704,7 +709,7 @@ class CobolDiscoverySuiteTests(unittest.TestCase):
 
     @requires_cobc
     def test_matching_expected_output_sidecar_passes(self) -> None:
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(root, "fixed_sum.cob", FIXED_FORMAT_SUM)
         _write(root, "fixed_sum.cob.expected", "TOTAL=+00900.25\n")
         result, _usage = self._run_discovery(root)
@@ -713,7 +718,7 @@ class CobolDiscoverySuiteTests(unittest.TestCase):
 
     @requires_cobc
     def test_disagreeing_sidecar_fails_with_diff_evidence(self) -> None:
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(root, "fixed_sum.cob", FIXED_FORMAT_SUM)
         _write(root, "fixed_sum.cob.expected", "TOTAL=+00900.50\n")
         result, _usage = self._run_discovery(root)
@@ -728,7 +733,7 @@ class CobolDiscoverySuiteTests(unittest.TestCase):
 
     @requires_cobc
     def test_compile_failure_diagnostic_reaches_the_failure_excerpt(self) -> None:
-        root = _tmpdir()
+        root = _tmpdir(case=self)
         _write(root, "fixed_broken.cob", "       IDENTIFICATION DIVISION.\n       FROBNICATE.\n")
         result, _usage = self._run_discovery(root)
         self.assertEqual(result.status, RunStatus.FAIL)

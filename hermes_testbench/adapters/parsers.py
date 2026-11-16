@@ -553,9 +553,33 @@ def parse_c_sanitizer(text: str) -> ParseOutcome:
 
 
 def parse_shell(text: str) -> ParseOutcome:
+    from .filecheck import parse_filecheck_diagnostics
+
     text = _clean(text)
     outcome = ParseOutcome()
     markers = _apply_markers(outcome, text)
+    if not markers:
+        fc_diags = parse_filecheck_diagnostics(text)
+        if fc_diags:
+            outcome.failures.extend(fc_diags)
+            for item in fc_diags:
+                outcome.cases.append(
+                    {
+                        "name": item["case_name"],
+                        "status": "FAIL",
+                        "message": item["message"],
+                        "file": item.get("file"),
+                        "line": item.get("line"),
+                    }
+                )
+            outcome.failed = len(fc_diags)
+            outcome.total = len(fc_diags)
+            first = fc_diags[0]["message"]
+            outcome.summary_line = (
+                first if len(fc_diags) == 1 else f"{first} (+{len(fc_diags) - 1} more)"
+            )[:800]
+            outcome.structured = True
+            return outcome
     counts, line = _summary_counts(text)
     if counts:
         _apply_summary(outcome, counts, line)
