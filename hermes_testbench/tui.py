@@ -119,18 +119,36 @@ def _load_log_tail(run: RunRecord, max_lines: int = 80) -> Tuple[str, ...]:
         if s.sanitized_path and Path(s.sanitized_path).is_file():
             try:
                 lines = Path(s.sanitized_path).read_text(encoding="utf-8", errors="replace").splitlines()
-                return tuple(lines[-max_lines:])
             except OSError:
-                pass
+                lines = []
+            if lines:
+                return tuple(lines[-max_lines:])
     ev = Path(run.evidence_dir) if run.evidence_dir else None
     if ev and ev.is_dir():
         for cand in sorted(ev.glob("*.sanitized.log")):
             try:
                 lines = cand.read_text(encoding="utf-8", errors="replace").splitlines()
-                return tuple(lines[-max_lines:])
             except OSError:
-                pass
+                continue
+            if lines:
+                return tuple(lines[-max_lines:])
     return ()
+
+
+def _refresh_active_logs(state: TuiState) -> TuiState:
+    """Re-read sanitized tails for ACTIVE runs.
+
+    A live run writes its log but not the store, so no data_version change
+    signals the TUI; without this the panel shows the pre-run tail until the
+    suite finishes.
+    """
+    merged = dict(state.log_lines)
+    for r in state.runs:
+        if r.status in RunStatus.ACTIVE:
+            tail = _load_log_tail(r)
+            if tail:
+                merged[r.run_id] = tail
+    return replace(state, log_lines=merged)
 
 
 def _refresh_from_store(store: TestBenchStore, prev: TuiState) -> TuiState:
@@ -365,6 +383,7 @@ def run_tui(
             now_mono = time.monotonic()
             if has_active and (now_mono - last_tick) >= 1.0:
                 state = replace(state, now_iso=utc_now_iso())
+                state = _refresh_active_logs(state)
                 last_tick = now_mono
 
             lines = render_frame(state, cols, rows, no_color=no_color, ascii_mode=ascii_mode)
