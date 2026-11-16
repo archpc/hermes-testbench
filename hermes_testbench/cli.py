@@ -16,7 +16,7 @@ from .store import TestBenchStore
 
 
 def _version_string() -> str:
-    """Package version, store schema, interpreter, and sandbox backend in one line."""
+    """Package version, deployed release SHA, store schema, interpreter, and sandbox backend."""
     import platform
     import shutil
 
@@ -24,8 +24,10 @@ def _version_string() -> str:
     from .schema import SCHEMA_VERSION
 
     sandbox = "seatbelt" if shutil.which("sandbox-exec") else "none (env and process-group isolation only)"
+    release = Path(__file__).resolve().parents[1] / "RELEASE"
+    sha = f"release {release.read_text(encoding='utf-8').strip()}; " if release.is_file() else ""
     return (
-        f"testbench {__version__} (schema {SCHEMA_VERSION}; python {platform.python_version()} "
+        f"testbench {__version__} ({sha}schema {SCHEMA_VERSION}; python {platform.python_version()} "
         f"{sys.executable}; {platform.system()} {platform.machine()}; sandbox {sandbox})"
     )
 
