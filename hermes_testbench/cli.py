@@ -10,6 +10,13 @@ import sys
 from typing import List, Optional
 
 from .engine import AuthorizationError, TestBenchEngine
+from .flake import (
+    FlakeHistory,
+    FlakeReport,
+    FlakeVerdict,
+    TargetClassification,
+    analyze_flake_history,
+)
 from .reporting import format_terminal_summary, render_junit_xml, render_run_json
 from .schema import RunStatus
 from .store import TestBenchStore
@@ -124,6 +131,25 @@ def build_parser() -> argparse.ArgumentParser:
     tuip.add_argument("--quit-on-q", action="store_true", help="Exit on lowercase q at top level")
     tuip.add_argument("--project", default="", help="Initial project filter")
 
+    flakep = sub.add_parser("flake", help="Hunt flaky tests: repeat executions and classify variance")
+    fsub = flakep.add_subparsers(dest="flake_action")
+    frun = fsub.add_parser(
+        "run",
+        help="Repeat a profile/suite group and classify each target (exit 0 only when all always_pass)",
+    )
+    frun.add_argument("path", nargs="?", default=".")
+    frun.add_argument("--repeats", type=int, default=None, help="Attempts (default: max SuiteSpec.repeat_runs)")
+    frun.add_argument("--profile", default="unit")
+    frun.add_argument("--suite", action="append", default=[], help="Specific suite name (repeatable)")
+    frun.add_argument("--timeout", type=float, default=None, help="Per-suite timeout override (s)")
+    frun.add_argument("--json", action="store_true")
+    fana = fsub.add_parser("analyze", help="Classify flake groups already recorded in the store")
+    fana.add_argument("--project", default="")
+    fana.add_argument("--revision", default="")
+    fana.add_argument("--group", default="", help="Restrict to one flake group_id")
+    fana.add_argument("--limit", type=int, default=200, help="Max stored runs to scan")
+    fana.add_argument("--json", action="store_true")
+
     sub.add_parser("mcp", help="Run local stdio MCP server")
 
     workp = sub.add_parser("_worker", help=argparse.SUPPRESS)
@@ -136,6 +162,54 @@ def build_parser() -> argparse.ArgumentParser:
     workp.add_argument("--timeout", type=float, default=None)
 
     return p
+
+
+def _format_flake_target(target: TargetClassification) -> List[str]:
+    head = f"  [{target.level}] {target.target}: {target.verdict}  pass={target.pass_count} fail={target.fail_count}"
+    if target.other_count:
+        head += f" other={target.other_count}"
+    head += f"  statuses={'/'.join(target.statuses)}"
+    lines = [head]
+    if target.passing_run_ids:
+        lines.append(f"    pass_runs={','.join(target.passing_run_ids)}")
+    if target.failing_run_ids:
+        lines.append(f"    fail_runs={','.join(target.failing_run_ids)}")
+        for rid, evidence in zip(target.failing_run_ids, target.failing_evidence_dirs):
+            lines.append(f"      fail_evidence[{rid}]={evidence}")
+    if target.other_run_ids:
+        lines.append(f"    other_runs={','.join(target.other_run_ids)}")
+    if target.missing_attempts:
+        lines.append(f"    missing_attempts={','.join(str(a) for a in target.missing_attempts)}")
+    return lines
+
+
+def _format_flake_report(report: FlakeReport) -> str:
+    lines = [
+        f"FLAKE {report.verdict}  group={report.group_id}  project={report.project}  "
+        f"revision={report.revision}  attempts={report.attempts}/{report.expected_repeats}"
+    ]
+    for run_id, status, evidence in zip(report.run_ids, report.statuses, report.evidence_dirs):
+        lines.append(f"  run {run_id}: {status}  evidence={evidence}")
+    for target in report.targets:
+        lines.extend(_format_flake_target(target))
+    if report.missing_attempts:
+        lines.append(f"  missing_attempts={','.join(str(a) for a in report.missing_attempts)}")
+    return "\n".join(lines)
+
+
+def _format_flake_history(history: FlakeHistory) -> str:
+    if not history.groups:
+        return "no flake groups recorded"
+    counts = history.verdict_counts()
+    header = "flake groups: {total} ({detail})".format(
+        total=len(history.groups),
+        detail=", ".join(f"{name}={counts.get(name, 0)}" for name in FlakeVerdict.ALL),
+    )
+    blocks = [header]
+    for group in history.groups:
+        blocks.append("")
+        blocks.append(_format_flake_report(group))
+    return "\n".join(blocks)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -177,6 +251,42 @@ def main(argv: Optional[List[str]] = None) -> int:
                     max_tokens=args.max_tokens,
                     timeout_s=args.timeout,
                 )
+
+            if args.command == "flake":
+                if args.flake_action == "run":
+                    report = eng.flake_hunt(
+                        Path(args.path),
+                        repeats=args.repeats,
+                        profile=args.profile,
+                        suite_names=args.suite or None,
+                        timeout_s=args.timeout,
+                    )
+                    if args.json:
+                        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+                    else:
+                        print(_format_flake_report(report))
+                    # Only a clean sweep of always_pass may exit 0: flakes,
+                    # deterministic failures, and inconclusive attempts never
+                    # masquerade as success.
+                    return 0 if report.verdict == FlakeVerdict.ALWAYS_PASS else 1
+                if args.flake_action == "analyze":
+                    runs = store.list_runs(project=args.project or None, limit=max(1, args.limit))
+                    history = analyze_flake_history(
+                        runs,
+                        project=args.project or None,
+                        revision=args.revision or None,
+                        group_id=args.group or None,
+                    )
+                    if args.json:
+                        print(json.dumps(history.to_dict(), indent=2, sort_keys=True))
+                    else:
+                        print(_format_flake_history(history))
+                    if not history.groups:
+                        sys.stderr.write("testbench: no flake groups recorded for the given filters\n")
+                        return 1
+                    return 0
+                parser.print_help()
+                return 2
 
             if args.command == "discover":
                 spec = eng.discover(Path(args.path))

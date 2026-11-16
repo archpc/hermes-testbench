@@ -31,6 +31,11 @@ testbench status --limit 15
 testbench results --last --logs
 testbench results <run_id> --format junit
 
+# Hunt flakes: N independent attempts, classified per suite (and per case)
+testbench flake run . --profile unit --repeats 5        # exit 0 only if all always_pass
+testbench flake analyze --project myproj --revision abc1234 --json
+testbench flake analyze --group fg_<run_id>            # one recorded group, no re-run
+
 # Print or execute deterministic failure reproduction
 testbench reproduce <run_id> --print-only
 testbench reproduce <run_id>
