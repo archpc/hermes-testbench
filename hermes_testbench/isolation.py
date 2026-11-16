@@ -595,21 +595,54 @@ def _open_0600_write(path: Path):
     return os.fdopen(fd, "w", encoding="utf-8")
 
 
+def _tmux_socket_files(tmux_tmpdir: Path) -> List[Path]:
+    """Socket paths a tmux server may have created inside our own ``TMUX_TMPDIR``.
+
+    tmux names its default socket ``$TMUX_TMPDIR/tmux-<uid>/default``; ``-L name`` servers land
+    in the same directory under ``name``. Only this directory is ever listed — nothing outside
+    ``tmux_tmpdir`` is inspected or signalled.
+    """
+    base = tmux_tmpdir / f"tmux-{os.getuid()}"
+    try:
+        root = tmux_tmpdir.resolve()
+        if not base.is_dir():
+            return []
+        found: List[Path] = []
+        for entry in base.iterdir():
+            try:
+                if not entry.is_socket():
+                    continue
+                if root not in entry.resolve().parents:
+                    continue
+            except OSError:
+                continue
+            found.append(entry)
+        return found
+    except OSError:
+        return []
+
+
 def _kill_disposable_tmux(tmux_socket: str, tmux_tmpdir: Path) -> None:
+    """Kill every tmux server reachable through this disposable ``TMUX_TMPDIR``.
+
+    ``-L <socket>`` alone is not enough: suites that call plain ``tmux new-session`` get the
+    default server at ``$TMUX_TMPDIR/tmux-<uid>/default``, which survives the ``-L`` kill and
+    outlives the unlinked ``tmux_tmpdir`` as an orphan (reproduced: 83 leaked ``deepcheck``
+    servers). Each socket inside ``tmux_tmpdir`` is therefore killed by path with ``-S``.
+    """
     tmux_bin = shutil.which("tmux")
-    if not tmux_bin or not tmux_socket:
+    if not tmux_bin:
         return
     env = {"PATH": os.environ.get("PATH", "/opt/homebrew/bin:/usr/bin:/bin"), "TMUX_TMPDIR": str(tmux_tmpdir)}
-    try:
-        subprocess.run(
-            [tmux_bin, "-L", tmux_socket, "kill-server"],
-            env=env,
-            capture_output=True,
-            timeout=3.0,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        pass
+    targets: List[List[str]] = []
+    if tmux_socket:
+        targets.append([tmux_bin, "-L", tmux_socket, "kill-server"])
+    targets.extend([tmux_bin, "-S", str(sock), "kill-server"] for sock in _tmux_socket_files(tmux_tmpdir))
+    for argv in targets:
+        try:
+            subprocess.run(argv, env=env, capture_output=True, timeout=3.0, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def run_isolated_command(
@@ -874,6 +907,9 @@ def run_isolated_command(
             terminate_process_group(pgid, expected_start_time=start_fp, grace_s=0.2)
         if needs_tmux and tmux_socket and tmux_tmpdir is not None:
             _kill_disposable_tmux(tmux_socket, tmux_tmpdir)
+            # A default-named server (plain `tmux new-session`) is only reachable by the
+            # socket sweep above; reap anything else still holding this tmpdir open.
+            _sweep_sandbox_survivors(tmux_tmpdir)
             _safe_rmtree_no_symlinks(tmux_tmpdir)
         if timed_out or cancelled or (exit_code is not None and exit_code != 0):
             swept, leaked_children = _sweep_sandbox_survivors(sandbox_dir)

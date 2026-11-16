@@ -198,8 +198,15 @@ class TapeTestBase(unittest.TestCase):
         (self.project / "fixture.py").write_text(FIXTURE_SRC, encoding="utf-8")
         self.golden_dir = self.project / "golden"
         self.tb_home = self.root / "tbhome"
+        # These tests exercise golden approval, which is a deliberate *host* action. Running
+        # the suite from inside TestBench sets TESTBENCH_SANDBOX=1 and would make every
+        # approval refusal test assert the sandbox guard instead of the guard under test.
+        self._sandbox_env = os.environ.pop("TESTBENCH_SANDBOX", None)
 
     def tearDown(self) -> None:
+        saved = getattr(self, "_sandbox_env", None)
+        if saved is not None:
+            os.environ["TESTBENCH_SANDBOX"] = saved
         self._tmp.cleanup()
 
     # -- helpers -------------------------------------------------------------
@@ -636,7 +643,11 @@ class TapeReplayTests(TapeTestBase):
             "Key Q\n"
         )
         tape = self.write_tape(body, name="tui")
-        outcome = self.replay(tape, timeout_s=45.0)
+        # A source-tree checkout is not importable from the temporary project cwd; the
+        # installed console entry point would be. Export the repo root explicitly so this
+        # test does not silently depend on an ambient PYTHONPATH.
+        with mock.patch.dict(os.environ, {"PYTHONPATH": str(REPO_ROOT)}):
+            outcome = self.replay(tape, timeout_s=45.0)
         self.assertEqual(outcome.status, RunStatus.PASS, outcome.message)
         self.assertGreaterEqual(outcome.passed, 3)
 
