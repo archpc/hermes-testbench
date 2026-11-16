@@ -31,6 +31,15 @@ testbench status --limit 15
 testbench results --last --logs
 testbench results <run_id> --format junit
 
+# Hunt flakes: N independent attempts, classified per suite (and per case)
+testbench flake run . --profile unit --repeats 5        # exit 0 only if all always_pass
+testbench flake analyze --project myproj --revision abc1234 --json
+testbench flake analyze --group fg_<run_id>            # one recorded group, no re-run
+
+# Replay declarative terminal tapes against approved goldens (real PTY, no VHS/browser)
+testbench tape run tui.tape --project-root .           # goldens are read-only; VHS is BLOCKED_POLICY
+testbench tape approve <run_id> --golden tui --yes      # human approval, interactive TTY only
+
 # Print or execute deterministic failure reproduction
 testbench reproduce <run_id> --print-only
 testbench reproduce <run_id>
@@ -54,6 +63,9 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/OPERATING-GUIDE.md](docs
 - **ADR-0002**: Local stdio MCP server with project trust registry and Seatbelt sandbox.
 - **ADR-0003**: Restrained borderless `hx:testbench` TUI and permanent auxiliary window reuse.
 - **ADR-0004**: In-stream secret redaction before disk write and strict schema/sanitize/reporting separation.
+- **ADR-0005**: Deny-by-default Seatbelt writes, Unix-socket confinement, and fingerprinted cancellation.
+- **ADR-0006**: External LLVM FileCheck steps and GnuCOBOL Decimal oracle over custom output-matching DSLs.
+- **ADR-0007**: Independent per-attempt RunRecords for Flake Hunter and in-process VTScreen Terminal Tape deferring VHS.
 
 ## Self-Verification
 

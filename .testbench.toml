@@ -6,9 +6,9 @@ languages = ["python"]
 name = "core-unit"
 adapter = "python_unittest"
 profile = "unit"
-command = ["{python}", "-W", "default", "-m", "unittest", "tests.test_schema", "tests.test_sanitize", "tests.test_reporting", "tests.test_store", "tests.test_discovery_and_adapters", "tests.test_output_contract", "tests.test_cobol_verification", "tests.test_tui_render", "tests.test_skill_and_agent_eval", "-v"]
-timeout_s = 120.0
-description = "Fast deterministic core, adapter, parser, store, and TUI state-machine unit tests"
+command = ["{python}", "-W", "default", "-m", "unittest", "tests.test_schema", "tests.test_sanitize", "tests.test_reporting", "tests.test_store", "tests.test_discovery_and_adapters", "tests.test_output_contract", "tests.test_cobol_verification", "tests.test_flake_hunter", "tests.test_tui_render", "tests.test_skill_and_agent_eval", "-v"]
+timeout_s = 180.0
+description = "Fast deterministic core, adapter, parser, store, flake-classifier, and TUI state-machine unit tests"
 
 [[suite]]
 name = "engine-mcp-messaging-integration"
@@ -23,10 +23,10 @@ description = "Engine, CLI, stdio MCP 2.0 protocol, SQLite WAL contention, and o
 name = "tui-pty-and-tmux"
 adapter = "python_unittest"
 profile = "terminal"
-command = ["{python}", "-W", "default", "-m", "unittest", "tests.test_tui_render", "tests.test_tui_pty", "tests.test_haunted_terminal", "-v"]
-timeout_s = 180.0
+command = ["{python}", "-W", "default", "-m", "unittest", "tests.test_tui_render", "tests.test_tui_pty", "tests.test_haunted_terminal", "tests.test_terminal_tape", "-v"]
+timeout_s = 300.0
 needs_tmux = true
-description = "Borderless 4-band TUI rendering, real PTY SIGWINCH resize, live refresh, permanent-tab guards, and Haunted Terminal tests"
+description = "Borderless 4-band TUI rendering, real PTY SIGWINCH resize, live refresh, permanent-tab guards, Haunted Terminal, and terminal-tape replay/golden-gate tests"
 
 [[suite]]
 name = "haunted-terminal"

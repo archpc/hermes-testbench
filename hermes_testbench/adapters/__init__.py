@@ -24,9 +24,13 @@ from ..schema import (
 )
 from . import parsers
 from .mutation import MUTATION_ADAPTERS, run_mutation_suite
-from .parsers import ADAPTER_PARSERS, ParseOutcome
+from .parsers import ADAPTER_PARSERS, ParseOutcome, parse_terminal_tape
 
-__all__ = ["execute_suite", "ADAPTER_PARSERS", "ParseOutcome"]
+__all__ = ["execute_suite", "ADAPTER_PARSERS", "ParseOutcome", "parse_terminal_tape", "TAPE_ADAPTER"]
+
+# Declarative terminal tapes run locally against a real PTY; they may never ask
+# for network access (VHS/browser backends are refused inside the tape runner).
+TAPE_ADAPTER = "terminal_tape"
 
 _SUMMARY_TAIL_LINES = 12
 
@@ -245,6 +249,24 @@ def execute_suite(
             scratch_root=scratch_root,
             on_spawn=on_spawn,
         )
+
+    # Gate 2b: terminal tapes are local-only; a tape may never request the network.
+    if suite.adapter == TAPE_ADAPTER and suite.allow_network:
+        result = _base_result(suite, cwd=cwd, status=RunStatus.BLOCKED, repro=repro, started_at=started_at)
+        result.total_count = 1
+        result.blocked_count = 1
+        result.summary_excerpt = (
+            "blocked: terminal_tape suites run against a local PTY and may not request network access"
+        )
+        result.failures = [
+            FailureRecord(
+                suite=suite.name,
+                case_name="<policy>",
+                kind=FailureKind.BLOCKED_POLICY,
+                message=result.summary_excerpt,
+            )
+        ]
+        return result, None
 
     # Gate 3: nothing to run, or prerequisites absent.
     skip_reason = ""

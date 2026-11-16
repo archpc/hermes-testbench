@@ -12,6 +12,8 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..schema import FailureKind, RunStatus
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 _COUNT_PATTERNS: Dict[str, re.Pattern[str]] = {
@@ -913,6 +915,76 @@ def parse_mutmut(text: str, *, results_text: str = "") -> ParseOutcome:
     return outcome
 
 
+_TB_TAPE_MARKER_RE = re.compile(r"^TB-TAPE\s+(\{.*\})\s*$")
+
+
+def parse_terminal_tape(text: str) -> ParseOutcome:
+    """Parse a ``testbench tape run`` marker line into per-check counts.
+
+    The marker is authoritative: it carries the tape name, terminal status, and
+    one entry per evaluated expectation. Without a marker the generic
+    PASS/FAIL/SKIP marker and summary counters still apply.
+    """
+    text = _clean(text)
+    outcome = ParseOutcome()
+    payload: Optional[Dict[str, Any]] = None
+    for line in text.splitlines():
+        match = _TB_TAPE_MARKER_RE.match(line.strip())
+        if not match:
+            continue
+        try:
+            candidate = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            payload = candidate
+    if payload is not None:
+        checks = [c for c in (payload.get("checks") or []) if isinstance(c, dict)]
+        name = str(payload.get("name") or "tape")
+        status = str(payload.get("status") or "")
+        failed = [c for c in checks if not c.get("ok")]
+        outcome.total = len(checks) or 1
+        outcome.passed = len(checks) - len(failed) if checks else 0
+        outcome.failed = len(failed)
+        if status == RunStatus.BLOCKED:
+            outcome.passed = 0
+            outcome.failed = 0
+            outcome.errors = 1
+        for check in failed:
+            kind = FailureKind.ASSERTION
+            if status == RunStatus.BLOCKED:
+                kind = FailureKind.BLOCKED_POLICY
+            outcome.failures.append(
+                _failure(
+                    f"{name}:{check.get('kind')}:{check.get('name') or check.get('mode') or 'check'}",
+                    kind,
+                    str(check.get("detail") or check.get("text") or "tape expectation failed"),
+                )
+            )
+        if status == RunStatus.BLOCKED and not outcome.failures:
+            outcome.failures.append(
+                _failure(name, FailureKind.BLOCKED_POLICY, str(payload.get("message") or "blocked by policy"))
+            )
+        outcome.cases = [
+            {
+                "name": f"{name}:{c.get('kind')}:{c.get('name') or c.get('mode') or 'check'}",
+                "status": RunStatus.PASS if c.get("ok") else RunStatus.FAIL,
+                "message": str(c.get("detail") or "")[:300],
+            }
+            for c in checks
+        ]
+        outcome.summary_line = f"{name} {status}".strip()
+        outcome.structured = True
+        return outcome
+
+    markers = _apply_markers(outcome, text)
+    counts, line = _summary_counts(text)
+    if counts:
+        _apply_summary(outcome, counts, line)
+    outcome.structured = outcome.structured or markers
+    return outcome
+
+
 ADAPTER_PARSERS = {
     "agent_eval": parse_agent_eval,
     "c_sanitizer": parse_c_sanitizer,
@@ -926,4 +998,5 @@ ADAPTER_PARSERS = {
     "re_project": parse_re_project,
     "shell": parse_shell,
     "sqlite_probe": parse_sqlite_probe,
+    "terminal_tape": parse_terminal_tape,
 }
