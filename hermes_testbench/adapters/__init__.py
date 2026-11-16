@@ -23,6 +23,7 @@ from ..schema import (
     utc_now_iso,
 )
 from . import parsers
+from .mutation import MUTATION_ADAPTERS, run_mutation_suite
 from .parsers import ADAPTER_PARSERS, ParseOutcome
 
 __all__ = ["execute_suite", "ADAPTER_PARSERS", "ParseOutcome"]
@@ -230,6 +231,20 @@ def execute_suite(
             )
         ]
         return result, None
+
+    # Mutation testing stages a disposable copy and enforces its own tool-availability and
+    # confinement gates, so it is dispatched before the generic prerequisite gate.
+    if suite.adapter in MUTATION_ADAPTERS:
+        return run_mutation_suite(
+            suite,
+            project_root=project_root,
+            evidence_dir=evidence_dir,
+            run_id=run_id,
+            trusted_manifest=trusted_manifest,
+            cancel_flag_path=cancel_flag_path,
+            scratch_root=scratch_root,
+            on_spawn=on_spawn,
+        )
 
     # Gate 3: nothing to run, or prerequisites absent.
     skip_reason = ""

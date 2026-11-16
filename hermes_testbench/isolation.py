@@ -626,6 +626,9 @@ def run_isolated_command(
     allow_network: bool = False,
     allow_repo_write: bool = False,
     use_seatbelt: bool = True,
+    # Internal only: TestBench-owned staging dirs (e.g. a disposable mutation copy)
+    # that the sandboxed tool must write inside. Never populated from manifest input.
+    extra_writable_dirs: Tuple[Path, ...] = (),
     env_overrides: Optional[Dict[str, str]] = None,
     scratch_root: Optional[Path] = None,
     cancel_flag_path: Optional[Path] = None,
@@ -671,7 +674,9 @@ def run_isolated_command(
         if sb_bin is None:
             seatbelt_state = "unavailable"
         elif can_apply_seatbelt():
-            extra_dirs = (tmux_tmpdir,) if tmux_tmpdir is not None else ()
+            extra_dirs = tuple(d for d in extra_writable_dirs if d is not None)
+            if tmux_tmpdir is not None:
+                extra_dirs = (*extra_dirs, tmux_tmpdir)
             uses_uv = Path(command[0]).name == "uv"
             profile = build_seatbelt_profile(
                 sandbox_dir=sandbox_dir,

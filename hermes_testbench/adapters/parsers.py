@@ -67,6 +67,9 @@ class ParseOutcome:
     summary_line: str = ""
     usage: Optional[Dict[str, Any]] = None
     structured: bool = False
+    # Mutation adapters: canonical buckets plus a baseline-failure marker.
+    buckets: Dict[str, int] = field(default_factory=dict)
+    baseline_failed: bool = False
 
 
 def _clean(text: str) -> str:
@@ -669,11 +672,254 @@ def parse_generic(text: str) -> ParseOutcome:
     return outcome
 
 
+MUTATION_BUCKETS = ("caught", "survived", "invalid", "timeout", "inconclusive")
+
+# One canonical case status per bucket. ``caught`` proves the suite noticed the bug;
+# ``survived`` is a real gap, everything else is "we could not measure this mutant".
+_MUTATION_CASE_STATUS: Dict[str, str] = {
+    "caught": "PASS",
+    "survived": "FAIL",
+    "invalid": "SKIP",
+    "timeout": "SKIP",
+    "inconclusive": "SKIP",
+}
+
+_MUTMUT_STATUS_BUCKET: Dict[str, str] = {
+    "killed": "caught",
+    "caught by type check": "caught",
+    "survived": "survived",
+    "timeout": "timeout",
+    "no tests": "inconclusive",
+    "not checked": "inconclusive",
+    "skipped": "inconclusive",
+    "suspicious": "inconclusive",
+    "check was interrupted by user": "inconclusive",
+    "segfault": "inconclusive",
+}
+
+_MUTMUT_EMOJI_BUCKET: Dict[str, str] = {
+    "🎉": "caught",
+    "🧙": "caught",
+    "🙁": "survived",
+    "⏰": "timeout",
+    "🫥": "inconclusive",
+    "🤔": "inconclusive",
+    "🔇": "inconclusive",
+    "🛑": "inconclusive",
+    "💥": "inconclusive",
+}
+
+_CARGO_OUTCOME_BUCKET: Dict[str, str] = {
+    "CaughtMutant": "caught",
+    "MissedMutant": "survived",
+    "Timeout": "timeout",
+    "Unviable": "invalid",
+    "UnviableMutant": "invalid",
+    "Failure": "inconclusive",
+    "Inconclusive": "inconclusive",
+}
+
+_CARGO_LINE_BUCKET: Dict[str, str] = {
+    "CAUGHT": "caught",
+    "MISSED": "survived",
+    "TIMEOUT": "timeout",
+    "UNVIABLE": "invalid",
+    "FAILED": "inconclusive",
+}
+
+_CARGO_STATUS_LINE_RE = re.compile(r"^(CAUGHT|MISSED|TIMEOUT|UNVIABLE|FAILED)\s+(\S.*)$")
+_CARGO_TALLY_RE = re.compile(
+    r"(\d+) (caught|missed|timeout|timed out|unviable|failed)",
+    re.IGNORECASE,
+)
+_MUTTALLY_BUCKET = {
+    "caught": "caught",
+    "missed": "survived",
+    "timeout": "timeout",
+    "timed out": "timeout",
+    "unviable": "invalid",
+    "failed": "inconclusive",
+}
+_MUTMUT_RESULT_LINE_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9_.\-]+):\s*(?P<status>[a-z][a-z \t]*[a-z])\s*$")
+_MUTMUT_EMOJI_TALLY_RE = re.compile(r"(🎉|🧙|🙁|⏰|🫥|🤔|🔇|🛑|💥)\s*(\d+)")
+
+_CARGO_BASELINE_FAILURE_MARKERS = (
+    "cargo test failed in an unmutated tree",
+    "no mutants were tested",
+)
+_MUTMUT_BASELINE_FAILURE_MARKERS = (
+    "failed to collect stats",
+    "failed to collect tests",
+    "failed to run tests",
+    "runner returned",
+)
+
+
+def _mutation_empty_buckets() -> Dict[str, int]:
+    return {name: 0 for name in MUTATION_BUCKETS}
+
+
+def _record_mutant(outcome: ParseOutcome, name: str, bucket: str, detail: str = "") -> None:
+    outcome.buckets[bucket] = outcome.buckets.get(bucket, 0) + 1
+    clean_name = (name or "<mutant>").strip()[:300]
+    outcome.cases.append(
+        {
+            "name": clean_name,
+            "status": _MUTATION_CASE_STATUS[bucket],
+            "message": (detail or bucket).strip()[:300],
+        }
+    )
+
+
+def _sync_mutation_counts(outcome: ParseOutcome) -> None:
+    for name in MUTATION_BUCKETS:
+        outcome.buckets.setdefault(name, 0)
+    outcome.total = sum(outcome.buckets[name] for name in MUTATION_BUCKETS)
+    outcome.passed = outcome.buckets["caught"]
+    outcome.failed = outcome.buckets["survived"]
+    outcome.skipped = (
+        outcome.buckets["invalid"] + outcome.buckets["timeout"] + outcome.buckets["inconclusive"]
+    )
+
+
+def _mark_baseline_failed(outcome: ParseOutcome, reason: str) -> None:
+    """A broken baseline means no mutant verdict is meaningful: count it as inconclusive."""
+    outcome.baseline_failed = True
+    outcome.buckets["inconclusive"] = outcome.buckets.get("inconclusive", 0) + 1
+    outcome.cases.append(
+        {"name": "<baseline>", "status": "SKIP", "message": reason.strip()[:300]}
+    )
+
+
+def parse_cargo_mutants(text: str, *, outcomes_json: str = "") -> ParseOutcome:
+    """Classify a ``cargo-mutants`` run from its console log or ``mutants.out/outcomes.json``."""
+    cleaned = _clean(text)
+    outcome = ParseOutcome()
+    outcome.buckets = _mutation_empty_buckets()
+
+    if outcomes_json.strip():
+        try:
+            payload = json.loads(outcomes_json)
+        except (json.JSONDecodeError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("outcomes"), list):
+            for entry in payload["outcomes"]:
+                if not isinstance(entry, dict):
+                    continue
+                scenario = entry.get("scenario")
+                summary = str(entry.get("summary", ""))
+                if scenario == "Baseline":
+                    if summary != "Success":
+                        _mark_baseline_failed(outcome, f"unmutated baseline: {summary}")
+                    continue
+                mutant = scenario.get("Mutant") if isinstance(scenario, dict) else None
+                if not isinstance(mutant, dict):
+                    continue
+                bucket = _CARGO_OUTCOME_BUCKET.get(summary, "inconclusive")
+                name = str(mutant.get("name") or "<mutant>")
+                _record_mutant(outcome, name, bucket, f"{bucket}: {summary or 'unknown'}")
+            if outcome.cases or outcome.baseline_failed:
+                outcome.structured = True
+                counts = payload.get("total_mutants")
+                outcome.summary_line = (
+                    f"cargo-mutants: {outcome.buckets['caught']} caught, "
+                    f"{outcome.buckets['survived']} survived, "
+                    f"{outcome.buckets['invalid']} unviable, "
+                    f"{outcome.buckets['timeout']} timeout, "
+                    f"{outcome.buckets['inconclusive']} inconclusive"
+                    + (f" ({counts} generated)" if isinstance(counts, int) else "")
+                )
+                _sync_mutation_counts(outcome)
+                return outcome
+
+    for line in cleaned.splitlines():
+        stripped = line.strip()
+        match = _CARGO_STATUS_LINE_RE.match(stripped)
+        if match:
+            keyword, detail = match.groups()
+            if keyword == "FAILED" and "baseline" in detail.lower():
+                _mark_baseline_failed(outcome, detail)
+                continue
+            # Strip the trailing timing so the case name stays the mutant description.
+            name = re.sub(r"\s+in \d+(?:\.\d+)?s build.*$", "", detail).strip()
+            _record_mutant(outcome, name, _CARGO_LINE_BUCKET[keyword], f"{keyword.lower()}: {name}")
+            continue
+        if not outcome.cases and _CARGO_TALLY_RE.search(stripped) and "mutant" in stripped.lower():
+            for count, kind in _CARGO_TALLY_RE.findall(stripped):
+                bucket = _MUTTALLY_BUCKET.get(kind.lower(), "inconclusive")
+                outcome.buckets[bucket] = outcome.buckets.get(bucket, 0) + int(count)
+            outcome.summary_line = stripped[:300]
+
+    lowered = cleaned.lower()
+    if any(marker in lowered for marker in _CARGO_BASELINE_FAILURE_MARKERS):
+        # The console log reports the baseline broken without naming a mutant.
+        if not outcome.baseline_failed:
+            _mark_baseline_failed(outcome, "cargo test failed in an unmutated tree")
+
+    if not outcome.summary_line and outcome.buckets["caught"]:
+        outcome.summary_line = (
+            f"cargo-mutants: {outcome.buckets['caught']} caught, "
+            f"{outcome.buckets['survived']} survived"
+        )
+    outcome.structured = outcome.structured or bool(outcome.cases) or outcome.baseline_failed
+    _sync_mutation_counts(outcome)
+    return outcome
+
+
+def parse_mutmut(text: str, *, results_text: str = "") -> ParseOutcome:
+    """Classify a ``mutmut`` run from ``mutmut run`` progress and ``mutmut results`` output."""
+    cleaned = _clean(text)
+    results = _clean(results_text) if results_text.strip() else cleaned
+    outcome = ParseOutcome()
+    outcome.buckets = _mutation_empty_buckets()
+
+    for line in results.splitlines():
+        match = _MUTMUT_RESULT_LINE_RE.match(line)
+        if not match:
+            continue
+        name, raw_status = match.group("name"), match.group("status").strip().lower()
+        bucket = _MUTMUT_STATUS_BUCKET.get(raw_status)
+        if bucket is None:
+            continue
+        _record_mutant(outcome, name, bucket, f"{raw_status}: {name}")
+
+    if not outcome.cases and cleaned:
+        # Fall back to the final progress tally that ``mutmut run`` prints.
+        last_tally: Dict[str, int] = {}
+        for line in cleaned.splitlines():
+            found = _MUTMUT_EMOJI_TALLY_RE.findall(line)
+            if found:
+                last_tally = {bucket: 0 for bucket in MUTATION_BUCKETS}
+                for emoji, count in found:
+                    bucket = _MUTMUT_EMOJI_BUCKET.get(emoji, "inconclusive")
+                    last_tally[bucket] = last_tally.get(bucket, 0) + int(count)
+        for bucket, count in last_tally.items():
+            outcome.buckets[bucket] = outcome.buckets.get(bucket, 0) + count
+        if last_tally:
+            outcome.summary_line = (
+                f"mutmut: {outcome.buckets['caught']} caught, "
+                f"{outcome.buckets['survived']} survived, "
+                f"{outcome.buckets['timeout']} timeout, "
+                f"{outcome.buckets['inconclusive']} inconclusive"
+            )
+
+    lowered = cleaned.lower()
+    if any(marker in lowered for marker in _MUTMUT_BASELINE_FAILURE_MARKERS):
+        if not outcome.cases:
+            _mark_baseline_failed(outcome, "mutmut could not collect a passing baseline")
+
+    outcome.structured = outcome.structured or bool(outcome.cases) or outcome.baseline_failed
+    _sync_mutation_counts(outcome)
+    return outcome
+
+
 ADAPTER_PARSERS = {
     "agent_eval": parse_agent_eval,
     "c_sanitizer": parse_c_sanitizer,
     "cargo": parse_cargo,
+    "cargo_mutants": lambda text: parse_cargo_mutants(text),
     "cobol": parse_cobol,
+    "mutmut": lambda text: parse_mutmut(text),
     "pty_tmux": parse_pty_tmux,
     "python_pytest": parse_python_pytest,
     "python_unittest": parse_python_unittest,

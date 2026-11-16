@@ -432,6 +432,20 @@ def _failed_suite_kind(suites: List[SuiteResult]) -> str:
     return FailureKind.ASSERTION
 
 
+def _apply_mutation_gate(suites: List[SuiteSpec], mutation_gate: Optional[float]) -> None:
+    """Stamp an operator-supplied mutation gate onto the selected suites.
+
+    A CLI gate is trusted by construction, unlike ``mutation_score_gate`` in a manifest,
+    which only counts once the manifest itself is trusted.
+    """
+    if mutation_gate is None:
+        return
+    gate = float(mutation_gate)
+    for suite in suites:
+        suite.mutation_score_gate = gate
+        suite.mutation_gate_from_cli = True
+
+
 def _aggregate_run_status(suites: List[SuiteResult]) -> Tuple[str, Optional[str]]:
     if not suites:
         return RunStatus.SKIP, None
@@ -582,6 +596,7 @@ class TestBenchEngine:
         timeout_s: Optional[float] = None,
         enforce_scope: bool = False,
         delegation_id: Optional[str] = None,
+        mutation_gate: Optional[float] = None,
     ) -> RunRecord:
         resolved = self.resolve_target(target, enforce_scope=enforce_scope)
         spec = self._discover_fn(resolved, store=self.store)
@@ -589,6 +604,7 @@ class TestBenchEngine:
         if timeout_s is not None:
             for s in suites:
                 s.timeout_s = float(timeout_s)
+        _apply_mutation_gate(suites, mutation_gate)
 
         rid = new_run_id()
         now = utc_now_iso()
@@ -693,6 +709,7 @@ class TestBenchEngine:
         wait_up_to_s: float = 3.0,
         enforce_scope: bool = False,
         delegation_id: Optional[str] = None,
+        mutation_gate: Optional[float] = None,
     ) -> RunRecord:
         resolved = self.resolve_target(target, enforce_scope=enforce_scope)
         spec = self._discover_fn(resolved, store=self.store)
@@ -737,6 +754,8 @@ class TestBenchEngine:
             argv.extend(["--max-tokens", str(int(max_tokens))])
         if timeout_s is not None:
             argv.extend(["--timeout", str(float(timeout_s))])
+        if mutation_gate is not None:
+            argv.extend(["--mutation-gate", str(float(mutation_gate))])
 
         env = dict(os.environ)
         # The worker imports exactly the package this process imported. A source tree,
@@ -785,6 +804,7 @@ class TestBenchEngine:
         allow_billable: bool = False,
         max_tokens: int = 0,
         timeout_s: Optional[float] = None,
+        mutation_gate: Optional[float] = None,
     ) -> int:
         rec = self.store.get_run(run_id)
         if rec is None:
@@ -809,6 +829,7 @@ class TestBenchEngine:
                 if timeout_s is not None:
                     for s in suites:
                         s.timeout_s = float(timeout_s)
+                _apply_mutation_gate(suites, mutation_gate)
 
                 rec.status = RunStatus.RUNNING
                 rec.started_at = utc_now_iso()
