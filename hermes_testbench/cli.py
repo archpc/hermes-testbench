@@ -10,6 +10,13 @@ import sys
 from typing import List, Optional
 
 from .engine import AuthorizationError, TestBenchEngine
+from .flake import (
+    FlakeHistory,
+    FlakeReport,
+    FlakeVerdict,
+    TargetClassification,
+    analyze_flake_history,
+)
 from .reporting import format_terminal_summary, render_junit_xml, render_run_json
 from .schema import RunStatus
 from .store import TestBenchStore
@@ -120,9 +127,43 @@ def build_parser() -> argparse.ArgumentParser:
     msgp.add_argument("--hermes-pytest", action="store_true", help="Also run Hermes offline bot_mode_dm pytest suite")
     msgp.add_argument("--json", action="store_true")
 
+    tapep = sub.add_parser("tape", help="Replay declarative terminal tapes against approved goldens")
+    tsub = tapep.add_subparsers(dest="tape_action")
+    trun = tsub.add_parser("run", help="Replay a .tape script in an isolated PTY")
+    trun.add_argument("tape_file")
+    trun.add_argument("--project-root", default="", help="Program cwd (defaults to the tape's directory)")
+    trun.add_argument("--golden-dir", default="", help="Golden directory (defaults to <tape dir>/golden)")
+    trun.add_argument("--timeout", type=float, default=120.0)
+    trun.add_argument("--json", action="store_true")
+    tapp = tsub.add_parser("approve", help="Approve a captured screen as a golden (interactive TTY only)")
+    tapp.add_argument("evidence_or_run_id")
+    tapp.add_argument("--golden", default="", help="Golden name (defaults to the tape name)")
+    tapp.add_argument("--golden-dir", required=True)
+    tapp.add_argument("--yes", action="store_true", help="Skip the confirmation prompt (still requires a TTY)")
+    tapp.add_argument("--json", action="store_true")
+
     tuip = sub.add_parser("tui", help="Launch interactive terminal UI (hx:testbench)")
     tuip.add_argument("--quit-on-q", action="store_true", help="Exit on lowercase q at top level")
     tuip.add_argument("--project", default="", help="Initial project filter")
+
+    flakep = sub.add_parser("flake", help="Hunt flaky tests: repeat executions and classify variance")
+    fsub = flakep.add_subparsers(dest="flake_action")
+    frun = fsub.add_parser(
+        "run",
+        help="Repeat a profile/suite group and classify each target (exit 0 only when all always_pass)",
+    )
+    frun.add_argument("path", nargs="?", default=".")
+    frun.add_argument("--repeats", type=int, default=None, help="Attempts (default: max SuiteSpec.repeat_runs)")
+    frun.add_argument("--profile", default="unit")
+    frun.add_argument("--suite", action="append", default=[], help="Specific suite name (repeatable)")
+    frun.add_argument("--timeout", type=float, default=None, help="Per-suite timeout override (s)")
+    frun.add_argument("--json", action="store_true")
+    fana = fsub.add_parser("analyze", help="Classify flake groups already recorded in the store")
+    fana.add_argument("--project", default="")
+    fana.add_argument("--revision", default="")
+    fana.add_argument("--group", default="", help="Restrict to one flake group_id")
+    fana.add_argument("--limit", type=int, default=200, help="Max stored runs to scan")
+    fana.add_argument("--json", action="store_true")
 
     sub.add_parser("mcp", help="Run local stdio MCP server")
 
@@ -136,6 +177,54 @@ def build_parser() -> argparse.ArgumentParser:
     workp.add_argument("--timeout", type=float, default=None)
 
     return p
+
+
+def _format_flake_target(target: TargetClassification) -> List[str]:
+    head = f"  [{target.level}] {target.target}: {target.verdict}  pass={target.pass_count} fail={target.fail_count}"
+    if target.other_count:
+        head += f" other={target.other_count}"
+    head += f"  statuses={'/'.join(target.statuses)}"
+    lines = [head]
+    if target.passing_run_ids:
+        lines.append(f"    pass_runs={','.join(target.passing_run_ids)}")
+    if target.failing_run_ids:
+        lines.append(f"    fail_runs={','.join(target.failing_run_ids)}")
+        for rid, evidence in zip(target.failing_run_ids, target.failing_evidence_dirs):
+            lines.append(f"      fail_evidence[{rid}]={evidence}")
+    if target.other_run_ids:
+        lines.append(f"    other_runs={','.join(target.other_run_ids)}")
+    if target.missing_attempts:
+        lines.append(f"    missing_attempts={','.join(str(a) for a in target.missing_attempts)}")
+    return lines
+
+
+def _format_flake_report(report: FlakeReport) -> str:
+    lines = [
+        f"FLAKE {report.verdict}  group={report.group_id}  project={report.project}  "
+        f"revision={report.revision}  attempts={report.attempts}/{report.expected_repeats}"
+    ]
+    for run_id, status, evidence in zip(report.run_ids, report.statuses, report.evidence_dirs):
+        lines.append(f"  run {run_id}: {status}  evidence={evidence}")
+    for target in report.targets:
+        lines.extend(_format_flake_target(target))
+    if report.missing_attempts:
+        lines.append(f"  missing_attempts={','.join(str(a) for a in report.missing_attempts)}")
+    return "\n".join(lines)
+
+
+def _format_flake_history(history: FlakeHistory) -> str:
+    if not history.groups:
+        return "no flake groups recorded"
+    counts = history.verdict_counts()
+    header = "flake groups: {total} ({detail})".format(
+        total=len(history.groups),
+        detail=", ".join(f"{name}={counts.get(name, 0)}" for name in FlakeVerdict.ALL),
+    )
+    blocks = [header]
+    for group in history.groups:
+        blocks.append("")
+        blocks.append(_format_flake_report(group))
+    return "\n".join(blocks)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -177,6 +266,42 @@ def main(argv: Optional[List[str]] = None) -> int:
                     max_tokens=args.max_tokens,
                     timeout_s=args.timeout,
                 )
+
+            if args.command == "flake":
+                if args.flake_action == "run":
+                    report = eng.flake_hunt(
+                        Path(args.path),
+                        repeats=args.repeats,
+                        profile=args.profile,
+                        suite_names=args.suite or None,
+                        timeout_s=args.timeout,
+                    )
+                    if args.json:
+                        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+                    else:
+                        print(_format_flake_report(report))
+                    # Only a clean sweep of always_pass may exit 0: flakes,
+                    # deterministic failures, and inconclusive attempts never
+                    # masquerade as success.
+                    return 0 if report.verdict == FlakeVerdict.ALWAYS_PASS else 1
+                if args.flake_action == "analyze":
+                    runs = store.list_runs(project=args.project or None, limit=max(1, args.limit))
+                    history = analyze_flake_history(
+                        runs,
+                        project=args.project or None,
+                        revision=args.revision or None,
+                        group_id=args.group or None,
+                    )
+                    if args.json:
+                        print(json.dumps(history.to_dict(), indent=2, sort_keys=True))
+                    else:
+                        print(_format_flake_history(history))
+                    if not history.groups:
+                        sys.stderr.write("testbench: no flake groups recorded for the given filters\n")
+                        return 1
+                    return 0
+                parser.print_help()
+                return 2
 
             if args.command == "discover":
                 spec = eng.discover(Path(args.path))
@@ -294,6 +419,45 @@ def main(argv: Optional[List[str]] = None) -> int:
                 else:
                     print(format_terminal_summary(rec))
                 return 0
+
+            if args.command == "tape":
+                from .tape import approve_golden, run_tape, tape_marker_from_run  # type: ignore
+                if args.tape_action == "run":
+                    rec = run_tape(
+                        store,
+                        Path(args.tape_file),
+                        project_root=Path(args.project_root) if args.project_root else None,
+                        golden_dir=Path(args.golden_dir) if args.golden_dir else None,
+                        timeout_s=args.timeout,
+                    )
+                    if args.json:
+                        sys.stdout.write(render_run_json(rec))
+                    else:
+                        print(format_terminal_summary(rec))
+                        for sres in rec.suites:
+                            print(f"  golden: {(sres.isolation_meta or {}).get('golden') or '-'}")
+                            print(f"  screen: {sres.sanitized_path or '-'}")
+                    # Machine marker last: consumed by the terminal_tape adapter.
+                    print(tape_marker_from_run(rec))
+                    return 0 if rec.status in (RunStatus.PASS, RunStatus.SKIP) else 1
+                if args.tape_action == "approve":
+                    info = approve_golden(
+                        args.evidence_or_run_id,
+                        golden_name=args.golden,
+                        golden_dir=Path(args.golden_dir),
+                        store=store,
+                        assume_yes=args.yes,
+                    )
+                    if args.json:
+                        print(json.dumps(info, indent=2, sort_keys=True))
+                    else:
+                        print(
+                            f"approved golden {info['name']} -> {info['screen_path']} "
+                            f"(sha256 {info['screen_sha256'][:12]})"
+                        )
+                    return 0
+                sys.stderr.write("testbench tape: expected 'run' or 'approve'\n")
+                return 2
 
             if args.command == "trust":
                 info = store.trust_project(Path(args.path))

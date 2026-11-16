@@ -15,6 +15,7 @@ import tomllib
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .isolation import real_user_home, run_isolated_command, terminate_process_group
+from .flake import FlakeReport, MIN_ATTEMPTS, build_report
 from .sanitize import redact_secrets, sanitize_terminal_text
 from .schema import (
     CaseResult,
@@ -408,6 +409,27 @@ def host_environment_snapshot() -> Dict[str, Any]:
     }
 
 
+def _merge_environment(
+    base: Dict[str, Any], extra: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Merge caller-supplied environment metadata over the host snapshot.
+
+    Used by ``flake_hunt`` to tag each attempt with ``environment['flake']``
+    while keeping every host fact. Nested ``flake`` dicts merge instead of
+    replacing each other so future callers can add keys without clobbering the
+    group/attempt/repeats contract.
+    """
+    env = dict(base)
+    for key, value in (extra or {}).items():
+        if key == "flake" and isinstance(value, dict):
+            merged = dict(env.get("flake") or {})
+            merged.update(value)
+            env["flake"] = merged
+        else:
+            env[key] = value
+    return env
+
+
 def _blocked_failure_kind(suites: List[SuiteResult]) -> str:
     for s in suites:
         if s.status != RunStatus.BLOCKED:
@@ -451,6 +473,9 @@ def _aggregate_run_status(suites: List[SuiteResult]) -> Tuple[str, Optional[str]
     if any(st == RunStatus.BLOCKED for st in statuses):
         return RunStatus.BLOCKED, _blocked_failure_kind(suites)
     return RunStatus.PASS, None
+
+
+MAX_FLAKE_REPEATS = 100
 
 
 class TestBenchEngine:
@@ -582,6 +607,7 @@ class TestBenchEngine:
         timeout_s: Optional[float] = None,
         enforce_scope: bool = False,
         delegation_id: Optional[str] = None,
+        env_meta: Optional[Dict[str, Any]] = None,
     ) -> RunRecord:
         resolved = self.resolve_target(target, enforce_scope=enforce_scope)
         spec = self._discover_fn(resolved, store=self.store)
@@ -603,7 +629,7 @@ class TestBenchEngine:
             commands=[list(s.command) for s in suites],
             created_at=now,
             started_at=now,
-            environment=host_environment_snapshot(),
+            environment=_merge_environment(host_environment_snapshot(), env_meta),
             delegation_id=delegation_id or os.environ.get("HERMES_DELEGATION_ID") or None,
             worker_pid=None,
             worker_pgid=None,
@@ -680,6 +706,75 @@ class TestBenchEngine:
             run_err.error_count = max(1, run_err.error_count)
             run_err.first_failure = f"Execution error: {exc}"[:300]
             return self.store.finalize_run(run_err)
+
+    @staticmethod
+    def _resolve_flake_repeats(
+        repeats: Optional[int], selected: Sequence[SuiteSpec]
+    ) -> int:
+        """Resolve attempt count: explicit overrides, else ``SuiteSpec.repeat_runs``."""
+        if repeats is None:
+            if not selected:
+                return 1
+            return max([MIN_ATTEMPTS] + [int(s.repeat_runs) for s in selected])
+        try:
+            count = int(repeats)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"flake repeats must be an integer, got {repeats!r}") from exc
+        if count < 1 or count > MAX_FLAKE_REPEATS:
+            raise ValueError(f"flake repeats must be between 1 and {MAX_FLAKE_REPEATS}, got {count}")
+        return count
+
+    def flake_hunt(
+        self,
+        target: Path,
+        *,
+        repeats: Optional[int] = None,
+        profile: str = "unit",
+        suite_names: Optional[Sequence[str]] = None,
+        allow_billable: bool = False,
+        max_tokens: int = 0,
+        timeout_s: Optional[float] = None,
+        enforce_scope: bool = False,
+        group_id: Optional[str] = None,
+    ) -> FlakeReport:
+        """Execute the selected suites ``repeats`` times and classify flakiness.
+
+        Every attempt is a complete :meth:`run_sync` execution: its own
+        independent ``run_id``, its own ``runs/RUN_ID/`` evidence directory, and
+        an ``environment['flake']`` tag of ``{group_id, attempt, repeats}``.
+        A later passing retry never touches an earlier failed attempt; the
+        failed row, its evidence, and its ``run.json`` stay in the store.
+        """
+        resolved = self.resolve_target(target, enforce_scope=enforce_scope)
+        spec = self._discover_fn(resolved, store=self.store)
+        selected = self._select_suites(spec, profile=profile, suite_names=suite_names)
+        attempts = self._resolve_flake_repeats(repeats, selected)
+        gid = (group_id or "").strip() or f"fg_{new_run_id()}"
+
+        runs: List[RunRecord] = []
+        for attempt in range(1, attempts + 1):
+            runs.append(
+                self.run_sync(
+                    resolved,
+                    profile=profile,
+                    suite_names=suite_names,
+                    allow_billable=allow_billable,
+                    max_tokens=max_tokens,
+                    timeout_s=timeout_s,
+                    env_meta={
+                        "flake": {
+                            "group_id": gid,
+                            "attempt": attempt,
+                            "repeats": attempts,
+                        }
+                    },
+                )
+            )
+        return build_report(
+            runs,
+            expected_repeats=attempts,
+            suite_names=[s.name for s in selected] or None,
+        )
 
     def spawn_async(
         self,

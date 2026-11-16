@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import sys
 import unittest
@@ -25,6 +26,21 @@ from hermes_testbench.isolation import (
 from hermes_testbench.messaging_suite import run_agent_messaging_verification
 from hermes_testbench.schema import RunRecord, RunStatus
 from hermes_testbench.store import TestBenchStore
+
+
+def _deepcheck_pids() -> set[int]:
+    """PIDs whose argv is a ``tmux ... new-session -d -s deepcheck`` server, read from ``ps``."""
+    out = subprocess.run(
+        ["/bin/ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5.0, check=False
+    ).stdout
+    pids: set[int] = set()
+    for line in out.splitlines():
+        pid_txt, _, argv = line.strip().partition(" ")
+        if not pid_txt.isdigit() or "ps -axo" in argv:
+            continue
+        if "new-session" in argv and "-s deepcheck" in argv:
+            pids.add(int(pid_txt))
+    return pids
 
 
 class RealWorldSmokeRegressionTests(unittest.TestCase):
@@ -47,6 +63,7 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
         self.assertTrue(probe["crash_recovered"])
         self.assertTrue(probe["server_gone"])
 
+        baseline_deepcheck = _deepcheck_pids()
         res = run_isolated_command(
             [
                 shutil.which("tmux") or "tmux",
@@ -64,7 +81,15 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
             needs_tmux=True,
             scratch_root=deep,
         )
-        # Note: needs_tmux passes TMUX_TMPDIR + TESTBENCH_TMUX_SOCKET; verify explicit -L works
+        # A bare `tmux new-session` lands on the default server inside TMUX_TMPDIR
+        # ($TMUX_TMPDIR/tmux-<uid>/default), which `-L <socket> kill-server` never reaches.
+        # Before the socket sweep in _kill_disposable_tmux this leaked one orphan per run
+        # (83 reproduced); it must now be gone the moment run_isolated_command returns.
+        self.assertEqual(
+            _deepcheck_pids() - baseline_deepcheck,
+            set(),
+            "a plain `tmux new-session -d -s deepcheck` server outlived run_isolated_command",
+        )
         sock_script = (
             "import os, subprocess; s=os.environ['TESTBENCH_TMUX_SOCKET']; "
             "subprocess.run(['tmux','-L',s,'-f','/dev/null','new-session','-d','-s','ok'], check=True)"

@@ -14,6 +14,7 @@ import re
 import selectors
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import termios
@@ -595,21 +596,98 @@ def _open_0600_write(path: Path):
     return os.fdopen(fd, "w", encoding="utf-8")
 
 
-def _kill_disposable_tmux(tmux_socket: str, tmux_tmpdir: Path) -> None:
+def _tmux_tmpdir_is_trusted(tmux_tmpdir: Path, expected_parent: Optional[Path] = None) -> bool:
+    """True only when ``tmux_tmpdir`` is a real directory directly under ``expected_parent``.
+
+    The sandboxed suite *owns* ``tmux_tmpdir`` and may delete it and plant a symlink to an
+    ambient directory (e.g. ``/private/tmp``) before exiting. Teardown must never follow such
+    a link when walking sockets, signalling servers, or sweeping survivors.
+    """
+    try:
+        st = os.lstat(tmux_tmpdir)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        return False
+    if expected_parent is None:
+        return True
+    try:
+        return Path(os.path.realpath(tmux_tmpdir)).parent == Path(os.path.realpath(expected_parent))
+    except OSError:
+        return False
+
+
+def _tmux_socket_files(tmux_tmpdir: Path, expected_parent: Optional[Path] = None) -> List[Path]:
+    """Socket paths a tmux server may have created inside our own ``TMUX_TMPDIR``.
+
+    tmux names its default socket ``$TMUX_TMPDIR/tmux-<uid>/default``; ``-L name`` servers land
+    in the same directory under ``name``. Only this directory is ever listed — nothing outside
+    ``tmux_tmpdir`` is inspected or signalled.
+
+    ``tmux_tmpdir``, ``tmux-<uid>`` and every entry are checked with ``lstat`` so a
+    child-planted symlink (or a symlinked socket) is never traversed.
+    """
+    if not _tmux_tmpdir_is_trusted(tmux_tmpdir, expected_parent):
+        return []
+    base = tmux_tmpdir / f"tmux-{os.getuid()}"
+    try:
+        base_st = os.lstat(base)
+        if stat.S_ISLNK(base_st.st_mode) or not stat.S_ISDIR(base_st.st_mode):
+            return []
+        if Path(os.path.realpath(base)).parent != Path(os.path.realpath(tmux_tmpdir)):
+            return []
+        uid_real = Path(os.path.realpath(base))
+        found: List[Path] = []
+        for entry in base.iterdir():
+            try:
+                if entry.is_symlink():
+                    continue
+                if not stat.S_ISSOCK(os.lstat(entry).st_mode):
+                    continue
+                if Path(os.path.realpath(entry)).parent != uid_real:
+                    continue
+            except OSError:
+                continue
+            found.append(entry)
+        return found
+    except OSError:
+        return []
+
+
+def _kill_disposable_tmux(
+    tmux_socket: str,
+    tmux_tmpdir: Path,
+    expected_parent: Optional[Path] = None,
+) -> None:
+    """Kill every tmux server reachable through this disposable ``TMUX_TMPDIR``.
+
+    ``-L <socket>`` alone is not enough: suites that call plain ``tmux new-session`` get the
+    default server at ``$TMUX_TMPDIR/tmux-<uid>/default``, which survives the ``-L`` kill and
+    outlives the unlinked ``tmux_tmpdir`` as an orphan (reproduced: 83 leaked ``deepcheck``
+    servers). Each socket inside ``tmux_tmpdir`` is therefore killed by path with ``-S``.
+
+    If the child replaced ``tmux_tmpdir`` with a symlink (escaping ``expected_parent``) no
+    server is signalled at all — only the planted link itself is unlinked.
+    """
+    if not _tmux_tmpdir_is_trusted(tmux_tmpdir, expected_parent):
+        _safe_rmtree_no_symlinks(tmux_tmpdir)
+        return
     tmux_bin = shutil.which("tmux")
-    if not tmux_bin or not tmux_socket:
+    if not tmux_bin:
         return
     env = {"PATH": os.environ.get("PATH", "/opt/homebrew/bin:/usr/bin:/bin"), "TMUX_TMPDIR": str(tmux_tmpdir)}
-    try:
-        subprocess.run(
-            [tmux_bin, "-L", tmux_socket, "kill-server"],
-            env=env,
-            capture_output=True,
-            timeout=3.0,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        pass
+    targets: List[List[str]] = []
+    if tmux_socket:
+        targets.append([tmux_bin, "-L", tmux_socket, "kill-server"])
+    targets.extend(
+        [tmux_bin, "-S", str(sock), "kill-server"]
+        for sock in _tmux_socket_files(tmux_tmpdir, expected_parent)
+    )
+    for argv in targets:
+        try:
+            subprocess.run(argv, env=env, capture_output=True, timeout=3.0, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def run_isolated_command(
@@ -652,6 +730,9 @@ def run_isolated_command(
     # Keep Unix domain socket paths well under macOS sockaddr_un.sun_path (104 bytes)
     tmux_socket = f"s{nonce[:8]}" if needs_tmux else ""
     short_tmux_base = short_writable_tmux_base(sroot) if needs_tmux else sroot
+    # Captured BEFORE the child is spawned: the child owns its tmpdir after that and may
+    # replace it with a symlink, so teardown must validate against this trusted parent.
+    expected_tmux_parent: Optional[Path] = short_tmux_base.resolve() if needs_tmux else None
     tmux_tmpdir: Optional[Path] = (short_tmux_base / f"tx{nonce[:6]}") if needs_tmux else None
 
     env = build_isolated_env(
@@ -873,7 +954,13 @@ def run_isolated_command(
         if pgid > 1:
             terminate_process_group(pgid, expected_start_time=start_fp, grace_s=0.2)
         if needs_tmux and tmux_socket and tmux_tmpdir is not None:
-            _kill_disposable_tmux(tmux_socket, tmux_tmpdir)
+            _kill_disposable_tmux(tmux_socket, tmux_tmpdir, expected_parent=expected_tmux_parent)
+            # A default-named server (plain `tmux new-session`) is only reachable by the
+            # socket sweep above; reap anything else still holding this tmpdir open. Both the
+            # kill and this sweep are skipped when the child planted a symlink in place of
+            # tmux_tmpdir, so an ambient directory (e.g. /private/tmp) is never touched.
+            if _tmux_tmpdir_is_trusted(tmux_tmpdir, expected_tmux_parent):
+                _sweep_sandbox_survivors(tmux_tmpdir)
             _safe_rmtree_no_symlinks(tmux_tmpdir)
         if timed_out or cancelled or (exit_code is not None and exit_code != 0):
             swept, leaked_children = _sweep_sandbox_survivors(sandbox_dir)

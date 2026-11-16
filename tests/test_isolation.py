@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -301,6 +302,97 @@ class IsolationTests(unittest.TestCase):
                 alive = False
                 break
         self.assertFalse(alive, f"Disposable tmux server pid {tmux_pid} leaked after teardown!")
+
+    @unittest.skipUnless(shutil.which("tmux"), "tmux unavailable")
+    def test_teardown_refuses_child_planted_tmux_tmpdir_symlink(self) -> None:
+        """A suite that swaps its TMUX_TMPDIR for a symlink must not make teardown follow it.
+
+        Adversarial case: the sandboxed child deletes ``$TMUX_TMPDIR`` and links it at a decoy
+        base hosting an unrelated tmux server. Teardown must refuse to walk the link, so the
+        decoy server stays alive and the decoy directory is left untouched.
+        """
+        # Short TMPDIR-based base: a socket under $TMPDIR/tmux-<uid>/decoy stays far below the
+        # macOS 104-byte sun_path limit even inside the nested (already sandboxed) test run.
+        decoy_base = Path(tempfile.mkdtemp(prefix="tb-decoy-", dir=os.environ.get("TMPDIR") or None))
+        decoy_base.chmod(0o700)
+        # No TMUX/TMUX_PANE in decoy_env: the decoy is a private server, never the ambient one.
+        decoy_env = dict(os.environ)
+        for key in ("TMUX", "TMUX_PANE"):
+            decoy_env.pop(key, None)
+        decoy_env["TMUX_TMPDIR"] = str(decoy_base)
+
+        decoy_pids: list[int] = []
+
+        def _kill_decoy() -> None:
+            for pid in decoy_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            subprocess.run(
+                ["tmux", "-L", "decoy", "kill-server"],
+                env=decoy_env,
+                capture_output=True,
+                timeout=5.0,
+                check=False,
+            )
+            shutil.rmtree(decoy_base, ignore_errors=True)
+
+        self.addCleanup(_kill_decoy)
+        started = subprocess.run(
+            ["tmux", "-L", "decoy", "-f", "/dev/null", "new-session", "-d", "-s", "decoy"],
+            env=decoy_env,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+        self.assertEqual(started.returncode, 0, f"decoy tmux failed to start: {started.stderr}")
+        decoy_pid = int(
+            subprocess.check_output(
+                ["tmux", "-L", "decoy", "display-message", "-p", "#{pid}"],
+                env=decoy_env,
+                text=True,
+                timeout=10.0,
+            ).strip()
+        )
+        decoy_socket = decoy_base / f"tmux-{os.getuid()}" / "decoy"
+        self.assertTrue(stat.S_ISSOCK(os.lstat(decoy_socket).st_mode))
+        decoy_pids.append(decoy_pid)
+
+        script = (
+            "import os, shutil, sys\n"
+            "t = os.environ['TMUX_TMPDIR']\n"
+            "shutil.rmtree(t)\n"
+            "os.symlink(sys.argv[1], t)\n"
+            "print('TMPDIR=' + t)\n"
+            "print('TARGET=' + os.readlink(t))\n"
+            "print('SYMLINKED=' + str(os.path.islink(t)))\n"
+        )
+        res = run_isolated_command(
+            [PY, "-c", script, str(decoy_base)],
+            cwd=self.repo,
+            evidence_dir=self.evidence,
+            step_name="tmux_symlink_escape",
+            run_id="tb_iso_tmux_symlink",
+            needs_tmux=True,
+            use_seatbelt=True,
+            scratch_root=self.root,
+        )
+        self.assertEqual(res.exit_code, 0, res.stderr_text)
+        self.assertIn("SYMLINKED=True", res.stdout_text)
+        planted = Path(res.stdout_text.split("TMPDIR=")[1].splitlines()[0].strip())
+        target = res.stdout_text.split("TARGET=")[1].splitlines()[0].strip()
+        # realpath both sides: macOS reports $TMPDIR as /var/... while realpath gives /private/var/...
+        self.assertEqual(Path(os.path.realpath(target)), Path(os.path.realpath(decoy_base)))
+
+        # The decoy server must still be alive: teardown refused to follow the planted link.
+        os.kill(decoy_pid, 0)
+        self.assertTrue(stat.S_ISSOCK(os.lstat(decoy_socket).st_mode))
+        self.assertTrue(decoy_base.is_dir())
+
+        # ...and the planted symlink itself was unlinked instead of traversed.
+        self.assertFalse(os.path.lexists(planted))
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "macOS sandbox-exec unavailable")
     def test_nested_process_inherits_effective_seatbelt_restrictions_and_detects_outer_sandbox(self) -> None:
