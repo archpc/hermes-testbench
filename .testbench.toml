@@ -6,7 +6,7 @@ languages = ["python"]
 name = "core-unit"
 adapter = "python_unittest"
 profile = "unit"
-command = ["{python}", "-W", "default", "-m", "unittest", "tests.test_schema", "tests.test_sanitize", "tests.test_reporting", "tests.test_store", "tests.test_discovery_and_adapters", "tests.test_output_contract", "tests.test_cobol_verification", "tests.test_flake_hunter", "tests.test_tui_render", "tests.test_skill_and_agent_eval", "-v"]
+command = ["{python}", "-W", "default", "-m", "unittest", "tests.test_schema", "tests.test_sanitize", "tests.test_reporting", "tests.test_store", "tests.test_discovery_and_adapters", "tests.test_output_contract", "tests.test_cobol_verification", "tests.test_flake_hunter", "tests.test_tui_render", "tests.test_mutation_testing", "tests.test_skill_and_agent_eval", "-v"]
 timeout_s = 180.0
 description = "Fast deterministic core, adapter, parser, store, flake-classifier, and TUI state-machine unit tests"
 

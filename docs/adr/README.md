@@ -5,6 +5,7 @@ Architectural choices for Hermes TestBench (`hermes_testbench`). Managed with th
 <!-- adr-index:start -->
 | ID | Status | Date | Decision |
 |---|---|---|---|
+| 0008 | accepted | 2026-11-15 | [Disposable source-stage mutation testing with stage-scoped Seatbelt writes and Linux confinement gate](0008-disposable-source-stage-mutation-testing-with-stage-scoped-s.md) |
 | 0007 | accepted | 2026-11-16 | [Independent per-attempt RunRecords for Flake Hunter and in-process VTScreen Terminal Tape deferring VHS](0007-independent-per-attempt-runrecords-for-flake-hunter-and-in-p.md) |
 | 0006 | accepted | 2026-11-16 | [External LLVM FileCheck steps and GnuCOBOL Decimal oracle over custom output-matching DSLs](0006-external-llvm-filecheck-steps-and-gnucobol-decimal-oracle-ov.md) |
 | 0005 | accepted | 2026-11-14 | [Deny-by-default Seatbelt writes, Unix-socket confinement, and fingerprinted cancellation](0005-deny-by-default-seatbelt-writes-unix-socket-confinement-and-.md) |

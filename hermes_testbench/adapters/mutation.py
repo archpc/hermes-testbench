@@ -466,6 +466,20 @@ def run_mutation_suite(
         if not workdir.is_dir():
             raise RuntimeError(f"staged suite cwd is missing: {relative_cwd}")
 
+        # Defense in depth (ADJACENT-1): ``stage_project_tree`` copies symlinks verbatim, so a
+        # symlinked suite cwd inside the staged copy can still point back at the real checkout.
+        # The lexical containment check above runs *before* the copy and cannot see links that the
+        # copy itself created, so re-verify the staged entry on disk right before spawning.
+        staged_workdir = stage_dir / relative_cwd
+        staged_root_real = Path(os.path.realpath(stage_dir))
+        if staged_workdir.is_symlink() or not Path(
+            os.path.realpath(staged_workdir)
+        ).is_relative_to(staged_root_real):
+            raise RuntimeError(
+                "staged suite cwd is not a real directory inside the staged copy "
+                f"(symlink escape): {relative_cwd}"
+            )
+
         try:
             exec_result = run_isolated_command(
                 _run_argv(adapter, tool_argv),

@@ -425,6 +425,52 @@ class GatingAndAvailabilityTests(_MutationTestCase):
         )
         self._assert_checkout_pristine(project)
 
+    def test_symlinked_staged_cwd_is_rejected_after_staging(self) -> None:
+        """The pre-staging lexical check cannot see links the copy itself creates.
+
+        ``stage_project_tree`` copies symlinks verbatim, so a symlinked suite cwd can pass the
+        ``resolve()``-based containment check (the link does not exist yet in the empty stage)
+        and only become an escape once the copy lands on disk. Re-verifying after staging must
+        reject it, spawn nothing, and remove the disposable stage.
+        """
+        project = self.root / "symlinkcwd"
+        _write_mutmut_project(project)
+        outside = self.root / "outside-target"
+        outside.mkdir()
+        (project / "linked").symlink_to(outside, target_is_directory=True)
+        subprocess.run(["git", "-C", str(project), "add", "-A"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(project),
+                "-c",
+                "user.email=tb@example.invalid",
+                "-c",
+                "user.name=testbench",
+                "commit",
+                "-qm",
+                "fixture: symlinked cwd",
+            ],
+            check=True,
+        )
+        spawns = []
+        suite = self._suite(cwd="linked")
+        with mock.patch.object(
+            mutation_mod, "can_apply_seatbelt", return_value=True
+        ), mock.patch.object(mutation_mod, "resolve_tool", return_value=["/bin/true"]):
+            result, _ = self._run(suite, project, on_spawn=lambda *a: spawns.append(a))
+        self.assertEqual(result.status, RunStatus.ERROR, result.summary_excerpt)
+        self.assertEqual(result.failures[0].kind, FailureKind.HARNESS_ERROR)
+        self.assertIn("symlink escape", result.summary_excerpt)
+        self.assertEqual(spawns, [], "a mutation tool ran through a symlinked staged cwd")
+        self.assertEqual(
+            list(self.scratch.glob("tbmut-*")),
+            [],
+            "the disposable stage survived a rejected cwd",
+        )
+        self._assert_checkout_pristine(project)
+
 
 class MutationGateValidationTests(unittest.TestCase):
     """A gate is a fraction of caught mutants; out-of-range values fail loudly."""
