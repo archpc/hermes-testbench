@@ -828,14 +828,42 @@ def _sqlite_suites(root: Path, files: List[str]) -> Tuple[List[SuiteSpec], bool]
     )
 
 
-def _mutation_suites(root: Path) -> List[SuiteSpec]:
-    """Mutation suites for projects that ship a supported tool configuration.
+def _mutation_suite_enabled(root: Path, adapter: str) -> bool:
+    """Whether the project explicitly opts into a mutation tool.
 
-    Only the configuration files are inspected: whether the binary itself is installed is a
-    run-time question, and a missing tool must surface as SKIP rather than vanish.
+    Mutation testing is expensive (minutes to hours), so it is never inferred from a plain
+    ``Cargo.toml``/``pyproject.toml``: the project must ship the tool's own configuration.
+    Binary availability is deliberately *not* consulted here — that is a run-time question,
+    and a missing tool must surface as SKIP rather than silently vanish from discovery.
     """
+    if adapter == "cargo_mutants":
+        if not (root / "Cargo.toml").is_file():
+            return False
+        for name in ("mutants.toml", ".cargo/mutants.toml"):
+            if (root / name).is_file():
+                return True
+        try:
+            text = (root / "Cargo.toml").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        return "[package.metadata.mutants]" in text or "[workspace.metadata.mutants]" in text
+    for name, marker in (("pyproject.toml", "[tool.mutmut]"), ("setup.cfg", "[mutmut]")):
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if marker in text:
+            return True
+    return False
+
+
+def _mutation_suites(root: Path) -> List[SuiteSpec]:
+    """Mutation suites for projects that ship a supported tool configuration."""
     suites: List[SuiteSpec] = []
-    if (root / "Cargo.toml").is_file():
+    if _mutation_suite_enabled(root, "cargo_mutants"):
         suites.append(
             SuiteSpec(
                 name="cargo-mutants",
@@ -847,18 +875,7 @@ def _mutation_suites(root: Path) -> List[SuiteSpec]:
                 description="cargo-mutants over a disposable staged copy (never the checkout)",
             )
         )
-    mutmut_config = False
-    for name, marker in (("pyproject.toml", "[tool.mutmut]"), ("setup.cfg", "[mutmut]")):
-        path = root / name
-        if not path.is_file():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        if marker in text:
-            mutmut_config = True
-    if mutmut_config:
+    if _mutation_suite_enabled(root, "mutmut"):
         suites.append(
             SuiteSpec(
                 name="mutmut",

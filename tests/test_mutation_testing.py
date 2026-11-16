@@ -586,6 +586,13 @@ class MutationDiscoveryTests(_MutationTestCase):
             '[package]\nname = "demo"\nversion = "0.1.0"\n', encoding="utf-8"
         )
         (project / "src" / "lib.rs").write_text("pub fn one() -> i32 { 1 }\n", encoding="utf-8")
+        # A plain Cargo.toml is never enough: mutation must be opted into via the tool's
+        # own configuration, because the suite costs minutes to hours.
+        plain = [s for s in discover_project(project).suites if s.profile == ProfileName.MUTATION]
+        self.assertEqual(plain, [])
+
+        (project / ".cargo").mkdir()
+        (project / ".cargo" / "mutants.toml").write_text("timeout_multiplier = 2.0\n", encoding="utf-8")
         spec = discover_project(project)
         mutation_suites = [s for s in spec.suites if s.profile == ProfileName.MUTATION]
         self.assertEqual([s.adapter for s in mutation_suites], ["cargo_mutants"])
