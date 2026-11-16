@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import re
+import tempfile
 import unittest
+from dataclasses import replace as dc_replace
+from pathlib import Path
 
 from hermes_testbench.schema import ProjectSpec, RunRecord, RunStatus
+from hermes_testbench.tui import _refresh_active_logs
 from hermes_testbench.tui_render import (
     BILLABLE_REFUSAL,
     PERMANENT_TAB_QUIT_HINT,
@@ -635,3 +639,82 @@ class DegradedStateTests(unittest.TestCase):
             self.assertEqual(len(lines), height)
             for line in lines:
                 self.assertEqual(display_width(line), width)
+
+
+class LiveRunObservabilityTests(unittest.TestCase):
+    """A live run must not look dead: pending counts, live tail, last activity."""
+
+    def _running_state(self, **overrides):
+        run = make_run(
+            "tb_20261115_180000_live0001",
+            project="demo",
+            status=RunStatus.RUNNING,
+            started_at="2026-11-15T18:00:00Z",
+            total_count=0,
+            pass_count=0,
+            fail_count=0,
+            skip_count=0,
+            error_count=0,
+            duration_ms=None,
+            first_failure="",
+            evidence_dir="/runs/live0001",
+        )
+        return sample_state(runs=(run,), selected=0, **overrides)
+
+    def test_active_run_with_unknown_counts_shows_pending_not_zero(self) -> None:
+        text = _strip("\n".join(render_frame(self._running_state(), 140, 36)))
+        self.assertIn("pending", text)
+        self.assertNotIn("0/0", text)
+
+    def test_active_run_shows_last_observed_activity_from_live_tail(self) -> None:
+        run_id = "tb_20261115_180000_live0001"
+        state = self._running_state(
+            log_lines={run_id: ("test_one ... ok", "test_two ... ok")},
+        )
+        text = _strip("\n".join(render_frame(state, 140, 36)))
+        self.assertIn("test_two ... ok", text)
+        detail = _strip("\n".join(render_frame(dc_replace(state, detail_open=True), 80, 24)))
+        self.assertIn("test_two ... ok", detail)
+        self.assertIn("pending", detail)
+
+    def test_active_run_without_output_yet_is_not_reported_as_finished_log(self) -> None:
+        detail = _strip("\n".join(render_frame(self._running_state(detail_open=True), 80, 24)))
+        self.assertIn("(no output yet)", detail)
+        self.assertNotIn("(no captured log lines)", detail)
+
+    def test_completed_run_keeps_numeric_counts_and_captured_tail(self) -> None:
+        done = make_run("tb_20261115_175900_done0001", status=RunStatus.PASS, total_count=373,
+                        pass_count=373, fail_count=0, skip_count=0, error_count=0,
+                        first_failure="", duration_ms=240950.0)
+        state = sample_state(runs=(done,), selected=0,
+                             log_lines={done.run_id: ("ran 373 tests", "OK")})
+        text = _strip("\n".join(render_frame(state, 140, 36)))
+        self.assertIn("373/373", text)
+        self.assertNotIn("pending", text)
+        detail = _strip("\n".join(render_frame(dc_replace(state, detail_open=True), 80, 24)))
+        self.assertIn("ran 373 tests", detail)
+
+    def test_live_tail_is_reread_while_the_store_is_unchanged(self) -> None:
+        scratch = Path.home() / ".hermes/cache/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(scratch), prefix="tb-live-") as tmp:
+            ev = Path(tmp) / "tb_20261115_180000_live0001"
+            ev.mkdir(parents=True, mode=0o700)
+            log = ev / "step.sanitized.log"
+            log.write_text("test_one ... ok\n", encoding="utf-8")
+            run = make_run(
+                "tb_20261115_180000_live0001",
+                status=RunStatus.RUNNING,
+                total_count=0,
+                pass_count=0,
+                fail_count=0,
+                duration_ms=None,
+                evidence_dir=str(ev),
+            )
+            state = TuiState(runs=(run,), projects=(), now_iso="2026-11-15T18:00:05Z")
+            first = _refresh_active_logs(state)
+            self.assertEqual(first.log_lines[run.run_id], ("test_one ... ok",))
+            with log.open("a", encoding="utf-8") as fh:
+                fh.write("test_two ... ok\n")
+            second = _refresh_active_logs(first)
+            self.assertEqual(second.log_lines[run.run_id][-1], "test_two ... ok")
