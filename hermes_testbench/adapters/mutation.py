@@ -399,7 +399,14 @@ def run_mutation_suite(
             )
 
     # Gate B: never spawn a mutation tool without filesystem/network confinement.
-    if not can_apply_seatbelt() and os.environ.get("TESTBENCH_SEATBELT_ACTIVE") != "1":
+    #
+    # There is deliberately *no* environment-variable escape hatch here. An inherited
+    # ``TESTBENCH_SEATBELT_ACTIVE`` marker only proves that some outer sandbox exists; it
+    # does not let ``run_isolated_command`` install its own per-stage Seatbelt profile
+    # (cwd=stage_dir, allow_repo_write=False). Honouring it would run the mutation tool
+    # unconfined on any host without ``sandbox-exec`` (i.e. every Linux box), so the
+    # platform capability is the only accepted evidence.
+    if not can_apply_seatbelt():
         return _blocked(
             suite,
             cwd=cwd,
@@ -439,6 +446,16 @@ def run_mutation_suite(
     run_text = ""
     results_text = ""
     try:
+        # The declared suite cwd is only ever resolved *inside* the disposable copy. An
+        # absolute path or a ``..`` traversal would otherwise pick an arbitrary working
+        # directory for the mutation tool, so it is rejected before anything is spawned.
+        stage_root = stage_dir.resolve()
+        workdir = (stage_root / relative_cwd).resolve()
+        if workdir != stage_root and not workdir.is_relative_to(stage_root):
+            raise RuntimeError(
+                f"suite cwd escapes the staged copy: {relative_cwd} -> {workdir}"
+            )
+
         try:
             stage_project_tree(project_root, stage_dir)
         except OSError as exc:
@@ -446,7 +463,6 @@ def run_mutation_suite(
                 f"could not stage a disposable copy for mutation testing: {exc}"
             ) from exc
 
-        workdir = stage_dir / relative_cwd
         if not workdir.is_dir():
             raise RuntimeError(f"staged suite cwd is missing: {relative_cwd}")
 

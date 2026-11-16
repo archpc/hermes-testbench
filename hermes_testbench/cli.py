@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import math
 from pathlib import Path
 import sys
 from typing import List, Optional
@@ -159,6 +160,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     home = Path(args.home).expanduser() if args.home else None
+
+    gate = getattr(args, "mutation_gate", None)
+    if gate is not None and (math.isnan(gate) or not 0.0 <= gate <= 1.0):
+        sys.stderr.write(
+            f"testbench: --mutation-gate must be a fraction between 0 and 1, got {gate:g}\n"
+        )
+        return 1
 
     if args.command == "mcp":
         from .mcp_server import serve_stdio

@@ -345,8 +345,9 @@ class GatingAndAvailabilityTests(_MutationTestCase):
     def test_missing_binary_returns_skip_never_pass(self) -> None:
         project = self.root / "notool"
         _write_mutmut_project(project)
-        # Keep the system binaries (so sandbox-exec still resolves and the confinement gate
-        # does not fire) but drop every directory that could hold a mutation tool.
+        # Drop every directory that could hold a mutation tool. Confinement is mocked as
+        # available so this exercises Gate C (missing binary) alone: on Linux CI there is no
+        # ``sandbox-exec`` and the confinement gate would otherwise win.
         env = {
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "TESTBENCH_MUTMUT": "",
@@ -355,7 +356,8 @@ class GatingAndAvailabilityTests(_MutationTestCase):
         with mock.patch.dict(os.environ, env, clear=False):
             os.environ.pop("TESTBENCH_MUTMUT", None)
             os.environ.pop("TESTBENCH_CARGO_MUTANTS", None)
-            result, _ = self._run(self._suite(), project)
+            with mock.patch.object(mutation_mod, "can_apply_seatbelt", return_value=True):
+                result, _ = self._run(self._suite(), project)
         self.assertEqual(result.status, RunStatus.SKIP)
         self.assertNotEqual(result.status, RunStatus.PASS)
         self.assertEqual(result.skip_count, 1)
@@ -377,18 +379,83 @@ class GatingAndAvailabilityTests(_MutationTestCase):
         self.assertEqual(result.pass_count, 0)
         self._assert_checkout_pristine(project)
 
-    def test_inherited_outer_sandbox_is_not_treated_as_unconfined(self) -> None:
-        project = self.root / "inherited"
+    def test_spoofed_seatbelt_env_var_still_blocks_when_seatbelt_unavailable(self) -> None:
+        project = self.root / "spoofed"
         _write_mutmut_project(project)
+        spawns = []
         env = dict(_tool_env())
         env["TESTBENCH_SEATBELT_ACTIVE"] = "1"
         with mock.patch.dict(os.environ, env, clear=False):
             with mock.patch.object(mutation_mod, "can_apply_seatbelt", return_value=False):
-                with mock.patch.object(mutation_mod, "resolve_tool", return_value=None):
-                    result, _ = self._run(self._suite(), project)
-        # The sandbox gate does not fire when an outer sandbox is inherited; the missing
-        # tool then surfaces as SKIP instead of BLOCKED.
-        self.assertEqual(result.status, RunStatus.SKIP)
+                with mock.patch.object(
+                    mutation_mod, "resolve_tool", return_value=["/bin/true"]
+                ):
+                    self.assertFalse(mutation_mod.can_apply_seatbelt())
+                    result, _ = self._run(
+                        self._suite(), project, on_spawn=lambda *a: spawns.append(a)
+                    )
+        # ``TESTBENCH_SEATBELT_ACTIVE`` is only an environment variable, so it is not
+        # evidence that this process can install a per-stage Seatbelt profile. On a host
+        # without ``sandbox-exec`` (every Linux box) the tool must never be spawned.
+        self.assertEqual(result.status, RunStatus.BLOCKED)
+        self.assertEqual(result.blocked_count, 1)
+        self.assertEqual(result.failures[0].kind, FailureKind.SANDBOX_DENIED)
+        self.assertIn("confinement unavailable", result.summary_excerpt)
+        self.assertEqual(spawns, [], "a mutation tool was spawned without confinement")
+        self.assertEqual(result.pass_count, 0)
+        self._assert_checkout_pristine(project)
+
+    def test_suite_cwd_cannot_escape_the_staged_copy(self) -> None:
+        project = self.root / "escapedcwd"
+        _write_mutmut_project(project)
+        spawns = []
+        for bad in ("../outside", "/tmp", "src/../../outside"):
+            suite = self._suite(cwd=bad)
+            with mock.patch.object(
+                mutation_mod, "can_apply_seatbelt", return_value=True
+            ), mock.patch.object(mutation_mod, "resolve_tool", return_value=["/bin/true"]):
+                result, _ = self._run(suite, project, on_spawn=lambda *a: spawns.append(a))
+            self.assertEqual(
+                result.status, RunStatus.ERROR, f"{bad}: {result.summary_excerpt}"
+            )
+            self.assertEqual(result.failures[0].kind, FailureKind.HARNESS_ERROR)
+            self.assertIn("escapes the staged copy", result.summary_excerpt)
+        self.assertEqual(
+            spawns, [], "a mutation tool ran from a working directory outside the stage"
+        )
+        self._assert_checkout_pristine(project)
+
+
+class MutationGateValidationTests(unittest.TestCase):
+    """A gate is a fraction of caught mutants; out-of-range values fail loudly."""
+
+    def _suite(self) -> SuiteSpec:
+        return SuiteSpec(
+            name="mutmut",
+            adapter="mutmut",
+            profile=ProfileName.MUTATION,
+            command=["mutmut", "run"],
+            timeout_s=60.0,
+        )
+
+    def test_engine_rejects_gates_outside_the_unit_interval(self) -> None:
+        from hermes_testbench.engine import _apply_mutation_gate
+
+        suite = self._suite()
+        for bad in (-1.0, 8.0, 1.5, float("nan")):
+            with self.assertRaises(ValueError, msg=f"gate {bad!r} was accepted"):
+                _apply_mutation_gate([suite], bad)
+        self.assertIsNone(suite.mutation_score_gate)
+        self.assertFalse(suite.mutation_gate_from_cli)
+
+    def test_cli_exits_nonzero_on_an_out_of_range_gate(self) -> None:
+        from hermes_testbench import cli
+
+        for bad in ("-1", "8", "nan"):
+            code = cli.main(
+                ["run", ".", "--profile", "mutation", f"--mutation-gate={bad}"]
+            )
+            self.assertEqual(code, 1, f"--mutation-gate={bad} exited {code}")
 
 
 class SeatbeltStagingRegressionTests(_MutationTestCase):

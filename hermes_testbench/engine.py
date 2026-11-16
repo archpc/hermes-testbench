@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 from pathlib import Path
 import platform
 import shlex
@@ -441,6 +442,12 @@ def _apply_mutation_gate(suites: List[SuiteSpec], mutation_gate: Optional[float]
     if mutation_gate is None:
         return
     gate = float(mutation_gate)
+    if math.isnan(gate) or not 0.0 <= gate <= 1.0:
+        # A gate is a fraction of caught mutants; anything else would silently make every
+        # mutation suite pass or fail, so it is rejected before any suite is stamped.
+        raise ValueError(
+            f"mutation gate must be a fraction between 0 and 1, got {mutation_gate!r}"
+        )
     for suite in suites:
         suite.mutation_score_gate = gate
         suite.mutation_gate_from_cli = True
