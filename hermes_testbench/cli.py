@@ -118,6 +118,21 @@ def build_parser() -> argparse.ArgumentParser:
     msgp.add_argument("--hermes-pytest", action="store_true", help="Also run Hermes offline bot_mode_dm pytest suite")
     msgp.add_argument("--json", action="store_true")
 
+    tapep = sub.add_parser("tape", help="Replay declarative terminal tapes against approved goldens")
+    tsub = tapep.add_subparsers(dest="tape_action")
+    trun = tsub.add_parser("run", help="Replay a .tape script in an isolated PTY")
+    trun.add_argument("tape_file")
+    trun.add_argument("--project-root", default="", help="Program cwd (defaults to the tape's directory)")
+    trun.add_argument("--golden-dir", default="", help="Golden directory (defaults to <tape dir>/golden)")
+    trun.add_argument("--timeout", type=float, default=120.0)
+    trun.add_argument("--json", action="store_true")
+    tapp = tsub.add_parser("approve", help="Approve a captured screen as a golden (interactive TTY only)")
+    tapp.add_argument("evidence_or_run_id")
+    tapp.add_argument("--golden", default="", help="Golden name (defaults to the tape name)")
+    tapp.add_argument("--golden-dir", required=True)
+    tapp.add_argument("--yes", action="store_true", help="Skip the confirmation prompt (still requires a TTY)")
+    tapp.add_argument("--json", action="store_true")
+
     tuip = sub.add_parser("tui", help="Launch interactive terminal UI (hx:testbench)")
     tuip.add_argument("--quit-on-q", action="store_true", help="Exit on lowercase q at top level")
     tuip.add_argument("--project", default="", help="Initial project filter")
@@ -292,6 +307,45 @@ def main(argv: Optional[List[str]] = None) -> int:
                 else:
                     print(format_terminal_summary(rec))
                 return 0
+
+            if args.command == "tape":
+                from .tape import approve_golden, run_tape, tape_marker_from_run  # type: ignore
+                if args.tape_action == "run":
+                    rec = run_tape(
+                        store,
+                        Path(args.tape_file),
+                        project_root=Path(args.project_root) if args.project_root else None,
+                        golden_dir=Path(args.golden_dir) if args.golden_dir else None,
+                        timeout_s=args.timeout,
+                    )
+                    if args.json:
+                        sys.stdout.write(render_run_json(rec))
+                    else:
+                        print(format_terminal_summary(rec))
+                        for sres in rec.suites:
+                            print(f"  golden: {(sres.isolation_meta or {}).get('golden') or '-'}")
+                            print(f"  screen: {sres.sanitized_path or '-'}")
+                    # Machine marker last: consumed by the terminal_tape adapter.
+                    print(tape_marker_from_run(rec))
+                    return 0 if rec.status in (RunStatus.PASS, RunStatus.SKIP) else 1
+                if args.tape_action == "approve":
+                    info = approve_golden(
+                        args.evidence_or_run_id,
+                        golden_name=args.golden,
+                        golden_dir=Path(args.golden_dir),
+                        store=store,
+                        assume_yes=args.yes,
+                    )
+                    if args.json:
+                        print(json.dumps(info, indent=2, sort_keys=True))
+                    else:
+                        print(
+                            f"approved golden {info['name']} -> {info['screen_path']} "
+                            f"(sha256 {info['screen_sha256'][:12]})"
+                        )
+                    return 0
+                sys.stderr.write("testbench tape: expected 'run' or 'approve'\n")
+                return 2
 
             if args.command == "trust":
                 info = store.trust_project(Path(args.path))
