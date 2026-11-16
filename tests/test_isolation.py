@@ -98,6 +98,55 @@ class IsolationTests(unittest.TestCase):
         self.assertNotIn("52;c;", sanitized_disk)
         self.assertEqual(stat.S_IMODE(Path(res.stdout_path).stat().st_mode), 0o600)
 
+    def test_sanitized_log_is_readable_while_the_command_still_runs(self) -> None:
+        """A live run's evidence must stream: the TUI reads sanitized.log while
+        the suite is still executing, so the writer flushes per chunk instead of
+        only at completion."""
+        release = self.evidence / "release.flag"
+        script = (
+            "import os, sys, time\n"
+            "sys.stdout.write('STREAM-MARKER-ONE\\n'); sys.stdout.flush()\n"
+            "deadline = time.monotonic() + 20\n"
+            f"while time.monotonic() < deadline and not os.path.exists({str(release)!r}):\n"
+            "    time.sleep(0.02)\n"
+        )
+        holder = {}
+
+        def run_step() -> None:
+            holder["res"] = run_isolated_command(
+                [PY, "-c", script],
+                cwd=self.repo,
+                evidence_dir=self.evidence,
+                step_name="stream_probe",
+                run_id="tb_iso_stream",
+                allow_repo_write=True,
+                use_seatbelt=False,
+                scratch_root=self.root,
+            )
+
+        worker = threading.Thread(target=run_step, daemon=True)
+        worker.start()
+        sanitized = self.evidence / "stream_probe.sanitized.log"
+        seen_mid_run = False
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if worker.is_alive() and sanitized.is_file():
+                try:
+                    if "STREAM-MARKER-ONE" in sanitized.read_text(encoding="utf-8"):
+                        seen_mid_run = True
+                        break
+                except OSError:
+                    pass
+            time.sleep(0.05)
+        self.assertTrue(seen_mid_run, "sanitized.log only appeared after the command exited")
+        release.write_text("go", encoding="utf-8")
+        worker.join(timeout=20.0)
+        self.assertFalse(worker.is_alive(), "stream probe never exited")
+        res = holder["res"]
+        self.assertEqual(res.exit_code, 0)
+        self.assertIn("STREAM-MARKER-ONE", Path(res.sanitized_path).read_text(encoding="utf-8"))
+        self.assertEqual(stat.S_IMODE(Path(res.sanitized_path).stat().st_mode), 0o600)
+
     def test_timeout_reaps_entire_process_group_including_spawned_grandchild(self) -> None:
         pid_file = self.evidence / "grandchild.pid"
         script = (

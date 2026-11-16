@@ -727,6 +727,10 @@ def run_isolated_command(
                     out_f.write(text_piece)
                     san_f.write(sanitize_terminal_text(text_piece))
                     disk_bytes_written += len(text_piece)
+                    # Flush per chunk so a live run's log is readable while it
+                    # runs; buffered writes only reach disk at completion.
+                    out_f.flush()
+                    san_f.flush()
 
             def _emit_err(text_piece: str) -> None:
                 nonlocal stderr_mem_len, disk_bytes_written
@@ -740,6 +744,8 @@ def run_isolated_command(
                     err_f.write(text_piece)
                     san_f.write(sanitize_terminal_text(text_piece))
                     disk_bytes_written += len(text_piece)
+                    err_f.flush()
+                    san_f.flush()
 
             if needs_pty:
                 pty_master_fd, slave_fd = pty.openpty()
