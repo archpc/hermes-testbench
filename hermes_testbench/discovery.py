@@ -119,6 +119,7 @@ KNOWN_ADAPTERS = frozenset(
         "re_project",
         "shell",
         "sqlite_probe",
+        "terminal_tape",
     }
 )
 
@@ -790,6 +791,40 @@ def _script_suites(root: Path, files: List[str]) -> Tuple[List[SuiteSpec], List[
     return suites, languages
 
 
+def _tape_suites(root: Path, files: List[str]) -> List[SuiteSpec]:
+    """Declarative `.tape` scripts become ``terminal_tape`` suites.
+
+    Each tape runs through the real PTY harness; goldens stay read-only during a
+    run and are never approved from inside a suite (approval requires a TTY).
+    """
+    python = _interpreter_for(root)
+    suites: List[SuiteSpec] = []
+    for rel in files:
+        if not rel.endswith(".tape"):
+            continue
+        suites.append(
+            SuiteSpec(
+                name=f"tape:{Path(rel).stem}",
+                adapter="terminal_tape",
+                profile=ProfileName.TERMINAL,
+                command=[
+                    str(python),
+                    "-m",
+                    "hermes_testbench",
+                    "tape",
+                    "run",
+                    rel,
+                    "--project-root",
+                    ".",
+                    "--json",
+                ],
+                timeout_s=180.0,
+                description=f"declarative terminal tape {rel}; PTY allocated by the tape runner",
+            )
+        )
+    return suites
+
+
 def _sqlite_suites(root: Path, files: List[str]) -> Tuple[List[SuiteSpec], bool]:
     dbs = [rel for rel in files if rel.endswith(".db") or rel.endswith(".sqlite")]
     if not dbs:
@@ -840,6 +875,10 @@ def _detect_zero_config(root: Path) -> Tuple[List[SuiteSpec], List[str]]:
     script_suites, script_languages = _script_suites(root, files)
     suites.extend(script_suites)
     languages.extend(script_languages)
+
+    tape_suites = _tape_suites(root, files)
+    if tape_suites:
+        suites.extend(tape_suites)
 
     sqlite_suites, has_sqlite = _sqlite_suites(root, files)
     if has_sqlite:
