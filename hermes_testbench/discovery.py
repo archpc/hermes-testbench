@@ -489,17 +489,35 @@ rc=0
 for src in "$@"; do
   name=$(printf '%s' "$src" | tr -c 'A-Za-z0-9._-' '_')
   bin="$TMPDIR/cobol_$name"
-  if ! cobc -O2 -debug -x -o "$bin" "$src"; then
+  log="$TMPDIR/cobol_$name.compile.log"
+  if ! cobc -O2 -debug -x -o "$bin" "$src" >"$log" 2>&1; then
     echo "TB-FAIL cobol:$src compile"
+    sed -n '1,20p' "$log" | sed 's/^/  /'
+    err=$(grep -m1 ': error: ' "$log" || true)
+    echo "  compile failed: ${err:-see compiler output above}"
     rc=1
     continue
   fi
-  if "$bin"; then
-    echo "TB-PASS cobol:$src"
-  else
-    status=$?
+  out="$TMPDIR/cobol_$name.stdout"
+  "$bin" </dev/null >"$out" 2>"$TMPDIR/cobol_$name.stderr"
+  status=$?
+  if [ "$status" -ne 0 ]; then
     echo "TB-FAIL cobol:$src rc=$status"
+    sed -n '1,10p' "$TMPDIR/cobol_$name.stderr" | sed 's/^/  /'
     rc=1
+    continue
+  fi
+  if [ -f "$src.expected" ]; then
+    if cmp -s "$src.expected" "$out"; then
+      echo "TB-PASS cobol:$src"
+    else
+      echo "TB-FAIL cobol:$src output"
+      diff -u "$src.expected" "$out" | sed -n '1,24p' | sed 's/^/  /'
+      echo "  output differs from $src.expected: expected [$(sed -n '1p' "$src.expected")] got [$(sed -n '1p' "$out")]"
+      rc=1
+    fi
+  else
+    echo "TB-PASS cobol:$src"
   fi
 done
 exit $rc
