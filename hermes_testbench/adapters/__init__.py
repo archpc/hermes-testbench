@@ -23,6 +23,7 @@ from ..schema import (
     utc_now_iso,
 )
 from . import parsers
+from .mutation import MUTATION_ADAPTERS, run_mutation_suite
 from .parsers import ADAPTER_PARSERS, ParseOutcome, parse_terminal_tape
 
 __all__ = ["execute_suite", "ADAPTER_PARSERS", "ParseOutcome", "parse_terminal_tape", "TAPE_ADAPTER"]
@@ -234,6 +235,20 @@ def execute_suite(
             )
         ]
         return result, None
+
+    # Mutation testing stages a disposable copy and enforces its own tool-availability and
+    # confinement gates, so it is dispatched before the generic prerequisite gate.
+    if suite.adapter in MUTATION_ADAPTERS:
+        return run_mutation_suite(
+            suite,
+            project_root=project_root,
+            evidence_dir=evidence_dir,
+            run_id=run_id,
+            trusted_manifest=trusted_manifest,
+            cancel_flag_path=cancel_flag_path,
+            scratch_root=scratch_root,
+            on_spawn=on_spawn,
+        )
 
     # Gate 2b: terminal tapes are local-only; a tape may never request the network.
     if suite.adapter == TAPE_ADAPTER and suite.allow_network:

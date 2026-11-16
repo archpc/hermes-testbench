@@ -38,8 +38,9 @@ class ProfileName:
     REGRESSION = "regression"
     BENCHMARK = "benchmark"
     AGENT_EVAL = "agent-eval"
+    MUTATION = "mutation"
 
-    STANDARD = (UNIT, INTEGRATION, TERMINAL, SECURITY, REGRESSION, BENCHMARK, AGENT_EVAL)
+    STANDARD = (UNIT, INTEGRATION, TERMINAL, SECURITY, REGRESSION, BENCHMARK, MUTATION, AGENT_EVAL)
 
 
 class FailureKind:
@@ -74,6 +75,11 @@ class SuiteSpec:
     description: str = ""
     warmup_runs: int = 1
     repeat_runs: int = 5
+    # Mutation testing: minimum acceptable ``caught / (caught + survived)``.
+    # A gate declared by a manifest is only honoured when that manifest is trusted;
+    # ``mutation_gate_from_cli`` marks an operator-supplied gate (always honoured).
+    mutation_score_gate: Optional[float] = None
+    mutation_gate_from_cli: bool = False
 
 
 @dataclass

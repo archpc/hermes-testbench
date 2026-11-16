@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import math
 from pathlib import Path
 import sys
 from typing import List, Optional
@@ -62,6 +63,12 @@ def build_parser() -> argparse.ArgumentParser:
     runp.add_argument("--timeout", type=float, default=None, help="Per-suite timeout override (s)")
     runp.add_argument("--allow-billable", action="store_true", help="Explicitly permit billable model-backed suites")
     runp.add_argument("--max-tokens", type=int, default=0, help="Token budget required with --allow-billable")
+    runp.add_argument(
+        "--mutation-gate",
+        type=float,
+        default=None,
+        help="Fail the run when caught/(caught+survived) falls below this fraction (mutation profile)",
+    )
     runp.add_argument("--json", action="store_true")
 
     statp = sub.add_parser("status", help="Show active and recent TestBench runs")
@@ -175,6 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
     workp.add_argument("--allow-billable", action="store_true")
     workp.add_argument("--max-tokens", type=int, default=0)
     workp.add_argument("--timeout", type=float, default=None)
+    workp.add_argument("--mutation-gate", type=float, default=None)
 
     return p
 
@@ -242,6 +250,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     home = Path(args.home).expanduser() if args.home else None
 
+    gate = getattr(args, "mutation_gate", None)
+    if gate is not None and (math.isnan(gate) or not 0.0 <= gate <= 1.0):
+        sys.stderr.write(
+            f"testbench: --mutation-gate must be a fraction between 0 and 1, got {gate:g}\n"
+        )
+        return 1
+
     if args.command == "mcp":
         from .mcp_server import serve_stdio
         with TestBenchStore(home) as store:
@@ -265,6 +280,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     allow_billable=args.allow_billable,
                     max_tokens=args.max_tokens,
                     timeout_s=args.timeout,
+                    mutation_gate=args.mutation_gate,
                 )
 
             if args.command == "flake":
@@ -333,6 +349,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         max_tokens=args.max_tokens,
                         timeout_s=args.timeout,
                         wait_up_to_s=args.wait,
+                        mutation_gate=args.mutation_gate,
                     )
                 else:
                     rec = eng.run_sync(
@@ -342,6 +359,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         allow_billable=args.allow_billable,
                         max_tokens=args.max_tokens,
                         timeout_s=args.timeout,
+                        mutation_gate=args.mutation_gate,
                     )
                 if args.json:
                     sys.stdout.write(render_run_json(rec))

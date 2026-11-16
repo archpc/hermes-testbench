@@ -112,7 +112,9 @@ KNOWN_ADAPTERS = frozenset(
         "agent_eval",
         "c_sanitizer",
         "cargo",
+        "cargo_mutants",
         "cobol",
+        "mutmut",
         "pty_tmux",
         "python_pytest",
         "python_unittest",
@@ -143,6 +145,7 @@ _MANIFEST_SUITE_FIELDS = frozenset(
         "description",
         "warmup_runs",
         "repeat_runs",
+        "mutation_score_gate",
     }
 )
 
@@ -179,6 +182,18 @@ def _as_int(value: Any, what: str, default: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{what} must be an integer, got {value!r}")
     return int(value)
+
+
+def _as_gate(value: Any, what: str) -> Optional[float]:
+    """A mutation score gate is a fraction in ``[0, 1]`` or absent."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{what} must be a number between 0 and 1, got {value!r}")
+    gate = float(value)
+    if not 0.0 <= gate <= 1.0:
+        raise ValueError(f"{what} must be between 0 and 1, got {value!r}")
+    return gate
 
 
 def _read_manifest_text(path: Path) -> bytes:
@@ -277,6 +292,9 @@ def _suite_from_manifest(
         description=description,
         warmup_runs=_as_int(entry.get("warmup_runs"), f"{where} warmup_runs", 1),
         repeat_runs=_as_int(entry.get("repeat_runs"), f"{where} repeat_runs", 5),
+        mutation_score_gate=_as_gate(
+            entry.get("mutation_score_gate"), f"{where} mutation_score_gate"
+        ),
     )
 
 
@@ -845,6 +863,68 @@ def _sqlite_suites(root: Path, files: List[str]) -> Tuple[List[SuiteSpec], bool]
     )
 
 
+def _mutation_suite_enabled(root: Path, adapter: str) -> bool:
+    """Whether the project explicitly opts into a mutation tool.
+
+    Mutation testing is expensive (minutes to hours), so it is never inferred from a plain
+    ``Cargo.toml``/``pyproject.toml``: the project must ship the tool's own configuration.
+    Binary availability is deliberately *not* consulted here — that is a run-time question,
+    and a missing tool must surface as SKIP rather than silently vanish from discovery.
+    """
+    if adapter == "cargo_mutants":
+        if not (root / "Cargo.toml").is_file():
+            return False
+        for name in ("mutants.toml", ".cargo/mutants.toml"):
+            if (root / name).is_file():
+                return True
+        try:
+            text = (root / "Cargo.toml").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        return "[package.metadata.mutants]" in text or "[workspace.metadata.mutants]" in text
+    for name, marker in (("pyproject.toml", "[tool.mutmut]"), ("setup.cfg", "[mutmut]")):
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if marker in text:
+            return True
+    return False
+
+
+def _mutation_suites(root: Path) -> List[SuiteSpec]:
+    """Mutation suites for projects that ship a supported tool configuration."""
+    suites: List[SuiteSpec] = []
+    if _mutation_suite_enabled(root, "cargo_mutants"):
+        suites.append(
+            SuiteSpec(
+                name="cargo-mutants",
+                adapter="cargo_mutants",
+                profile=ProfileName.MUTATION,
+                command=["cargo-mutants", "mutants"],
+                timeout_s=3600.0,
+                allow_repo_write=False,
+                description="cargo-mutants over a disposable staged copy (never the checkout)",
+            )
+        )
+    if _mutation_suite_enabled(root, "mutmut"):
+        suites.append(
+            SuiteSpec(
+                name="mutmut",
+                adapter="mutmut",
+                profile=ProfileName.MUTATION,
+                command=["mutmut", "run"],
+                timeout_s=3600.0,
+                allow_repo_write=False,
+                description="mutmut over a disposable staged copy (never the checkout)",
+            )
+        )
+    return suites
+
+
 def _detect_zero_config(root: Path) -> Tuple[List[SuiteSpec], List[str]]:
     """Zero-config capability discovery for repositories with no manifest."""
     suites: List[SuiteSpec] = []
@@ -884,5 +964,7 @@ def _detect_zero_config(root: Path) -> Tuple[List[SuiteSpec], List[str]]:
     if has_sqlite:
         suites.extend(sqlite_suites)
         languages.append("sqlite")
+
+    suites.extend(_mutation_suites(root))
 
     return suites, sorted(set(languages))
