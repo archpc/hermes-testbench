@@ -359,6 +359,35 @@ def _baseline_failure_record(suite_name: str, excerpt: str) -> FailureRecord:
 # --------------------------------------------------------------------------- execution
 
 
+def _relativize_suite_cwd(suite_cwd: Optional[str], project_root: Path) -> Path:
+    """Return the suite cwd as a path relative to ``project_root``.
+
+    ``TestBenchEngine.reproduce`` replays recorded suites by feeding ``SuiteResult.cwd``
+    straight back into a new ``SuiteSpec``, and that recorded value is absolute (it is
+    ``str(project_root)`` for a mutation suite). Joining an absolute path onto
+    ``stage_dir`` discards the stage entirely, so a recorded, trustworthy cwd inside the
+    project must be rewritten as a relative path (``cwd == str(project_root)`` -> ``.``).
+
+    Only a path that is lexically inside ``project_root``, is not itself a symlink, and
+    whose resolved form stays inside the resolved project root is rewritten. Everything
+    else is returned untouched so the containment check below rejects it and nothing is
+    spawned.
+    """
+    rel = Path(suite_cwd or ".")
+    if not rel.is_absolute():
+        return rel
+    try:
+        lexical = rel.relative_to(project_root)
+    except ValueError:
+        return rel
+    real_root = Path(os.path.realpath(project_root))
+    if rel.is_symlink() or not Path(os.path.realpath(rel)).is_relative_to(real_root):
+        return rel
+    if not rel.resolve().is_relative_to(project_root.resolve()):
+        return rel
+    return lexical
+
+
 def run_mutation_suite(
     suite: SuiteSpec,
     *,
@@ -374,7 +403,7 @@ def run_mutation_suite(
     adapter = suite.adapter
     project_root = Path(project_root).resolve()
     evidence_dir = Path(evidence_dir)
-    relative_cwd = Path(suite.cwd or ".")
+    relative_cwd = _relativize_suite_cwd(suite.cwd, project_root)
     cwd = (project_root / relative_cwd).resolve()
     repro = (
         f"cd {cwd} && testbench run {project_root} --profile mutation "

@@ -268,6 +268,59 @@ class RealToolEndToEndTests(_MutationTestCase):
 
     @unittest.skipUnless(MUTMUT_BIN.is_file(), "mutmut binary unavailable")
     @unittest.skipUnless(can_apply_seatbelt(), "macOS sandbox-exec unavailable")
+    def test_reproduce_of_mutation_run_succeeds_and_keeps_checkout_clean(self) -> None:
+        """``testbench reproduce`` must replay a mutation suite through the engine.
+
+        A ``RunRecord`` stores ``SuiteResult.cwd`` as an absolute path (the project root).
+        Replaying that value verbatim used to feed it into the staged-copy containment
+        check, where an absolute path silently escapes ``stage_dir`` and the reproduce run
+        errored out with "suite cwd escapes the staged copy".
+        """
+        from hermes_testbench.engine import TestBenchEngine
+        from hermes_testbench.store import TestBenchStore
+
+        project = self.root / "pymutrepro"
+        _write_mutmut_project(project)
+        home = self.root / "home"
+
+        with mock.patch.dict(os.environ, _tool_env(), clear=False):
+            store = TestBenchStore(home)
+            try:
+                engine = TestBenchEngine(store)
+                run = engine.run_sync(project, profile="mutation")
+                self.assertEqual(run.status, RunStatus.PASS, run.first_failure)
+                self.assertEqual([s.adapter for s in run.suites], ["mutmut"])
+                first = run.suites[0].metrics["mutation"]
+                self.assertGreaterEqual(first["caught"], 1, first)
+                self.assertGreaterEqual(first["survived"], 1, first)
+                self.assertEqual(
+                    run.suites[0].cwd, str(project.resolve()), "recorded cwd is absolute"
+                )
+
+                reproduced = engine.reproduce(run.run_id)
+            finally:
+                store.close()
+
+        self.assertNotEqual(reproduced["repro_run_id"], run.run_id)
+        self.assertEqual(
+            reproduced["status"],
+            RunStatus.PASS,
+            reproduced.get("first_failure") or reproduced,
+        )
+        with TestBenchStore(home) as store:
+            repro_run = store.get_run(reproduced["repro_run_id"])
+        assert repro_run is not None
+        self.assertEqual(repro_run.profile, "repro:mutation")
+        self.assertEqual([s.adapter for s in repro_run.suites], ["mutmut"])
+        metrics = repro_run.suites[0].metrics["mutation"]
+        self.assertGreaterEqual(metrics["caught"], 1, metrics)
+        self.assertGreaterEqual(metrics["survived"], 1, metrics)
+        self.assertEqual(repro_run.pass_count, metrics["caught"])
+        self.assertEqual(repro_run.fail_count, metrics["survived"])
+        self._assert_checkout_pristine(project)
+
+    @unittest.skipUnless(MUTMUT_BIN.is_file(), "mutmut binary unavailable")
+    @unittest.skipUnless(can_apply_seatbelt(), "macOS sandbox-exec unavailable")
     def test_cli_mutation_gate_fails_when_a_survivor_lowers_the_score(self) -> None:
         project = self.root / "pygate"
         _write_mutmut_project(project)
