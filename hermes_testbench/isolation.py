@@ -38,6 +38,18 @@ _SCRUB_EXACT = frozenset(
         "SSH_AGENT_PID",
         "GPG_AGENT_INFO",
         "SECURITYSESSIONID",
+        # Shell startup/config leakage: a suite must not inherit the caller's rc
+        # plumbing, option bundles, or directory-walk behaviour. ``HOME`` is
+        # already a disposable overlay, but ZDOTDIR/BASH_ENV/ENV can point past
+        # it at the real configuration, and inherited SHELLOPTS can hand
+        # ``errexit``/``noclobber`` to a script that never asked for them.
+        "ZDOTDIR",
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "CDPATH",
+        "GLOBIGNORE",
     }
 )
 

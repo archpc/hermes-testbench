@@ -120,10 +120,25 @@ KNOWN_ADAPTERS = frozenset(
         "python_unittest",
         "re_project",
         "shell",
+        "shell_test",
         "sqlite_probe",
         "terminal_tape",
     }
 )
+
+# ``shell_test`` is an explicit, declared-file runner: one suite spec per
+# declared script, executed under a pinned interpreter with rc files disabled.
+# Discovery never guesses which files are tests from their names.
+_SHELL_TEST_ADAPTER = "shell_test"
+_SHELL_TEST_FIELDS = frozenset({"files", "shell", "interpreter"})
+
+# bash needs ``--noprofile --norc``; note that ``--norc`` does NOT stop
+# ``$BASH_ENV``, which is why the isolation layer scrubs BASH_ENV/ENV/ZDOTDIR.
+_SHELL_RC_FLAGS: Dict[str, Tuple[str, ...]] = {
+    "bash": ("--noprofile", "--norc"),
+    "zsh": ("-f",),
+    "sh": (),
+}
 
 _MANIFEST_SUITE_FIELDS = frozenset(
     {
@@ -140,8 +155,11 @@ _MANIFEST_SUITE_FIELDS = frozenset(
         "billable",
         "custom_from_manifest",
         "env_overrides",
+        "files",
+        "interpreter",
         "required_paths",
         "required_binaries",
+        "shell",
         "description",
         "warmup_runs",
         "repeat_runs",
@@ -247,6 +265,15 @@ def _suite_from_manifest(
         raise ValueError(
             f"{where} profile {profile!r} is not one of: {', '.join(ProfileName.STANDARD)}"
         )
+    if adapter != _SHELL_TEST_ADAPTER:
+        # Reject rather than silently ignore: a manifest that declares files for
+        # an adapter that never reads them is a config bug, not a no-op.
+        stray = sorted(_SHELL_TEST_FIELDS & set(entry))
+        if stray:
+            raise ValueError(
+                f"{where} keys {', '.join(stray)} are only valid with adapter "
+                f"{_SHELL_TEST_ADAPTER!r}, not {adapter!r}"
+            )
 
     env_raw = entry.get("env_overrides")
     if env_raw is None:
@@ -298,6 +325,69 @@ def _suite_from_manifest(
     )
 
 
+def _shell_test_suites(
+    entry: Dict[str, Any], idx: int, *, custom_from_manifest: bool, manifest: Path
+) -> List[SuiteSpec]:
+    """Expand one declared ``shell_test`` suite into one spec per declared file.
+
+    One script per suite keeps exit status, markers, evidence and repro
+    commands per file instead of inventing an aggregate. The interpreter is
+    pinned to an absolute path at discovery so a repro cannot pick a different
+    bash/zsh off PATH, and rc files are disabled by construction.
+    """
+    where = f"manifest {manifest} suite[{idx}]"
+    files = _as_str_list(entry.get("files"), f"{where} files")
+    if not files:
+        raise ValueError(f"{where} adapter 'shell_test' requires a non-empty 'files' list")
+    if entry.get("command"):
+        raise ValueError(f"{where} adapter 'shell_test' takes 'files', not an explicit 'command'")
+
+    shell = entry.get("shell", "bash")
+    if not isinstance(shell, str) or shell not in _SHELL_RC_FLAGS:
+        raise ValueError(
+            f"{where} shell must be one of: {', '.join(sorted(_SHELL_RC_FLAGS))}, got {shell!r}"
+        )
+    flags = list(_SHELL_RC_FLAGS[shell])
+
+    interpreter = entry.get("interpreter", "")
+    if interpreter:
+        if not isinstance(interpreter, str):
+            raise ValueError(f"{where} interpreter must be a string")
+        if not Path(interpreter).expanduser().is_absolute():
+            raise ValueError(f"{where} interpreter must be an absolute path, got {interpreter!r}")
+        resolved = str(Path(interpreter).expanduser())
+    else:
+        # Pinned now, not at run time: PATH order may differ later.
+        resolved = shutil.which(shell) or ""
+
+    suites: List[SuiteSpec] = []
+    for rel in files:
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise ValueError(f"{where} files entries must be repo-relative paths, got {rel!r}")
+        per_file = {k: v for k, v in entry.items() if k not in _SHELL_TEST_FIELDS and k != "command"}
+        per_file["name"] = f"{entry['name']}:{rel}"
+        per_file["command"] = [resolved or shell, *flags, rel]
+        per_file["required_paths"] = [rel]
+        # Pinned interpreter (or the bare name when PATH had nothing): a missing
+        # one is a SKIP with a named reason, never a phantom PASS or a discovery
+        # crash on a machine that simply lacks this shell.
+        per_file["required_binaries"] = [
+            *(entry.get("required_binaries") or []),
+            resolved or shell,
+        ]
+        per_file.setdefault(
+            "description",
+            f"{shell} via {resolved or '(not found on PATH)'} {' '.join(flags)}".strip(),
+        )
+        suites.append(
+            _suite_from_manifest(
+                per_file, idx, custom_from_manifest=custom_from_manifest, manifest=manifest
+            )
+        )
+    return suites
+
+
 def _suites_from_manifest(
     data: Dict[str, Any], *, custom_from_manifest: bool, manifest: Path
 ) -> List[SuiteSpec]:
@@ -308,10 +398,22 @@ def _suites_from_manifest(
         entries = [entries]
     if not isinstance(entries, list):
         raise ValueError(f"manifest {manifest} 'suite' must be an array of tables")
-    suites = [
-        _suite_from_manifest(entry, idx, custom_from_manifest=custom_from_manifest, manifest=manifest)
-        for idx, entry in enumerate(entries)
-    ]
+    suites: List[SuiteSpec] = []
+    for idx, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"manifest {manifest} suite[{idx}] must be a table")
+        if entry.get("adapter") == _SHELL_TEST_ADAPTER:
+            suites.extend(
+                _shell_test_suites(
+                    entry, idx, custom_from_manifest=custom_from_manifest, manifest=manifest
+                )
+            )
+        else:
+            suites.append(
+                _suite_from_manifest(
+                    entry, idx, custom_from_manifest=custom_from_manifest, manifest=manifest
+                )
+            )
     seen: set[str] = set()
     for suite in suites:
         if suite.name in seen:

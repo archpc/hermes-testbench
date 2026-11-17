@@ -55,7 +55,19 @@ testbench bench run [path] --name WORKLOAD [--warmup 1] [--repeats 5] -- <cmd...
 testbench bench compare <baseline_run_id> <candidate_run_id> [--json]
 testbench messaging-verify [--json]
 testbench trust [path]
+testbench completion bash|zsh          # static completions from the live CLI tree
 hermes-tmux testbench
+```
+
+Shell test suites are declared, never filename-guessed:
+
+```toml
+[[suite]]
+name = "shell-unit"
+adapter = "shell_test"
+profile = "unit"
+shell = "bash"                  # bash | zsh | sh; interpreter pinned absolutely
+files = ["tests/one_test.sh"]   # one suite spec per declared file
 ```
 
 ## Procedure
