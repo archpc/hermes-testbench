@@ -174,6 +174,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("mcp", help="Run local stdio MCP server")
 
+    comp = sub.add_parser("completion", help="Print bash/zsh completion script (opt-in install)")
+    comp.add_argument("shell", choices=["bash", "zsh"])
+
     workp = sub.add_parser("_worker", help=argparse.SUPPRESS)
     workp.add_argument("--run-id", required=True)
     workp.add_argument("--project-root", required=True)
@@ -247,6 +250,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.command:
         parser.print_help()
         return 2
+
+    if args.command == "completion":
+        # Pure text generation: no store, no home, no side effects.
+        from .shell_completion import render
+
+        sys.stdout.write(render(args.shell))
+        return 0
 
     home = Path(args.home).expanduser() if args.home else None
 

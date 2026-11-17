@@ -997,6 +997,7 @@ ADAPTER_PARSERS = {
     "python_unittest": parse_python_unittest,
     "re_project": parse_re_project,
     "shell": parse_shell,
+    "shell_test": parse_shell,
     "sqlite_probe": parse_sqlite_probe,
     "terminal_tape": parse_terminal_tape,
 }

@@ -53,7 +53,56 @@ testbench messaging-verify
 
 # Focus (or open) permanent hx:testbench TUI inside hermes-tmux
 hermes-tmux testbench
+
+# Shell completion and shell test suites (see "Shells" below)
+testbench completion zsh > "${fpath[1]}/_testbench"
+testbench completion bash > ~/.local/share/bash-completion/completions/testbench
 ```
+
+## Shells
+
+**Shell test suites.** `adapter = "shell_test"` runs exactly the files a manifest
+declares, one suite spec per file, under an interpreter pinned to an absolute
+path at discovery with rc files disabled (`bash --noprofile --norc`, `zsh -f`).
+Nothing is discovered from filenames. Counting uses the existing `shell`
+adapter's contract: `TB-PASS:<case>` / `TB-FAIL:<case> [detail]` / `SKIP:<case>`
+lines give per-case results, and a script with no markers reports one case from
+its exit status. A declared file or interpreter that is missing yields `SKIP`
+with a named reason, never a fabricated pass.
+
+```toml
+[[suite]]
+name = "shell-unit"
+adapter = "shell_test"
+shell = "bash"                     # bash | zsh | sh
+files = ["tests/one_test.sh", "tests/two_test.sh"]
+# interpreter = "/opt/homebrew/bin/bash"   # optional absolute pin
+```
+
+`profile` defaults to `unit`; set it explicitly to file the same scripts under a
+different profile. Suite names are the declared name plus `:<path>`, one spec
+per file.
+
+Suites run with `ZDOTDIR`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `CDPATH`,
+and `GLOBIGNORE` stripped, because bash sources `$BASH_ENV` even under
+`--norc`. Which shell version runs is decided by the pinned path: macOS
+`/bin/bash` is 3.2, so a suite needing bash 4+ features fails visibly instead of
+silently running elsewhere.
+
+**Completion.** Generated from the live argparse tree, so new subcommands and
+flags appear without a separate list. Opt-in, never written into your dotfiles:
+
+```sh
+# zsh (file goes in an fpath directory; #compdef registers it)
+testbench completion zsh > "${fpath[1]}/_testbench"
+
+# bash (loaded by bash-completion from this directory)
+testbench completion bash > ~/.local/share/bash-completion/completions/testbench
+```
+
+Both target the macOS system shells (bash 3.2.57, zsh 5.9). Command names,
+options, profile names (from the schema), `--format` values and directory
+arguments complete; run IDs deliberately do not.
 
 ## Architecture
 
