@@ -283,6 +283,18 @@ def _fmt_duration(ms: Optional[float]) -> str:
     return f"{ms / 1000.0:.2f}s"
 
 
+def _fmt_timestamp(value: Optional[str]) -> str:
+    if not value:
+        return UNSET
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if stamp.tzinfo is not None:
+            return stamp.astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+    except (ValueError, OverflowError, OSError):
+        pass
+    return UNSET
+
+
 def _parse_iso(value: Optional[str]) -> Optional[float]:
     if not value:
         return None
@@ -656,6 +668,8 @@ def _inspector_lines(state: TuiState, pal: Palette, run: Optional[RunRecord], ma
         + (f" err={run.error_count}" if run.error_count else "")
         + f" skip={run.skip_count}",
         _paint(pal, pal.dim(), "duration ") + _fmt_duration(run.duration_ms),
+        _paint(pal, pal.dim(), "started  ") + _fmt_timestamp(run.started_at),
+        _paint(pal, pal.dim(), "ended    ") + _fmt_timestamp(run.finished_at),
     ]
     lines.extend(_wrap_field(pal, "failure", run.first_failure or UNSET, max_width))
     lines.extend(_wrap_field(pal, "repro", tb_repro, max_width))
@@ -684,6 +698,8 @@ def _detail_lines(state: TuiState, pal: Palette) -> List[str]:
         + _paint(pal, _status_style(pal, run.status), _STATUS_WORD.get(run.status, run.status)),
         _paint(pal, pal.dim(), "counts   ") + _counts_detail(run),
         _paint(pal, pal.dim(), "duration ") + _fmt_duration(run.duration_ms),
+        _paint(pal, pal.dim(), "started  ") + _fmt_timestamp(run.started_at),
+        _paint(pal, pal.dim(), "ended    ") + _fmt_timestamp(run.finished_at),
         _paint(pal, pal.dim(), "failure  ") + _clean(run.first_failure or UNSET),
         _paint(pal, pal.dim(), "repro    ") + _clean(_repro_for(run) or UNSET),
         _paint(pal, pal.dim(), "evidence ") + _clean(run.evidence_dir or UNSET),

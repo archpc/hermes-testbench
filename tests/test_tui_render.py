@@ -6,6 +6,7 @@ import re
 import tempfile
 import unittest
 from dataclasses import replace as dc_replace
+from datetime import datetime
 from pathlib import Path
 
 from hermes_testbench.schema import ProjectSpec, RunRecord, RunStatus, SuiteResult
@@ -218,9 +219,9 @@ class FrameGeometryTests(unittest.TestCase):
         self.assertIn("tb_20261114_164000_failed01", body)
         self.assertIn("/runs/tb_20261114_164000_failed01", body)  # evidence dir
         self.assertIn("python3.14 -m unittest tests.test_bad", body)
-        # The inspector occupies the right half of the split.
+        # At 140 cells, the 68-cell list and 2-cell gutter precede the inspector.
         for line in lines[1:10]:
-            right = _strip(line)[80:]
+            right = _strip(line)[70:]
             self.assertEqual(display_width(line), 140)
             self.assertTrue(right.strip())
 
@@ -236,6 +237,29 @@ class FrameGeometryTests(unittest.TestCase):
 
 
 class FrameContentTests(unittest.TestCase):
+    def test_run_timestamps_appear_in_split_and_detail_views(self) -> None:
+        run = make_run(started_at="2026-11-14T23:59:58.123Z", finished_at="2026-11-15T02:00:02+02:00")
+        started = datetime.fromisoformat("2026-11-14T23:59:58+00:00").astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+        ended = datetime.fromisoformat("2026-11-15T00:00:02+00:00").astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+        for width, opened in ((140, False), (80, True)):
+            with self.subTest(width=width):
+                state = sample_state(runs=(run,), detail_open=opened)
+                view = _strip("\n".join(render_frame(state, width, 24)))
+                self.assertRegex(view, r"started\s+" + re.escape(started))
+                self.assertRegex(view, r"ended\s+" + re.escape(ended))
+
+    def test_run_timestamps_do_not_invent_start_or_end_times(self) -> None:
+        for run in (make_run(status=RunStatus.QUEUED),
+                    make_run(status=RunStatus.RUNNING, started_at="2026-11-14T17:00:00Z"),
+                    make_run(status=RunStatus.ERROR, started_at="invalid", finished_at="invalid")):
+            with self.subTest(status=run.status):
+                view = _strip("\n".join(render_frame(sample_state(runs=(run,)), 140, 24)))
+                self.assertRegex(view, r"ended\s+-")
+                if run.status == RunStatus.RUNNING:
+                    self.assertRegex(view, r"started\s+\d{4}-\d{2}-\d{2}")
+                else:
+                    self.assertRegex(view, r"started\s+-")
+
     def test_overview_puts_active_runs_first_then_failures(self) -> None:
         text = _strip("\n".join(render_frame(sample_state(), 140, 36)))
         self.assertIn("RUN ", text)
