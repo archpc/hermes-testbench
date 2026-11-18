@@ -29,6 +29,7 @@ PERMANENT_TAB_QUIT_HINT = "press Q (shift-q) to quit TUI, or switch tmux windows
 BILLABLE_REFUSAL = "billable LLM profile blocked in TUI; use CLI --allow-billable"
 
 VIEWS = ("overview", "history", "projects", "benchmarks")
+_HISTORY_ORDERS = ("newest", "failures first", "longest")
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,7 @@ class TuiState:
     log_lines: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
 
     view: str = "overview"
+    history_order: str = _HISTORY_ORDERS[0]
     selected: int = 0
     project_filter: str = ""
     search_query: str = ""
@@ -363,7 +365,27 @@ def _overview_runs(state: TuiState) -> List[RunRecord]:
 
 def _history_runs(state: TuiState) -> List[RunRecord]:
     indexed = [(idx, r) for idx, r in enumerate(state.runs) if _project_ok(state, r.project) and _query_ok(state, r)]
-    return [r for _idx, r in sorted(indexed, key=lambda item: (_run_sort_ts(item[1]), -item[0]), reverse=True)]
+    runs = [r for _idx, r in sorted(indexed, key=lambda item: (_run_sort_ts(item[1]), -item[0]), reverse=True)]
+    # Stable sorts preserve newest-first order within equal keys.
+    if state.history_order == "failures first":
+        runs.sort(key=lambda r: r.status not in _FAILURE_STATUSES)
+    elif state.history_order == "longest":
+        runs.sort(key=lambda r: -r.duration_ms if r.duration_ms is not None else float("inf"))
+    return runs
+
+
+def preserve_history_selection(previous: TuiState, current: TuiState) -> TuiState:
+    """Keep the same run selected when sorting or refreshing History."""
+    if previous.view != "history" or current.view != "history":
+        return current
+    old_runs = _history_runs(previous)
+    if not old_runs:
+        return current
+    selected_id = old_runs[_clamped_index(previous, old_runs)].run_id
+    for index, run in enumerate(_history_runs(current)):
+        if run.run_id == selected_id:
+            return replace(current, selected=index)
+    return current
 
 
 def _project_list(state: TuiState) -> List[Any]:
@@ -592,11 +614,16 @@ def _bench_row(pal: Palette, bench: BenchmarkRow, selected: bool, marks: Dict[st
     return fit_cells(content, width) + pal.reset()
 
 
-def _list_rows(state: TuiState, pal: Palette, width: int, marks: Dict[str, str]) -> List[str]:
+def _list_rows(state: TuiState, pal: Palette, width: int, marks: Dict[str, str], max_rows: int) -> List[str]:
     items = _view_items(state)
     index = _clamped_index(state, items)
+    start = 0
+    if state.view == "history" and 0 < max_rows < len(items):
+        # Page around the selection so sorting or jumping cannot strand the cursor offscreen.
+        start = min(index // max_rows * max_rows, len(items) - max_rows)
+        items = items[start : start + max_rows]
     rows: List[str] = []
-    for position, item in enumerate(items):
+    for position, item in enumerate(items, start=start):
         selected = position == index
         if state.view == "projects":
             rows.append(_project_row(state, pal, item, selected, marks, width))
@@ -725,6 +752,7 @@ def _help_lines(pal: Palette) -> List[str]:
         ("g / G", "first / last"),
         ("Enter", "inspect selected run (never executes)"),
         ("Tab / 1-4", "overview, history, projects, benchmarks"),
+        ("s", "sort History: newest, failures first, longest"),
         ("p", "project filter picker"),
         ("/", "search and filter runs"),
         ("r", "run a profile (y confirms)"),
@@ -791,6 +819,8 @@ def _header_line(state: TuiState, pal: Palette, width: int, marks: Dict[str, str
         + _paint(pal, pal.dim(), sep)
         + _paint(pal, pal.blue(), _clean(state.view))
     )
+    if state.view == "history":
+        left += _paint(pal, pal.dim(), sep) + _paint(pal, pal.dim(), state.history_order)
     scope_runs = _overview_runs(state) if state.view == "overview" else _history_runs(state)
     running = sum(1 for r in state.runs if r.status == RunStatus.RUNNING)
     queued = sum(1 for r in state.runs if r.status == RunStatus.QUEUED)
@@ -976,6 +1006,10 @@ def handle_key(state: TuiState, key: str) -> Tuple[TuiState, Optional[TuiAction]
         return replace(base, view=_next_view(state.view), selected=0, detail_scroll=0), None
     if key in ("1", "2", "3", "4"):
         return replace(base, view=VIEWS[int(key) - 1], selected=0, detail_scroll=0), None
+    if key == "s" and state.view == "history":
+        index = _HISTORY_ORDERS.index(state.history_order)
+        order = _HISTORY_ORDERS[(index + 1) % len(_HISTORY_ORDERS)]
+        return preserve_history_selection(state, replace(base, history_order=order)), None
     if key in _DOWN_KEYS:
         return replace(base, selected=min(last, state.selected + 1)), None
     if key in _UP_KEYS:
@@ -1086,7 +1120,7 @@ def render_frame(
     elif width >= 120:
         left_w = max(30, min(68, width // 2 - 2))
         right_w = max(10, width - left_w - 2)
-        left_rows = _list_rows(state, pal, left_w, marks)
+        left_rows = _list_rows(state, pal, left_w, marks, remaining)
         if not left_rows:
             left_rows = [_paint(pal, pal.dim(), _empty_message(state, marks))]
         right_rows = _inspector_lines(state, pal, _selected_run(state), max_width=right_w)
@@ -1097,7 +1131,7 @@ def render_frame(
             split.append(_split_line(left, right, pal, left_w, right_w))
         body.extend(split)
     else:
-        rows = _list_rows(state, pal, width, marks)
+        rows = _list_rows(state, pal, width, marks, remaining)
         if not rows:
             rows = [_paint(pal, pal.dim(), _empty_message(state, marks))]
         sel_run = _selected_run(state)
@@ -1113,6 +1147,8 @@ def render_frame(
 
     compact_hints = "j/k move  Enter inspect  Tab view  p proj  r run  R rerun  x cancel  ? help"
     hints_str = HINTS_LINE if width >= len(HINTS_LINE) + 2 else compact_hints
+    if state.view == "history":
+        hints_str = hints_str.replace("Tab view", "Tab view  s sort", 1)
     lines.append(fit_cells(" " + hints_str, width) + "\033[0m")
     lines.append(_minibuffer_line(state, pal, width))
     return lines

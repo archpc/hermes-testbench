@@ -72,6 +72,7 @@ Security gates enforced before process spawn:
   - `j` / `k` / `Up` / `Down`, `g` / `G`: navigate rows (or scroll detail logs when detail sheet is open).
   - `Tab` or `1`..`4`: switch view (`overview`, `history`, `projects`, `benchmarks`).
   - `Enter`: open/close full-screen log & evidence inspector (`< 120` cols; `>= 120` cols shows live 2-column split). `Enter` never confirms execution or cancellation.
+  - `s`: cycle History through newest, failures first, and longest duration. Each order retains all runs in the current filter; the selected run stays selected.
   - `p`: filter by project; `/`: text filter; `y`: copy reproduction command to tmux buffer / clipboard.
   - `r`: select profile to run; `R`: rerun selected run; `x`: cancel selected TestBench-owned active run (each requires explicit `y` in minibuffer).
   - `q`: close active overlay; at top level in permanent-tab mode, `Q` (`Shift-Q`) exits TUI so muscle-memory `q` does not kill the permanent pane.
