@@ -6,10 +6,12 @@ import re
 import tempfile
 import unittest
 from dataclasses import replace as dc_replace
+from datetime import datetime
 from pathlib import Path
 
-from hermes_testbench.schema import ProjectSpec, RunRecord, RunStatus
-from hermes_testbench.tui import _refresh_active_logs
+from hermes_testbench.schema import ProjectSpec, RunRecord, RunStatus, SuiteResult
+from hermes_testbench.store import TestBenchStore
+from hermes_testbench.tui import _refresh_active_logs, _refresh_from_store
 from hermes_testbench.tui_render import (
     BILLABLE_REFUSAL,
     PERMANENT_TAB_QUIT_HINT,
@@ -217,9 +219,9 @@ class FrameGeometryTests(unittest.TestCase):
         self.assertIn("tb_20261114_164000_failed01", body)
         self.assertIn("/runs/tb_20261114_164000_failed01", body)  # evidence dir
         self.assertIn("python3.14 -m unittest tests.test_bad", body)
-        # The inspector occupies the right half of the split.
+        # At 140 cells, the 68-cell list and 2-cell gutter precede the inspector.
         for line in lines[1:10]:
-            right = _strip(line)[80:]
+            right = _strip(line)[70:]
             self.assertEqual(display_width(line), 140)
             self.assertTrue(right.strip())
 
@@ -235,6 +237,29 @@ class FrameGeometryTests(unittest.TestCase):
 
 
 class FrameContentTests(unittest.TestCase):
+    def test_run_timestamps_appear_in_split_and_detail_views(self) -> None:
+        run = make_run(started_at="2026-11-14T23:59:58.123Z", finished_at="2026-11-15T02:00:02+02:00")
+        started = datetime.fromisoformat("2026-11-14T23:59:58+00:00").astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+        ended = datetime.fromisoformat("2026-11-15T00:00:02+00:00").astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+        for width, opened in ((140, False), (80, True)):
+            with self.subTest(width=width):
+                state = sample_state(runs=(run,), detail_open=opened)
+                view = _strip("\n".join(render_frame(state, width, 24)))
+                self.assertRegex(view, r"started\s+" + re.escape(started))
+                self.assertRegex(view, r"ended\s+" + re.escape(ended))
+
+    def test_run_timestamps_do_not_invent_start_or_end_times(self) -> None:
+        for run in (make_run(status=RunStatus.QUEUED),
+                    make_run(status=RunStatus.RUNNING, started_at="2026-11-14T17:00:00Z"),
+                    make_run(status=RunStatus.ERROR, started_at="invalid", finished_at="invalid")):
+            with self.subTest(status=run.status):
+                view = _strip("\n".join(render_frame(sample_state(runs=(run,)), 140, 24)))
+                self.assertRegex(view, r"ended\s+-")
+                if run.status == RunStatus.RUNNING:
+                    self.assertRegex(view, r"started\s+\d{4}-\d{2}-\d{2}")
+                else:
+                    self.assertRegex(view, r"started\s+-")
+
     def test_overview_puts_active_runs_first_then_failures(self) -> None:
         text = _strip("\n".join(render_frame(sample_state(), 140, 36)))
         self.assertIn("RUN ", text)
@@ -693,6 +718,37 @@ class LiveRunObservabilityTests(unittest.TestCase):
         self.assertNotIn("pending", text)
         detail = _strip("\n".join(render_frame(dc_replace(state, detail_open=True), 80, 24)))
         self.assertIn("ran 373 tests", detail)
+
+    def test_inspector_prefers_failure_log_in_multi_suite_run(self) -> None:
+        scratch = Path.home() / ".hermes/cache/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch, prefix="tb-log-") as tmp:
+            root = Path(tmp)
+            good_log = root / "good.sanitized.log"
+            bad_log = root / "bad.sanitized.log"
+            good_log.write_text("passing suite output\n", encoding="utf-8")
+            bad_log.write_text("failing suite traceback\n", encoding="utf-8")
+            good = SuiteResult("good", "shell", "unit", ["true"], tmp, RunStatus.PASS,
+                               sanitized_path=str(good_log))
+            bad = dc_replace(good, name="bad", command=["false"], status=RunStatus.FAIL,
+                             sanitized_path=str(bad_log))
+            store = TestBenchStore(root / "store")
+            self.addCleanup(store.close)
+            passed = make_run("tb_20261114_170000_aaaa1111", status=RunStatus.PASS, suites=[good])
+            failed = make_run("tb_20261114_170100_bbbb2222", status=RunStatus.FAIL, suites=[good, bad])
+            store.finalize_run(passed)
+            store.finalize_run(failed)
+            state = _refresh_from_store(store, TuiState(detail_open=True))
+            self.assertEqual(state.log_lines[passed.run_id], ("passing suite output",))
+            detail = _strip("\n".join(render_frame(state, 80, 24)))
+            self.assertIn("failing suite traceback", detail)
+            self.assertNotIn("passing suite output", detail)
+
+            bad_log.unlink()
+            state = _refresh_from_store(store, state)
+            detail = _strip("\n".join(render_frame(state, 80, 24)))
+            self.assertIn("Failure log unavailable", detail)
+            self.assertNotIn("passing suite output", detail)
 
     def test_live_tail_is_reread_while_the_store_is_unchanged(self) -> None:
         scratch = Path.home() / ".hermes/cache/scratch"

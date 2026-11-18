@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import selectors
 import subprocess
 import sys
 import tempfile
@@ -97,6 +98,40 @@ class EngineAndCliTests(unittest.TestCase):
 
             repro_cmd = eng.reproduce(run.run_id, print_only=True)
             self.assertIn("run_unit.py", repro_cmd["repro_command"])
+
+    def test_explicit_missing_suite_does_not_exit_success(self) -> None:
+        proc = subprocess.run([PY, "-m", "hermes_testbench", "--home", str(self.tb_home),
+                               "run", str(self.proj), "--suite", "not-a-suite", "--json"],
+                              cwd=REPO_ROOT, capture_output=True, text=True, timeout=10)
+        self.assertEqual(json.loads(proc.stdout)["status"], RunStatus.SKIP)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_foreground_stream_shows_sanitized_output_before_suite_finishes(self) -> None:
+        (self.proj / ".testbench.toml").write_text(
+            '[[suite]]\nname = "stream"\nadapter = "shell"\nprofile = "unit"\n'
+            f'command = [{json.dumps(PY)}, "run_unit.py"]\ntimeout_s = 15\n', encoding="utf-8")
+        (self.proj / "run_unit.py").write_text(
+            'import sys, time\n'
+            'print("LIVE-BEFORE-EXIT " + "x" * 400, flush=True)\n'
+            'time.sleep(2)\nprint("TB-PASS done", flush=True)\n', encoding="utf-8")
+        argv = [PY, "-m", "hermes_testbench", "--home", str(self.tb_home),
+                "run", str(self.proj), "--suite", "stream", "--stream"]
+        with subprocess.Popen(argv, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as proc:
+            try:
+                assert proc.stdout is not None
+                with selectors.DefaultSelector() as ready:
+                    ready.register(proc.stdout, selectors.EVENT_READ)
+                    self.assertTrue(ready.select(10), "no streaming output")
+                    first = os.read(proc.stdout.fileno(), 8192)
+                self.assertIn(b"LIVE-BEFORE-EXIT", first)
+                self.assertIsNone(proc.poll(), "output appeared only after the suite finished")
+                rest, _ = proc.communicate(timeout=15)
+                self.assertIn(b"TB-PASS done", first + rest)
+                self.assertEqual(proc.returncode, 0)
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=15)
 
     def test_async_worker_survives_caller_return_and_explicit_cancel_terminates_owned_job(self) -> None:
         # Write a real slow script so CLI detached _worker can run without custom python callbacks

@@ -273,6 +273,7 @@ def _fallback_execute_suite(
     max_tokens: int = 0,
     cancel_flag_path: Optional[Path] = None,
     on_spawn: Optional[Any] = None,
+    on_output: Optional[Callable[[str], None]] = None,
 ) -> Tuple[SuiteResult, Optional[Dict[str, Any]]]:
     try:
         from .adapters import execute_suite  # type: ignore
@@ -286,6 +287,7 @@ def _fallback_execute_suite(
             max_tokens=max_tokens,
             cancel_flag_path=cancel_flag_path,
             on_spawn=on_spawn,
+            on_output=on_output,
         )
     except ImportError:
         pass
@@ -343,6 +345,7 @@ def _fallback_execute_suite(
         allow_repo_write=suite.allow_repo_write,
         env_overrides=suite.env_overrides,
         cancel_flag_path=cancel_flag_path,
+        on_output=on_output,
     )
     finished = utc_now_iso()
     if res.cancelled:
@@ -630,6 +633,7 @@ class TestBenchEngine:
         delegation_id: Optional[str] = None,
         mutation_gate: Optional[float] = None,
         env_meta: Optional[Dict[str, Any]] = None,
+        on_output: Optional[Callable[[str], None]] = None,
     ) -> RunRecord:
         resolved = self.resolve_target(target, enforce_scope=enforce_scope)
         spec = self._discover_fn(resolved, store=self.store)
@@ -702,6 +706,7 @@ class TestBenchEngine:
                             max_tokens=max_tokens,
                             cancel_flag_path=cancel_flag,
                             on_spawn=_record_child_spawn,
+                            **({"on_output": on_output} if on_output is not None else {}),
                         )
                     except TypeError:
                         # Custom injected _execute_suite_fn in unit tests without on_spawn kwarg

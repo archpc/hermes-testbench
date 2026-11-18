@@ -70,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail the run when caught/(caught+survived) falls below this fraction (mutation profile)",
     )
     runp.add_argument("--json", action="store_true")
+    runp.add_argument("--stream", action="store_true", help="Show sanitized output during a foreground run")
 
     statp = sub.add_parser("status", help="Show active and recent TestBench runs")
     statp.add_argument("run_id", nargs="?", default="")
@@ -350,6 +351,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 0
 
             if args.command == "run":
+                if args.stream and (args.async_run or args.json):
+                    parser.error("--stream requires a foreground text run (no --async or --json)")
                 if args.async_run:
                     rec = eng.spawn_async(
                         Path(args.path),
@@ -370,13 +373,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                         max_tokens=args.max_tokens,
                         timeout_s=args.timeout,
                         mutation_gate=args.mutation_gate,
+                        on_output=(lambda text: print(text, end="", flush=True)) if args.stream else None,
                     )
                 if args.json:
                     sys.stdout.write(render_run_json(rec))
                 else:
+                    if args.stream:
+                        print()
                     print(format_terminal_summary(rec))
                 if args.async_run and rec.status in RunStatus.ACTIVE:
                     return 0
+                if args.suite and rec.status == RunStatus.SKIP and not rec.suites:
+                    print(f"testbench: no suites matched: {', '.join(args.suite)}", file=sys.stderr)
+                    return 1
                 return 0 if rec.status in (RunStatus.PASS, RunStatus.SKIP) else 1
 
             if args.command == "status":

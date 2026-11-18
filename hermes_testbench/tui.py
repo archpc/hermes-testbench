@@ -115,7 +115,10 @@ def _read_keys(fd: int) -> List[str]:
 
 
 def _load_log_tail(run: RunRecord, max_lines: int = 80) -> Tuple[str, ...]:
-    for s in run.suites:
+    # The inspector shows one tail. Prefer failure evidence over passing output.
+    failure_statuses = {RunStatus.FAIL, RunStatus.ERROR, RunStatus.TIMEOUT, RunStatus.CANCELLED, RunStatus.BLOCKED}
+    failures = [s for s in run.suites if s.status in failure_statuses]
+    for s in failures or run.suites:
         if s.sanitized_path and Path(s.sanitized_path).is_file():
             try:
                 lines = Path(s.sanitized_path).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -123,6 +126,8 @@ def _load_log_tail(run: RunRecord, max_lines: int = 80) -> Tuple[str, ...]:
                 lines = []
             if lines:
                 return tuple(lines[-max_lines:])
+    if failures:
+        return ("Failure log unavailable",)
     ev = Path(run.evidence_dir) if run.evidence_dir else None
     if ev and ev.is_dir():
         for cand in sorted(ev.glob("*.sanitized.log")):
