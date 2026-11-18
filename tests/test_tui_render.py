@@ -8,8 +8,9 @@ import unittest
 from dataclasses import replace as dc_replace
 from pathlib import Path
 
-from hermes_testbench.schema import ProjectSpec, RunRecord, RunStatus
-from hermes_testbench.tui import _refresh_active_logs
+from hermes_testbench.schema import ProjectSpec, RunRecord, RunStatus, SuiteResult
+from hermes_testbench.store import TestBenchStore
+from hermes_testbench.tui import _refresh_active_logs, _refresh_from_store
 from hermes_testbench.tui_render import (
     BILLABLE_REFUSAL,
     PERMANENT_TAB_QUIT_HINT,
@@ -693,6 +694,37 @@ class LiveRunObservabilityTests(unittest.TestCase):
         self.assertNotIn("pending", text)
         detail = _strip("\n".join(render_frame(dc_replace(state, detail_open=True), 80, 24)))
         self.assertIn("ran 373 tests", detail)
+
+    def test_inspector_prefers_failure_log_in_multi_suite_run(self) -> None:
+        scratch = Path.home() / ".hermes/cache/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch, prefix="tb-log-") as tmp:
+            root = Path(tmp)
+            good_log = root / "good.sanitized.log"
+            bad_log = root / "bad.sanitized.log"
+            good_log.write_text("passing suite output\n", encoding="utf-8")
+            bad_log.write_text("failing suite traceback\n", encoding="utf-8")
+            good = SuiteResult("good", "shell", "unit", ["true"], tmp, RunStatus.PASS,
+                               sanitized_path=str(good_log))
+            bad = dc_replace(good, name="bad", command=["false"], status=RunStatus.FAIL,
+                             sanitized_path=str(bad_log))
+            store = TestBenchStore(root / "store")
+            self.addCleanup(store.close)
+            passed = make_run("tb_20261114_170000_aaaa1111", status=RunStatus.PASS, suites=[good])
+            failed = make_run("tb_20261114_170100_bbbb2222", status=RunStatus.FAIL, suites=[good, bad])
+            store.finalize_run(passed)
+            store.finalize_run(failed)
+            state = _refresh_from_store(store, TuiState(detail_open=True))
+            self.assertEqual(state.log_lines[passed.run_id], ("passing suite output",))
+            detail = _strip("\n".join(render_frame(state, 80, 24)))
+            self.assertIn("failing suite traceback", detail)
+            self.assertNotIn("passing suite output", detail)
+
+            bad_log.unlink()
+            state = _refresh_from_store(store, state)
+            detail = _strip("\n".join(render_frame(state, 80, 24)))
+            self.assertIn("Failure log unavailable", detail)
+            self.assertNotIn("passing suite output", detail)
 
     def test_live_tail_is_reread_while_the_store_is_unchanged(self) -> None:
         scratch = Path.home() / ".hermes/cache/scratch"

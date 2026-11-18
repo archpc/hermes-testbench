@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..isolation import extra_bin_dirs, run_isolated_command
 from ..schema import (
@@ -182,6 +182,7 @@ def execute_suite(
     cancel_flag_path: Optional[Path] = None,
     scratch_root: Optional[Path] = None,
     on_spawn: Optional[Any] = None,
+    on_output: Optional[Callable[[str], None]] = None,
 ) -> Tuple[SuiteResult, Optional[Dict[str, Any]]]:
     """Run one suite exactly once under isolation and map its output to a result."""
     project_root = Path(project_root)
@@ -305,6 +306,7 @@ def execute_suite(
             cancel_flag_path=cancel_flag_path,
             scratch_root=scratch_root,
             on_spawn=on_spawn,
+            on_output=on_output,
         )
     except (OSError, ValueError) as exc:
         result = _base_result(suite, cwd=cwd, status=RunStatus.ERROR, repro=repro, started_at=started_at)

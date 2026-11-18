@@ -723,6 +723,7 @@ def run_isolated_command(
     scratch_root: Optional[Path] = None,
     cancel_flag_path: Optional[Path] = None,
     on_spawn: Optional[Callable[[int, int, Optional[str]], None]] = None,
+    on_output: Optional[Callable[[str], None]] = None,
 ) -> IsolatedExecResult:
     if not command or any(not isinstance(a, str) or "\x00" in a for a in command):
         raise ValueError(f"Invalid command argv: {command!r}")
@@ -821,9 +822,12 @@ def run_isolated_command(
                     keep = text_piece[: MAX_MEM_CAPTURE_CHARS - stdout_mem_len]
                     stdout_mem.append(keep)
                     stdout_mem_len += len(keep)
+                safe = sanitize_terminal_text(text_piece)
+                if on_output is not None:
+                    on_output(safe)
                 if disk_bytes_written < MAX_DISK_LOG_BYTES:
                     out_f.write(text_piece)
-                    san_f.write(sanitize_terminal_text(text_piece))
+                    san_f.write(safe)
                     disk_bytes_written += len(text_piece)
                     # Flush per chunk so a live run's log is readable while it
                     # runs; buffered writes only reach disk at completion.
@@ -838,9 +842,12 @@ def run_isolated_command(
                     keep = text_piece[: MAX_MEM_CAPTURE_CHARS - stderr_mem_len]
                     stderr_mem.append(keep)
                     stderr_mem_len += len(keep)
+                safe = sanitize_terminal_text(text_piece)
+                if on_output is not None:
+                    on_output(safe)
                 if disk_bytes_written < MAX_DISK_LOG_BYTES:
                     err_f.write(text_piece)
-                    san_f.write(sanitize_terminal_text(text_piece))
+                    san_f.write(safe)
                     disk_bytes_written += len(text_piece)
                     err_f.flush()
                     san_f.flush()
