@@ -156,6 +156,14 @@ def stream_phase(rng: random.Random) -> list[str]:
     pem_body = "\n".join("".join(rng.choice(ALNUM) for _ in range(64)) for _ in range(30))
     cases.append(("pad -----BEGIN RSA PRIVATE KEY-----\n" + pem_body + "\n-----END RSA PRIVATE KEY-----\n",
                   pem_body.split("\n")[0], "mid-line PEM BEGIN"))
+    # R3-1: secret in the prefix before a mid-line BEGIN.
+    tok = "secret" + "token"
+    cases.append(("TOKEN=" + tok + " -----BEGIN RSA PRIVATE KEY-----\n" + pem_body + "\n-----END RSA PRIVATE KEY-----\n",
+                  tok, "PEM prefix secret"))
+    # Genuine SEC-3: sub-minimum value terminated by whitespace at the cut.
+    cases.append(("a" * 65100 + "PASSWORD=*** " + "z" * 512, "=abc", "short value terminated at cut"))
+    # R3-2: cut inside the literal scheme.
+    cases.append(("a" * 65027 + "https://u:" + "P" * 400 + "@h/x" + "z" * 100, "P" * 400, "split-scheme URL"))
     pem = "-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(
         "".join(rng.choice(ALNUM) for _ in range(64)) for _ in range(30)
     ) + "\n-----END RSA PRIVATE KEY-----"

@@ -47,8 +47,17 @@ _EXPECTS_VALUE_RE = re.compile(
 # still a secret continuation across the cut.
 _ENV_ASSIGN_SHORT_RE = re.compile(
     r"(?i)(\b[A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH_KEY)"
-    r"[A-Z0-9_]*\s*[:=]\s*['\"]?)[^\s'\"`,;]{0,3}$"
+    r"[A-Z0-9_]*\s*[:=]\s*['\"]?)[^\s'\"`,;]{0,3}['\"]?\s*$"
 )
+# A cut inside the literal 'https://' leaves neither side with a complete
+# scheme; detect user:pass shapes straddling the boundary window.
+_SPLIT_URL_USERINFO_RE = re.compile(r"https?://[^/\s:@]+:[^@\s/]")
+
+
+def _split_url_userinfo(head: str, tail: str) -> bool:
+    left = head[-8:]
+    m = _SPLIT_URL_USERINFO_RE.search(left + tail[:128])
+    return bool(m and m.start() < len(left) and m.end() > len(left))
 
 
 def redact_secrets(text: str) -> str:
@@ -114,7 +123,7 @@ class StreamRedactor:
                     if m_held is not None:
                         self._in_pem = m_held.group(1)
                         self._pem_redacted_emitted = False
-                        out_lines.append(held[: m_held.end()] + "\n")
+                        out_lines.append(redact_secrets(held[: m_held.end()]) + "\n")
                         continue
                 # Prose (or anything not key-shaped): the held line was a
                 # mention. Emit it and process the current line normally.
@@ -126,9 +135,10 @@ class StreamRedactor:
                 if not prefix.strip() or (remainder and _PEM_BODY_RE.fullmatch(remainder)):
                     # Canonical line-start BEGIN, or key body already on the
                     # marker line: enter PEM state, keep prefix + marker only.
+                    # The prefix may itself contain secrets — redact it.
                     self._in_pem = m_begin.group(1)
                     self._pem_redacted_emitted = False
-                    out_lines.append(line[: m_begin.end()] + "\n")
+                    out_lines.append(redact_secrets(line[: m_begin.end()]) + "\n")
                     continue
                 if not remainder:
                     # Mid-line BEGIN with nothing after the marker: ambiguous
@@ -182,6 +192,7 @@ class StreamRedactor:
                 or _URL_USERINFO_OPEN_RE.search(head)
                 or _URL_AUTHORITY_OPEN_RE.search(head)
                 or _URL_USERINFO_OPEN_RE.search(tail)
+                or _split_url_userinfo(head, tail)
             ):
                 # The cut landed inside a secret value, or separated a secret
                 # from its key (whitespace split: head keeps 'TOKEN = ', tail

@@ -155,7 +155,9 @@ class StreamRedactorLongValueTests(unittest.TestCase):
         self.assertNotIn(tok[-64:], out)
 
     def test_short_value_straddling_cut_never_leaks(self) -> None:
-        # SEC-3: value shorter than the 4-char pattern minimum at the cut.
+        # Sub-minimum value with the cut INSIDE it (no trailing delimiter):
+        # exercises _ends_in_secret's short-value reach, not the terminated
+        # shape covered by test_short_value_terminated_at_cut_never_leaks.
         text = "a" * 65100 + "PASSWORD=***" + "z" * 509
         sr = StreamRedactor()
         out = sr.feed(text) + sr.flush()
@@ -196,6 +198,37 @@ class StreamRedactorLongValueTests(unittest.TestCase):
         out = sr.feed(text) + sr.flush()
         self.assertNotIn(body, out)
         self.assertIn("[REDACTED]", out)
+
+    def test_pem_prefix_secret_is_redacted(self) -> None:
+        # R3-1 (review R3): a secret in the prefix before a mid-line BEGIN
+        # must be redacted, not emitted raw with the marker slice.
+        tok = "secret" + "token"
+        text = "TOKEN=" + tok + " -----BEGIN RSA PRIVATE KEY-----\n" + "B" * 64 + "\n-----END RSA PRIVATE KEY-----\n"
+        sr = StreamRedactor()
+        out = sr.feed(text) + sr.flush()
+        self.assertNotIn(tok, out)
+        self.assertNotIn("B" * 64, out)
+        self.assertIn("[REDACTED]", out)
+
+    def test_short_value_terminated_at_cut_never_leaks(self) -> None:
+        # Genuine SEC-3 shape: a sub-minimum value followed by whitespace
+        # exactly at the cut ('PASSWORD=*** '). Exercises _ENV_ASSIGN_SHORT_RE
+        # (the straddling test above exercises _ends_in_secret instead).
+        key = "PASS" + "WORD"
+        text = "a" * 65100 + key + "=abc " + "z" * 512
+        sr = StreamRedactor()
+        out = sr.feed(text) + sr.flush()
+        self.assertNotIn("=abc", out)
+        self.assertIn("[REDACTED]", out)
+
+    def test_split_scheme_url_password_never_leaks(self) -> None:
+        # R3-2 (review R3): the cut lands inside the literal 'https://' so
+        # neither head nor tail carries a complete scheme; the password must
+        # still not leak (narrow alignment window, same F8 class).
+        text = "a" * 65027 + "https://u:" + "P" * 400 + "@h/x" + "z" * 100
+        sr = StreamRedactor()
+        out = sr.feed(text) + sr.flush()
+        self.assertNotIn("P" * 64, out)
 
     def test_benign_long_line_with_whitespace_is_preserved(self) -> None:
         sr = StreamRedactor()
