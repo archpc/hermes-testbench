@@ -13,6 +13,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
+import time
 from typing import Any, Dict, Iterator, List, Optional
 
 from .reporting import format_repro_script, render_junit_xml, render_run_json
@@ -166,6 +167,38 @@ class TestBenchStore:
         self._conn: sqlite3.Connection = self._open_and_init_db()
 
     def _open_and_init_db(self) -> sqlite3.Connection:
+        # First-open of a fresh home races when several connections initialize
+        # at once: the WAL switch contends and SQLite returns SQLITE_BUSY/LOCKED.
+        # busy_timeout covers row locks but not the journal_mode pragma
+        # transition. The schema probe+DDL below runs under one BEGIN IMMEDIATE
+        # so it is atomic; a competing initializer just makes us wait. Retry the
+        # whole open on BUSY/LOCKED until a competitor finishes, bounded. Without
+        # this, concurrent TestBenchStore(home) on a new home fails ~38% (4
+        # threads, 300 trials). Match error codes, not message text: the DDL is
+        # CREATE ... IF NOT EXISTS, so "already exists" is not a reachable state.
+        # Bound is approximate: an attempt can block up to busy_timeout=5s inside
+        # BEGIN IMMEDIATE / journal_mode before raising, and the deadline is
+        # checked between attempts, so worst case is ~deadline + 5s (≈15s).
+        # Cost: every open (even existing-DB reads) briefly takes the write lock
+        # to serialize the probe (~+60us single-threaded). No deadlock: in-repo
+        # write txns are short upserts/deletes and run.lock is flock LOCK_NB.
+        deadline = time.monotonic() + 10.0
+        delay = 0.01
+        while True:
+            try:
+                return self._open_and_init_db_once()
+            except sqlite3.OperationalError as exc:
+                # Primary SQLite result code: 5=BUSY, 6=LOCKED (the mask covers
+                # extended variants such as BUSY_SNAPSHOT / LOCKED_SHAREDCACHE).
+                if ((getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF) not in (5, 6):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, 0.25)
+
+    def _open_and_init_db_once(self) -> sqlite3.Connection:
         fd = os.open(
             str(self.db_path),
             os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
@@ -181,20 +214,23 @@ class TestBenchStore:
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute("PRAGMA foreign_keys = ON")
 
-            ver = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            has_runs = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'"
-            ).fetchone() is not None
-
-            if ver == 0 and not has_runs:
-                with self._write_tx_conn(conn):
+            # Probe + DDL under one write lock so the user_version/has_runs reads
+            # cannot tear against a competing initializer committing between them
+            # (a torn ver=0 / has_runs=True pair would otherwise raise a spurious
+            # SchemaMismatchError). BEGIN IMMEDIATE serializes first-open.
+            with self._write_tx_conn(conn):
+                ver = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                has_runs = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'"
+                ).fetchone() is not None
+                if ver == 0 and not has_runs:
                     for stmt in [s.strip() for s in _DDL.split(";") if s.strip()]:
                         conn.execute(stmt)
                     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            elif ver != SCHEMA_VERSION:
-                raise SchemaMismatchError(
-                    f"state.db schema user_version={ver} != expected {SCHEMA_VERSION} ({self.db_path})"
-                )
+                elif ver != SCHEMA_VERSION:
+                    raise SchemaMismatchError(
+                        f"state.db schema user_version={ver} != expected {SCHEMA_VERSION} ({self.db_path})"
+                    )
             return conn
         except Exception:
             conn.close()

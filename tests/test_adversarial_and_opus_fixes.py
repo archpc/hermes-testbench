@@ -57,18 +57,28 @@ class AdversarialAndOpusRegressionTests(unittest.TestCase):
         signal.signal(signal.SIGTERM, _catch_term)
         try:
             done_rec: list[RunRecord] = []
+            worker_err: list[BaseException] = []
 
             def _runner() -> None:
-                with TestBenchStore(self.tb_home) as st:
-                    eng = TestBenchEngine(st)
-                    done_rec.append(eng.run_sync(proj, profile="unit"))
+                # Surface any worker failure instead of letting the thread die
+                # silently: a dead runner never creates a RUNNING row, and the
+                # old "did not enter RUNNING state" assertion hid the real cause
+                # (sqlite 'database is locked' during concurrent store init).
+                try:
+                    with TestBenchStore(self.tb_home) as st:
+                        eng = TestBenchEngine(st)
+                        done_rec.append(eng.run_sync(proj, profile="unit"))
+                except BaseException as exc:  # noqa: BLE001 - report the real error
+                    worker_err.append(exc)
 
             t = threading.Thread(target=_runner)
             t.start()
 
             rid = ""
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + 30.0
             while time.monotonic() < deadline and not rid:
+                if worker_err:
+                    self.fail("run_sync worker thread died: %r" % worker_err[0])
                 if self.tb_home.exists():
                     with TestBenchStore(self.tb_home) as st2:
                         runs = st2.list_runs(limit=5)
@@ -76,7 +86,10 @@ class AdversarialAndOpusRegressionTests(unittest.TestCase):
                             rid = runs[0].run_id
                             break
                 time.sleep(0.05)
-            self.assertTrue(rid, "run_sync did not enter RUNNING state")
+            self.assertTrue(
+                rid,
+                "run_sync did not enter RUNNING state (worker_err=%r)" % worker_err[:1],
+            )
 
             with TestBenchStore(self.tb_home) as st_cancel:
                 c_rec = TestBenchEngine(st_cancel).cancel(rid)
