@@ -2,6 +2,24 @@
 
 Execution policy is enforced before any process is spawned, the command runs
 exactly once, and all counts come from the single captured stdout/stderr pair.
+
+Dispatch order for one suite (``execute_suite``), and the reason it is this order:
+
+1. billable approval (a suite that costs tokens needs both a flag and a budget);
+2. untrusted-manifest capability check (network / repo write are manifest-supplied
+   requests, so an untrusted manifest may not use them);
+3. mutation adapters are handed to ``run_mutation_suite`` *before* the generic
+   prerequisite gate, because they stage a disposable copy and need to report
+   BLOCKED/SKIP with their own reason (confinement, tool availability);
+4. terminal tapes may not ask for the network;
+5. prerequisites (command present, binaries on PATH, declared paths present) become
+   a SKIP with the exact missing thing named;
+6. exactly one isolated execution.
+
+Gates 1, 2, 4, 5 return without spawning anything; gate 3 hands mutation suites to
+``run_mutation_suite`` (which stages a copy and spawns its own tool), and gate 6 is the
+path that can set counts from runner output. Any parse it cannot trust degrades to the
+exit status rather than to an invented count (``_finalize_counts``).
 """
 
 from __future__ import annotations
@@ -88,12 +106,26 @@ def _base_result(
 
 
 def _tail_excerpt(text: str, limit: int = 800) -> str:
+    """Last 12 non-blank lines, then a hard 800-char cut from the *end*.
+
+    Blank lines are dropped before the window is taken, so a log that ends in a wall
+    of newlines still shows its last real content. The character cut can truncate the
+    first line of the window mid-word; that is intentional — the end of a failure is
+    the part an operator needs.
+    """
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
     tail = "\n".join(lines[-_SUMMARY_TAIL_LINES:])
     return tail[-limit:]
 
 
 def _to_failure_records(suite_name: str, raw: List[Dict[str, Any]]) -> List[FailureRecord]:
+    """Materialise parser failure dicts, defaulting kind to assertion.
+
+    ``suite`` is overwritten unconditionally so a parser can never attribute a
+    failure to a different suite. Any key the parser emitted that
+    ``FailureRecord`` does not accept raises ``TypeError`` — a deliberate tripwire,
+    not a tolerated shape drift.
+    """
     records: List[FailureRecord] = []
     for item in raw:
         data = dict(item)
@@ -106,6 +138,12 @@ def _to_failure_records(suite_name: str, raw: List[Dict[str, Any]]) -> List[Fail
 
 
 def _to_case_results(suite_name: str, raw: List[Dict[str, Any]]) -> List[CaseResult]:
+    """Materialise parser case dicts. Missing status defaults to PASS.
+
+    That default is only safe because every parser that emits a case emits a status;
+    a parser that omits one would turn silence into a pass, which is why the default
+    exists as a single visible place to audit rather than per-parser.
+    """
     cases: List[CaseResult] = []
     for item in raw:
         data = dict(item)
@@ -121,6 +159,21 @@ def _finalize_counts(
     exit_code: Optional[int],
     signal_num: Optional[int],
 ) -> None:
+    """Turn a parse outcome plus the exit status into the suite's verdict and counts.
+
+    Two regimes, and the difference is the point:
+
+    * ``outcome.structured`` — the runner summarised itself, so its counts stand. The
+      exit status is then only a *cross-check*: a nonzero exit with zero failures
+      means the process died before the summary, so one ``HARNESS_ERROR`` is added
+      and the suite fails ("we cannot call this a pass").
+    * unstructured — no counts are invented. The whole run becomes exactly one
+      pass or one failure chosen by the exit status, with the tail excerpt attached
+      so the operator still sees why.
+
+    A timeout/cancel is decided by the caller before this runs; here a nonzero exit
+    or a signal is a failure, never a pass.
+    """
     result.total_count = outcome.total
     result.pass_count = outcome.passed
     result.fail_count = outcome.failed
@@ -184,7 +237,22 @@ def execute_suite(
     on_spawn: Optional[Any] = None,
     on_output: Optional[Callable[[str], None]] = None,
 ) -> Tuple[SuiteResult, Optional[Dict[str, Any]]]:
-    """Run one suite exactly once under isolation and map its output to a result."""
+    """Run one suite exactly once under isolation and map its output to a result.
+
+    Returns ``(SuiteResult, usage)`` where ``usage`` is the runner's own
+    ``TESTBENCH_MODEL_USAGE`` payload (only ``agent_eval`` fills it) or ``None``.
+
+    Side effects are confined to ``evidence_dir`` (captured streams, sanitized copy)
+    and any disposable stage a mutation run creates; nothing here writes to the
+    project tree. ``project_root`` is only used to resolve ``suite.cwd``, to check
+    ``required_paths`` and to hand the sandbox its root.
+
+    Gate order and rationale are documented in the module docstring. The helpers
+    that matter when debugging a blocked suite: ``_missing_binary`` (PATH plus
+    ``extra_bin_dirs()``, so a Homebrew-only tool is found), and the seatbelt
+    post-pass below that reclassifies generic spawn failures as ``sandbox_denied``
+    when confinement was actually active.
+    """
     project_root = Path(project_root)
     evidence_dir = Path(evidence_dir)
     cwd = _resolve_cwd(project_root, suite)
@@ -239,6 +307,8 @@ def execute_suite(
 
     # Mutation testing stages a disposable copy and enforces its own tool-availability and
     # confinement gates, so it is dispatched before the generic prerequisite gate.
+    # Consequence worth knowing: mutation suites never hit Gate 3, so their "missing tool"
+    # reason comes from ``run_mutation_suite`` (SKIP), not from ``_missing_binary``.
     if suite.adapter in MUTATION_ADAPTERS:
         return run_mutation_suite(
             suite,
@@ -367,10 +437,17 @@ def execute_suite(
         ]
         return result, None
 
+    # Unknown adapter names are tolerated here and only here: they fall back to the
+    # generic parser, which can report markers/summary/traceback but never invents a
+    # pass. Discovery rejects unknown adapters up front, so this is a belt-and-braces
+    # path (a replayed SuiteSpec, for instance).
     parser = ADAPTER_PARSERS.get(suite.adapter, parsers.parse_generic)
     outcome = parser(combined)
     result.summary_excerpt = outcome.summary_line or _tail_excerpt(combined)
     _finalize_counts(result, outcome, exec_result.exit_code, exec_result.signal_num)
+    # "Operation not permitted" under an active profile is a policy denial, not a bug in
+    # the suite. Reclassify so the reporter points at confinement instead of a generic
+    # harness error. Keyed on the marker in isolation_meta, never on message text alone.
     if result.isolation_meta.get("seatbelt") in ("active", "inherited_outer"):
         for frec in result.failures:
             blob = f"{frec.message}\n{frec.excerpt}"

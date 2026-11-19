@@ -2,8 +2,26 @@
 
 Candidates are derived from the live :func:`hermes_testbench.cli.build_parser`
 tree, never from a hand-maintained list, so a new subcommand or flag appears in
-the completions without touching this module. Emitted scripts must run on the
-macOS system shells: bash 3.2.57 and zsh 5.9.
+the completions without touching this module — a new *positional choice* or a new
+non-``path`` file argument does, because only option values are exported. Emitted
+scripts must run on the macOS system shells: bash 3.2.57 and zsh 5.9.
+
+Known limits, all consequences of the generated shape rather than bugs to chase:
+
+* both scripts assume the subcommand is word 2 (``testbench <cmd> ...``), so a
+  global option before the subcommand (``testbench --home DIR ru<TAB>``) defeats
+  command and option completion entirely;
+* only positional arguments whose ``dest`` is literally ``path`` get file
+  completion, and no positional's ``choices`` are offered as values;
+* ``value_choices`` is keyed by option string across the whole tree, so two
+  commands declaring the same option name with different choices would collide
+  (last one wins); today only ``--format`` and ``--profile`` carry choices.
+
+Generation reaches into argparse internals (``_actions``, ``_choices_actions``,
+``choices``) because argparse exposes no public tree walk. That is the reason the
+tests pin the *output* on real shells instead of trusting the introspection alone:
+a Python release that renames those internals breaks generation, not the scripts
+already installed.
 
 Installation is opt-in and never performed here: the user redirects the printed
 script into an ``fpath``/bash-completion directory (see README).
@@ -26,6 +44,16 @@ _PROFILE_CHOICES: Tuple[str, ...] = tuple(ProfileName.STANDARD)
 
 @dataclass
 class CommandSpec:
+    """Flattened view of one argparse parser, as the script templates need it.
+
+    ``options`` keeps declaration order (help first, because argparse adds
+    ``-h/--help`` first) and includes every visible option string. ``value_choices``
+    maps an *option string* to its fixed values; ``path_positional`` means "this
+    command takes a directory and should offer files when the cursor is not on a
+    dash". ``subcommands`` preserves parser order, which is what makes the emitted
+    ``case`` blocks deterministic across runs.
+    """
+
     name: str
     help: str
     options: List[str] = field(default_factory=list)
@@ -62,6 +90,15 @@ def _hidden_choices(action: argparse._SubParsersAction) -> set[str]:
 
 
 def _command_spec(name: str, parser: argparse.ArgumentParser, help_text: str = "") -> CommandSpec:
+    """Collect one parser's visible options, value choices, and children.
+
+    Only ``option_strings`` are inspected for values, so positional ``choices``
+    (``completion bash|zsh``) never reach the scripts. ``--profile`` is special
+    cased because it carries no argparse ``choices`` by design. A positional whose
+    ``dest`` is ``path`` sets ``path_positional``; other positionals (``run_id``,
+    ``tape_file``, ``evidence_or_run_id``) are invisible to completion, which is
+    why ``tape run <TAB>`` offers nothing.
+    """
     spec = CommandSpec(name=name, help=help_text)
     for arg in parser._actions:
         if isinstance(arg, argparse._SubParsersAction):
@@ -154,6 +191,19 @@ def _zsh_options(indent: str, spec: CommandSpec) -> List[str]:
 
 
 def render_zsh(parser: argparse.ArgumentParser) -> str:
+    """Emit a ``#compdef`` script for zsh 5.9.
+
+    Shape: first handle "we are completing an option value" from ``prev``, then
+    the command position (``CURRENT == 2``) with top-level options plus described
+    commands, then a ``case`` per command. ``words[1]`` is the program in zsh, so
+    ``words[2]`` is the subcommand — the script has no notion of options before it.
+
+    Option values are emitted as an unconditional ``compadd`` keyed only on
+    ``prev``, so a same-named option in a different command inherits the same
+    candidates. Leaf subcommands with no options are skipped inside the ``case``:
+    an empty branch would end the function with no candidates instead of letting
+    the parent's completion stand.
+    """
     tree = command_tree(parser)
     out: List[str] = [
         "#compdef testbench",
@@ -219,6 +269,18 @@ def _bash_options(indent: str, spec: CommandSpec) -> List[str]:
 
 
 def render_bash(parser: argparse.ArgumentParser) -> str:
+    """Emit a bash-3.2-compatible completion function for ``testbench``.
+
+    bash 3.2 is the macOS system shell, so: no associative arrays, no ``mapfile``,
+    no ``local -n``. ``COMP_WORDS[1]`` is assumed to be the subcommand (the
+    program name is word 0), and the top-level branch triggers only at
+    ``COMP_CWORD == 1`` — which means a root option before the subcommand lands in
+    the ``case "$cmd"`` default and yields no candidates at all.
+
+    Directory completion is offered only for ``path_positional`` commands and only
+    when the current word does not start with ``-``, so flags still complete for
+    ``run``/``discover``/``trust``.
+    """
     tree = command_tree(parser)
     out: List[str] = [
         "# bash completion for testbench",
@@ -280,6 +342,13 @@ def render_bash(parser: argparse.ArgumentParser) -> str:
 
 
 def render(shell: str) -> str:
+    """Return the completion script for ``shell`` (``"bash"`` or ``"zsh"``).
+
+    Builds a throwaway parser rather than importing one from a global: completion
+    must describe the CLI *this* build ships, including a command added five
+    minutes ago. No store, no home, no filesystem access — the CLI surfaces this
+    behind ``testbench completion <shell>`` precisely so it can run anywhere.
+    """
     from .cli import build_parser
 
     parser = build_parser()

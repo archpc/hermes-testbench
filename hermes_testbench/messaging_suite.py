@@ -11,6 +11,34 @@ tree read-only, inspects the artifact's evidence receipts, and drives the artifa
     ``artifact_root`` exists.
   * ``agent-messaging:pytest`` — only when ``run_hermes_pytest=True``; a SKIP when the
     hermetic bot-mode pytest files cannot be run.
+
+What "verification" means here, stated plainly, because it is much weaker than a real
+integration test and the wording of the cases can mislead a reader:
+
+* Most contract cases are **source greps**. ``tools/bot_mode_dm.py``,
+  ``tools/bot_failure_reasons.py``, ``tools/bot_live_delivery.py``,
+  ``agent/bot_chain.py`` and ``tests/tools/test_bot_mode_dm.py`` are read as text and
+  searched for exact substrings (``"not a delivery receipt"``, ``hop > settings.max_hops``,
+  …). That detects *removal* of a documented behavior and nothing else: a rewrite that
+  keeps the behavior but renames the string fails the case, and a contradiction added
+  next to the string still passes. These are regression tripwires for a known-good
+  upstream tree, not proofs.
+* The evidence cases (``a4``/``b4``/``c6``) read ``*.json`` receipts from the artifact's
+  ``evidence/`` dir and from this run's evidence dir. No receipts at all reads the same
+  as wrong receipts: the case FAILs when the artifact directory exists, SKIPs when it
+  does not.
+* ``g4`` exercises ``settlement_from_notification`` — *this module's* helper — against a
+  synthetic receipt. It verifies the fallback logic TestBench documents, not the
+  artifact's own implementation. Read it as a self-test, not as evidence about the
+  artifact.
+* The ``wiring`` suite is the only part that executes third-party code
+  (``scripts/check-wiring.py``, two spawns, 120 s each).
+* ``pytest`` is opt-in and runs the upstream venv's interpreter directly, outside
+  TestBench's sandbox; that is acceptable only because the files are hermetic.
+
+The whole module is therefore tied to an upstream vocabulary: any rename in
+``bot_failure_reasons.py`` or the DM tool turns cases red without a behavior change.
+When a case fails, diff the artifact/source tree *first*, then the case.
 """
 
 from __future__ import annotations
@@ -55,6 +83,9 @@ _EXPECTED_REASONS = frozenset(
 )
 
 # Name -> (title, behavior family) for every required contract behavior.
+# The names are the stable identity of a case: they appear in stored run records, the
+# sanitized log, and failure records. Renaming one makes historical comparison of a run
+# series impossible, so names change only when a behavior is genuinely redefined.
 _REQUIRED_CASES: Tuple[str, ...] = (
     "a1_ack_is_queued_handoff_with_delivery_id",
     "a2_ack_documented_as_handoff_not_receipt",
@@ -147,11 +178,28 @@ def _read_text(path: Path) -> str:
 
 
 def _parse_frozenset(text: str, name: str) -> Optional[str]:
+    """Return the *body* of ``NAME = frozenset({...})`` from source text, or ``None``.
+
+    Deliberately syntactic: the body is returned unparsed so callers can do substring
+    checks on it (``"PROVIDER_QUOTA_LIMIT" not in body``). The non-greedy match stops at
+    the first ``}``, so a set literal containing a nested brace or a ``}`` inside a
+    string would be truncated — acceptable for these three constants, a trap for the
+    next one. ``None`` means "constant not found or restructured", which every caller
+    must treat as a failure rather than as an empty set.
+    """
     match = re.search(rf"{name}\s*=\s*frozenset\(\{{(.*?)\}}\)", text, re.S)
     return match.group(1) if match else None
 
 
 def _declared_strings(text: str) -> Dict[str, str]:
+    """Map ``CONSTANT = "literal"`` assignments to their values (module-level only).
+
+    Only double-quoted, column-zero assignments count. A constant built with ``f""``,
+    concatenation, ``.format`` or a single-quoted string simply will not appear, and the
+    calling case then reports a missing reason. That failure mode is intentional (no
+    guessing at values) but reads as "vocabulary missing" when the real change was a
+    formatting refactor.
+    """
     return {
         match.group(1): match.group(2)
         for match in re.finditer(r"^([A-Z][A-Z0-9_]*)\s*=\s*\"([^\"]*)\"", text, re.M)
@@ -159,6 +207,14 @@ def _declared_strings(text: str) -> Dict[str, str]:
 
 
 def _receipts(artifact_root: Optional[Path], evidence_dir: Path) -> List[Dict[str, Any]]:
+    """Collect receipt JSON objects from the artifact's ``evidence/`` then this run's dir.
+
+    Only ``*.json`` at the top level of each directory is read — receipts are flat by
+    contract, and a recursive walk could pick up unrelated run artefacts. A file that is
+    not a JSON object, or does not parse, is skipped silently: evidence quality is
+    reported by the per-case assertions, not by a parse error, so one corrupt file cannot
+    fail a suite whose real evidence is fine.
+    """
     out: List[Dict[str, Any]] = []
     candidates: List[Path] = []
     if artifact_root is not None:
@@ -197,6 +253,12 @@ def _skipped(name: str, message: str, suite: str = CONTRACT_SUITE) -> CaseResult
 
 
 def _status_for(pass_count: int, fail_count: int, skip_count: int, error_count: int) -> str:
+    """Suite status from its case mix: any fail/error fails, all-skip skips, else pass.
+
+    "All skipped" is SKIP and not PASS on purpose — a contract that was never inspected
+    must not read as a green result. An empty case list falls through to PASS, which can
+    only happen if a caller builds a suite with no cases; keep at least one case.
+    """
     if fail_count or error_count:
         return RunStatus.FAIL
     if pass_count == 0 and skip_count:
@@ -217,6 +279,18 @@ def _suite(
     evidence_dir: Optional[Path] = None,
     isolation_meta: Optional[Dict[str, Any]] = None,
 ) -> SuiteResult:
+    """Build one ``SuiteResult`` from already-decided cases; never runs anything.
+
+    Counts are derived from the case list, so ``total_count == len(cases)`` always holds
+    here — unlike the adapter path, where counts come from a parser. ``isolation_meta``
+    records ``mode="offline_in_process"`` and both capability flags as False: these
+    suites spawn nothing through the sandbox (the wiring/pytest helpers spawn
+    directly), and saying so in the record keeps a reader from assuming confinement.
+
+    ``evidence_dir`` triggers a sanitized per-case log write; it is deliberately
+    optional because the pytest path prefers the runner's own output as the log and
+    must not have it replaced by a one-line-per-case summary.
+    """
     pass_count = sum(1 for c in cases if c.status == RunStatus.PASS)
     fail_count = sum(1 for c in cases if c.status == RunStatus.FAIL)
     skip_count = sum(1 for c in cases if c.status == RunStatus.SKIP)
@@ -282,6 +356,19 @@ def _contract_cases(
     artifact_root: Optional[Path],
     evidence_dir: Path,
 ) -> List[CaseResult]:
+    """Evaluate every contract case from source text plus receipts. Never spawns.
+
+    Returns the full case list, always including ``RESTART_SKIP_CASE``: the skip is part
+    of the contract ("this was not verified"), so it must not be silently absent from a
+    green run. With no source tree every case — including the skip — is SKIPped, so an
+    unconfigured host cannot look verified.
+
+    The case bodies are substring checks against an exact upstream vocabulary; see the
+    module docstring for what that does and does not prove. Read them as a checklist of
+    the behaviors the artifact is supposed to keep, in the order of the contract's own
+    lettering (a=authored ack, b=author envelope, c=failure reasons, d=refusals,
+    e=dedupe/hops, f=restart durability, g=settlement).
+    """
     if hermes_agent_root is None or not Path(hermes_agent_root).is_dir():
         message = "source tree absent: the Hermes source checkout was not provided"
         return [_skipped(name, message) for name in (*_REQUIRED_CASES, RESTART_SKIP_CASE)]
@@ -531,6 +618,7 @@ def _contract_cases(
     )
 
     # g4 exercises this module's own fallback against a synthetic durable receipt.
+    # Note the subject: it is TestBench's helper under test, not the artifact's code.
     delivery_id = "ab" * 32
     evidence_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -567,6 +655,13 @@ def _contract_cases(
 
 
 def _run_wiring_script(script: Path, home: Path) -> Tuple[int, str]:
+    """Spawn the artifact's own ``check-wiring.py`` once, with the upstream interpreter.
+
+    ``sys.executable`` (TestBench's interpreter) is used because the check is a plain
+    script in the artifact tree; there is no sandbox and no env scrubbing here. Exit 127
+    is synthesised for "could not spawn at all" so callers can distinguish a failed check
+    from an unrunnable one without a second return channel.
+    """
     try:
         proc = subprocess.run(
             [sys.executable, str(script), "--hermes-home", str(home)],
@@ -581,6 +676,17 @@ def _run_wiring_script(script: Path, home: Path) -> Tuple[int, str]:
 
 
 def _wiring_suite(artifact_root: Path, evidence_dir: Path) -> Optional[SuiteResult]:
+    """Two-case suite: a synthetic wired home must pass, an empty one must be flagged.
+
+    The positive *and* negative control in one suite is the point — a checker that always
+    exits 0 would pass the first case alone. Both fixtures are built inside a temp dir
+    under ``evidence_dir`` and removed afterwards, so nothing in the real ``~/.hermes`` is
+    touched. ``sqlite3`` is imported lazily because the state.db shape is fixed by the
+    fixture, not by TestBench's schema.
+
+    Returns ``None`` when the artifact has no ``scripts/check-wiring.py``: absence is not
+    a failure, and the caller drops the suite rather than reporting a red one.
+    """
     root = Path(artifact_root)
     script = root / "scripts" / "check-wiring.py"
     if not script.is_file():
@@ -642,6 +748,14 @@ def _wiring_suite(artifact_root: Path, evidence_dir: Path) -> Optional[SuiteResu
 
 
 def _pytest_suite(hermes_agent_root: Optional[Path], evidence_dir: Optional[Path] = None) -> SuiteResult:
+    """Optional upstream pytest run; one case, SKIP when the venv is absent.
+
+    The interpreter is the *upstream* ``venv/bin/python`` on purpose: the point is to run
+    the artifact's hermetic test file in its own environment, not TestBench's. That also
+    means this path bypasses the sandbox entirely and inherits the ambient environment, so
+    900 s is the only guard. Output is sanitized into its own log rather than the
+    one-line-per-case log, because the pytest failure text *is* the evidence.
+    """
     root = Path(hermes_agent_root) if hermes_agent_root is not None else None
     command: List[str] = []
     if root is not None:
@@ -713,7 +827,18 @@ def run_agent_messaging_verification(
     hermes_agent_root: Optional[Path] = None,
     run_hermes_pytest: bool = False,
 ) -> List[SuiteResult]:
-    """Run the offline agent-messaging verification suites in deterministic order."""
+    """Run the offline agent-messaging verification suites in deterministic order.
+
+    Contract first (always present), then wiring (only when the artifact exists and ships
+    the checker), then pytest (only when opted in) — a stable order keeps stored run
+    comparisons meaningful. ``evidence_dir`` is the run's own directory: the contract
+    suite reads receipts from it as well as from the artifact, which is how a receipt
+    captured by an earlier step of the same run is visible.
+
+    Nothing here raises for a missing input; a missing tree is an explicit SKIP per case
+    (see ``_contract_cases``). The caller (``cli.messaging-verify``) is what turns a
+    FAIL/SKIP aggregate into an exit status.
+    """
     evidence = Path(evidence_dir)
     evidence.mkdir(parents=True, exist_ok=True)
 

@@ -1,6 +1,30 @@
 """Project capability discovery: git metadata, manifests, and zero-config detection.
 
 Pure stdlib. Never writes inside the examined project tree (ADR-0004).
+
+Two very different modes live here, and their guarantees are not the same:
+
+* **Manifest mode** — the project ships ``.testbench.toml`` (or the operator
+  passes an external one). Suites are exactly what the file declares; nothing
+  is inferred from filenames, and every unknown key, unknown adapter, unknown
+  profile, bad type, absolute/``..`` path, symlinked manifest or >256 KiB file
+  is a hard ``ValueError``. Strictness is the feature: a silently ignored typo
+  turns "my network-accessing suite never ran" into "everything passed".
+  Provenance is recorded in ``SuiteSpec.custom_from_manifest`` and
+  ``ProjectSpec.trusted``, which is what the engine's trust gate reads.
+* **Zero-config mode** — no manifest, so suites are *detected*. This half does
+  use conventions (``tests/test_*.py``, ``Cargo.toml``, ``*.cob``, ``*selftest*.c``,
+  ``*.tape``, ``*.db``/``*.sqlite``, known verifier scripts). Detection is a
+  best guess by design: it can only ever propose suites, and every spec it
+  builds carries ``allow_network = False`` / ``allow_repo_write = False``
+  (the dataclass defaults), so the profile never asks the gate for anything.
+
+Neither mode writes to the project. Both may *execute* project-adjacent code:
+``_interpreter_for`` prefers ``./venv/bin/python`` or ``./.venv/bin/python``
+and ``_has_module`` runs it with ``-c "import pytest"``, which triggers that
+interpreter's site initialisation — so ``testbench discover`` on an untrusted
+checkout is not a read-only operation: an interpreter under the repo executes
+with the caller's privileges before any isolation wrapper exists.
 """
 
 from __future__ import annotations
@@ -41,7 +65,16 @@ _UNVERSIONED: Tuple[str, str] = ("unversioned", "")
 
 
 def _git(root: Path, *args: str, timeout_s: float = 10.0) -> Optional[str]:
-    """Run git read-only against ``root``; return stdout or None on any failure."""
+    """Run git read-only against ``root``; return stdout or None on any failure.
+
+    Read-only is enforced by the environment, not by trusting the arguments:
+    ``GIT_OPTIONAL_LOCKS=0`` stops git taking its opportunistic index lock (so
+    a status call never writes inside the examined tree), ``GIT_TERMINAL_PROMPT=0``
+    makes a credential prompt fail instead of hang, ``GIT_CONFIG_NOSYSTEM=1``
+    keeps host git config from changing output, and ``LC_ALL=C`` keeps error
+    strings out of the parsed values. Any failure degrades to ``None`` — git
+    metadata is enrichment, never a reason to refuse a project.
+    """
     env = dict(os.environ)
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -72,6 +105,14 @@ def detect_git_metadata(root: Path) -> Tuple[str, str]:
     uncommitted changes (untracked files are ignored). Branch falls back to
     ``HEAD`` for detached checkouts. A broken ``.git`` pointer or a directory
     that is merely *inside* some other repository degrades to ``unversioned``.
+
+    The "merely inside" case is the one that matters: ``rev-parse HEAD`` would
+    happily answer with the *parent* repo's commit, which would silently
+    attribute a run to the wrong revision. ``--show-toplevel`` is compared
+    against the resolved root, and any mismatch yields ``unversioned`` — a
+    truthful "this directory is not its own repo" rather than a plausible
+    lie. ``+dirty`` ignores untracked files so a scratch artifact in the tree
+    does not mark every run dirty.
     """
     try:
         resolved = Path(root).expanduser().resolve(strict=True)
@@ -128,7 +169,9 @@ KNOWN_ADAPTERS = frozenset(
 
 # ``shell_test`` is an explicit, declared-file runner: one suite spec per
 # declared script, executed under a pinned interpreter with rc files disabled.
-# Discovery never guesses which files are tests from their names.
+# Scoped to *manifest* suites only — this adapter never infers anything from a
+# filename. (Zero-config detection below does match names and suffixes; see the
+# module docstring. The two modes differ on purpose and must not be conflated.)
 _SHELL_TEST_ADAPTER = "shell_test"
 _SHELL_TEST_FIELDS = frozenset({"files", "shell", "interpreter"})
 
@@ -215,6 +258,16 @@ def _as_gate(value: Any, what: str) -> Optional[float]:
 
 
 def _read_manifest_text(path: Path) -> bytes:
+    """Read a manifest with the two structural refusals applied before parsing.
+
+    Symlink refusal is load-bearing: ``.testbench.toml`` as a link lets a repo
+    present one document to ``testbench trust`` and a different one to the
+    next run, with the pinned digest still matching the file that was
+    reviewed. The size cap runs on the bytes actually read (post-read, not
+    ``stat``) so a growing file cannot slip past a pre-check; 256 KiB is far
+    beyond any honest manifest and small enough that a hostile one cannot cost
+    more than one page-in.
+    """
     if path.is_symlink():
         raise ValueError(f"manifest must not be a symlink: {path}")
     try:
@@ -241,10 +294,26 @@ def _parse_manifest_bytes(raw: bytes, path: Path) -> Dict[str, Any]:
 def _suite_from_manifest(
     entry: Any, index: int, *, custom_from_manifest: bool, manifest: Path
 ) -> SuiteSpec:
+    """Validate one manifest ``[[suite]]`` table into a ``SuiteSpec``.
+
+    Every field is type-checked by hand (``_as_bool``/``_as_float``/``_as_int``
+    reject ``bool`` where a number is expected, and vice versa) instead of
+    trusting TOML coercion, because a manifest is untrusted input that decides
+    what gets executed. Positive-only ``timeout_s`` and a ``[0, 1]`` mutation
+    gate are the same idea: a zero timeout or a gate of ``2.0`` would silently
+    make suites unsatisfiable rather than malformed.
+
+    ``{python}`` as the first argument is substituted with the pinned
+    interpreter at discovery time, so the command recorded in the run is the
+    command that actually ran — not one that depends on PATH later.
+    """
     where = f"manifest {manifest} suite #{index + 1}"
     if not isinstance(entry, dict):
         raise ValueError(f"{where} must be a table")
 
+    # Unknown keys are refused, and ``env`` is aliased only when the canonical
+    # name is absent: a manifest that sets both ``env`` and ``env_overrides``
+    # gets an "unknown keys" error rather than a silent precedence rule.
     unknown = set(entry) - _MANIFEST_SUITE_FIELDS
     if "env" in entry and "env_overrides" not in entry:
         entry = {**entry, "env_overrides": entry["env"]}
@@ -334,6 +403,13 @@ def _shell_test_suites(
     commands per file instead of inventing an aggregate. The interpreter is
     pinned to an absolute path at discovery so a repro cannot pick a different
     bash/zsh off PATH, and rc files are disabled by construction.
+
+    The pinning has a second effect worth knowing: ``required_binaries`` gets
+    the resolved path appended, so on a machine that lacks the shell the suite
+    becomes SKIP with a named reason (adapters check existence at run time)
+    rather than a discovery failure or a phantom PASS. ``files`` entries must
+    be repo-relative and free of ``..`` — a manifest cannot point a shell suite
+    at ``/etc/passwd`` or outside the checkout.
     """
     where = f"manifest {manifest} suite[{idx}]"
     files = _as_str_list(entry.get("files"), f"{where} files")
@@ -391,6 +467,15 @@ def _shell_test_suites(
 def _suites_from_manifest(
     data: Dict[str, Any], *, custom_from_manifest: bool, manifest: Path
 ) -> List[SuiteSpec]:
+    """Parse ``[[suite]]`` (or the ``[[suites]]`` spelling), expand, and de-duplicate.
+
+    Accepts a single table as well as an array so a one-suite manifest need not
+    be an array — a convenience that costs nothing because the shape is
+    normalised here rather than in every reader. Duplicate names are rejected
+    rather than silently merged: ``--suite <name>`` selection and per-suite
+    history rows both key on the name, so a collision would make selection
+    ambiguous and hide one of the two suites' results.
+    """
     entries = data.get("suite", data.get("suites", []))
     if entries is None:
         entries = []
@@ -448,7 +533,27 @@ def discover_project(
     store: Optional[TestBenchStore] = None,
     external_manifest: Optional[Path] = None,
 ) -> ProjectSpec:
-    """Detect the project layout and the suites it can run."""
+    """Detect the project layout and the suites it can run.
+
+    Selection between the two modes is a single decision: a local
+    ``.testbench.toml`` (regular file *or* symlink — the symlink then fails in
+    ``_read_manifest_text`` with a clear message) disables zero-config
+    detection entirely. A manifest that declares nothing yields an empty
+    suite list, not a fallback to detection: "the project owns its suite list"
+    must not be silently overridden by heuristics.
+
+    An ``external_manifest`` is trusted=false and custom_from_manifest=false
+    by construction — the operator supplied it, so it is neither the repo's
+    request nor a pinned document. That also means its ``allow_network`` /
+    ``allow_repo_write`` flags are **not** subject to the untrusted-manifest
+    veto in the engine, since that gate keys on ``custom_from_manifest``.
+    Callers that accept a path from a less-trusted source must not rely on this
+    function having gated it.
+
+    ``trusted`` is computed here from the store's pinned digest, but the
+    manifest bytes are read again immediately after; a concurrent writer
+    between the two reads can be approved-on-one-content / parsed-as-another.
+    """
     try:
         resolved = Path(root).expanduser().resolve(strict=True)
     except OSError as exc:
@@ -513,6 +618,22 @@ def discover_project(
 
 
 def _python_suite(root: Path) -> Optional[SuiteSpec]:
+    """Propose one Python suite, or ``None`` when the repo shows no Python tests.
+
+    The three-way command choice is about what is *installed*, not what is
+    preferred: ``uv run --offline --with pyte`` only when the tests import pyte
+    and plain pytest is missing, pytest when the interpreter has it, unittest
+    otherwise. Every branch keeps a verbosity flag or ``-q`` so the adapter's
+    marker/count parser has structured output to read rather than a bare exit
+    code.
+
+    ``needs_tmux`` is inferred from an adjacent ``hermes_tmux`` package or a
+    ``test_tmux_integration.py`` file, which is the difference between a suite
+    that can run headless and one that needs a live server. The pyte probe
+    reads test sources (bounded to ``tests/``) — that is a regex over
+    filenames' contents, not execution; the only execution here is
+    ``_has_module``'s ``-c "import ..."``.
+    """
     tests_dir = root / "tests"
     has_tests = tests_dir.is_dir() and any(tests_dir.glob("test_*.py"))
     has_pyproject = (root / "pyproject.toml").is_file()
@@ -724,7 +845,19 @@ sys.exit(1 if failed else 0)
 
 
 def _project_files(root: Path) -> List[str]:
-    """All non-noise, non-hidden project files as sorted posix relative paths."""
+    """All non-noise, non-hidden project files as sorted posix relative paths.
+
+    Bounded by ``MAX_WALK_FILES``. The cap is a silent truncation, not an
+    error: past 20k files the walk stops and returns what it has, so a huge
+    repository can end up with a partial inventory and therefore *missing*
+    detected suites (a ``.cob`` below the cut is simply never seen). Nothing
+    downstream can tell the difference between "no such files" and "stopped
+    looking", which is the honest limitation of a cheap walk — a repo that
+    large needs a manifest.
+
+    Noise/hidden directories are pruned before descent, so ``node_modules``
+    and ``.venv`` cost nothing and the 20k budget is spent on real source.
+    """
     rels: List[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(
@@ -881,6 +1014,16 @@ sys.exit(rc_all)
 
 
 def _script_suites(root: Path, files: List[str]) -> Tuple[List[SuiteSpec], List[str]]:
+    """Known verifier scripts, adjusted by reading their source.
+
+    The adjustment is a heuristic, and an honest one: these scripts take a
+    path argument only if they mention ``sys.argv[1]``, and ``check-wiring.py``
+    gets wrapped in a synthetic two-home probe when it mentions
+    ``--hermes-home``/``hermes-bots``. A comment containing ``sys.argv[1]``
+    would append ``.`` needlessly — harmless, since a verifier that ignores the
+    extra argv still runs. Reading source at discovery keeps the script
+    contract "no flags means current directory" without a per-script table.
+    """
     suites: List[SuiteSpec] = []
     languages: List[str] = []
     present = set(files)
@@ -946,6 +1089,14 @@ def _tape_suites(root: Path, files: List[str]) -> List[SuiteSpec]:
 
 
 def _sqlite_suites(root: Path, files: List[str]) -> Tuple[List[SuiteSpec], bool]:
+    """Probe every ``*.db``/``*.sqlite`` in the tree for integrity and modes.
+
+    One suite, all files as argv: the probe opens each with
+    ``mode=ro&immutable=1`` so a check can never modify or lock the database
+    it is inspecting. It is deliberately read-only — a writable integrity check
+    would be the one command in TestBench that can corrupt the artifact it
+    reports on.
+    """
     dbs = [rel for rel in files if rel.endswith(".db") or rel.endswith(".sqlite")]
     if not dbs:
         return [], False
@@ -1028,7 +1179,22 @@ def _mutation_suites(root: Path) -> List[SuiteSpec]:
 
 
 def _detect_zero_config(root: Path) -> Tuple[List[SuiteSpec], List[str]]:
-    """Zero-config capability discovery for repositories with no manifest."""
+    """Zero-config capability discovery for repositories with no manifest.
+
+    Each detector is independent and additive; the returned language list is a
+    union used for display only, never for selection. Two ordering
+    consequences are load-bearing: Rust and Python come in one suite each
+    (their runners already discover internally), while Cobol, C, SQLite and
+    tapes produce one suite per source or per tape so a failure points at a
+    file. Mutation suites are appended last and only when the project ships the
+    tool's configuration — mutation testing is never inferred.
+
+    Note that detection is *permissive* in exactly one way: it proposes
+    whatever it finds, including a ``.db`` in the tree that the operator never
+    meant to probe. That is why zero-config suites are profile-tagged
+    (``integration`` for SQLite, ``security`` for C) rather than dumped into
+    ``unit``: running an unexpected profile is an explicit choice.
+    """
     suites: List[SuiteSpec] = []
     languages: List[str] = []
 

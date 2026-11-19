@@ -2,6 +2,29 @@
 
 Speaks newline-delimited JSON-RPC 2.0 over stdin/stdout with zero external dependencies.
 Never writes anything except valid JSON-RPC frames to stdout; diagnostics go to stderr.
+
+Surface, deliberately small: ``initialize``, ``ping``, ``tools/list``, ``tools/call``.
+Everything else — including every notification, which has no ``id`` — is either ignored
+(notifications) or answered with ``-32601 Method not found``. There are no resources,
+prompts or subscriptions, so a client that asks for them gets a clean protocol error
+rather than an empty success.
+
+Error taxonomy, because the difference matters to a caller: JSON-RPC ``error`` frames
+mean the *protocol* failed (parse error, unknown method, missing method); ``result`` with
+``isError: true`` means the *tool* failed and carries ``{"error", "code"}`` with one of
+``invalid_arguments``/``invalid_params``/``not_found``/``unauthorized``/
+``internal_error``/``unknown_tool``. A tool error is never a transport error, so a client
+can retry or re-prompt without treating the connection as broken.
+
+Ownership: ``serve_stdio()`` creates and closes a ``TestBenchEngine`` only when it was not
+handed one (tests inject a store-backed engine). Runs are spawned through
+``engine.spawn_async`` and therefore survive this server's lifetime: the worker runs in its
+own session (``start_new_session``), so killing the MCP client does not kill it and the run
+normally completes. ``reconcile_orphans()`` only sweeps a run whose worker actually died.
+
+Deliberate policy: ``testbench_run`` always passes ``allow_billable=False, max_tokens=0``.
+There is no MCP knob for spending money on an LLM-backed suite; that stays a CLI/operator
+decision.
 """
 
 from __future__ import annotations
@@ -19,6 +42,10 @@ from .schema import RunRecord
 HANDSHAKE_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 DEFAULT_PROTOCOL_VERSION = "2025-11-25"
 
+# Advertised surface. Every entry needs a matching branch in ``_dispatch_tool``; the
+# schema here is what the client validates against, so it is also the contract for
+# argument names. ``annotations`` are advisory only — the real policy (scope enforcement,
+# billable denial) lives in the engine and in ``_dispatch_tool``, never in the schema.
 TOOLS_SPEC: List[Dict[str, Any]] = [
     {
         "name": "testbench_discover",
@@ -125,6 +152,19 @@ TOOLS_SPEC: List[Dict[str, Any]] = [
 
 
 def _compact_run_summary(run: RunRecord, *, include_suites: bool = False) -> Dict[str, Any]:
+    """Flatten a ``RunRecord`` into the shape an agent actually reads.
+
+    Every free-text field goes through ``sanitize_for_agent`` with its own bound: this is
+    the boundary where operator logs (possibly containing a secret) become model input.
+    Bounds differ per field on purpose — a first failure is worth 500 chars, a suite
+    excerpt 1200, a per-failure message 600 — and ``suites`` is opt-in because the full
+    suite list is large and most questions are about the run level.
+
+    Paths (``evidence_dir``, ``run_json_path``, ``junit_xml_path``) are passed through
+    untouched: they are local filesystem references the client is allowed to open, not
+    content. ``failures`` is capped at 10 per suite — the evidence directory is the
+    complete record.
+    """
     out: Dict[str, Any] = {
         "run_id": run.run_id,
         "project": run.project,
@@ -197,6 +237,23 @@ def _tool_err(message: str, code: str = "error") -> Dict[str, Any]:
 
 
 def _dispatch_tool(engine: TestBenchEngine, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Route one ``tools/call`` to the engine and shape the tool result.
+
+    ``reconcile_orphans()`` runs on *every* call, before dispatch: it is what turns a run
+    whose worker died (killed client, reboot) into a settled ERROR record, so the first
+    question after a crash does not block on a RUNNING row forever. It is cheap and
+    idempotent; that is why it is here rather than in the server loop.
+
+    Exceptions are *not* caught here — ``_handle_rpc_message`` maps
+    ``AuthorizationError``/``KeyError``/``ValueError`` to error codes and catches the
+    rest as ``internal_error``. Anything raised past this point is a bug, and it is
+    reported as one instead of being retried.
+
+    Behaviour that surprises callers: ``testbench_results`` with no arguments returns the
+    most recent run of any project (a convenience, not a filter); ``testbench_status``
+    clamps ``limit`` to 1..50 silently; ``testbench_cancel`` on an already-terminal run
+    returns that run unchanged rather than erroring.
+    """
     engine.store.reconcile_orphans()
 
     if name == "testbench_discover":
@@ -344,6 +401,18 @@ def _dispatch_tool(engine: TestBenchEngine, name: str, args: Dict[str, Any]) -> 
 
 
 def _handle_rpc_message(engine: TestBenchEngine, msg: Any) -> Optional[Dict[str, Any]]:
+    """One JSON-RPC frame in, at most one frame out (``None`` for notifications).
+
+    The rule that shapes everything else: **no ``id`` means no reply**. A notification
+    (``notifications/initialized``, ``notifications/cancelled``) that got a response would
+    desynchronise every compliant client, so the absence check comes before method
+    dispatch, not after.
+
+    Version negotiation: an offered ``protocolVersion`` is echoed only when it is one of
+    ``HANDSHAKE_VERSIONS``; anything else (unknown, missing, non-string) is answered with
+    ``DEFAULT_PROTOCOL_VERSION``. The server does not try to emulate an older protocol —
+    it advertises what it implements and lets the client decide.
+    """
     if not isinstance(msg, dict):
         return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
     method = msg.get("method")
@@ -415,6 +484,20 @@ def serve_stdio(
     instream: Optional[io.TextIOBase] = None,
     outstream: Optional[io.TextIOBase] = None,
 ) -> int:
+    """Serve newline-delimited JSON-RPC until stdin closes or the operator interrupts.
+
+    One frame per line, written and flushed per reply: a client reading with a timeout
+    must never be left holding a buffered frame. Blank input lines are skipped rather than
+    answered — a stray newline is not a parse error.
+
+    A malformed line gets a ``-32700`` frame with ``id: null`` and the loop continues, so
+    one bad write does not poison the connection. Only ``KeyboardInterrupt`` is treated as
+    a normal stop (exit 0); everything else propagates so a crash is visible to the parent
+    rather than looking like a clean shutdown.
+
+    ``instream``/``outstream`` exist for tests and embedding; passing an engine means the
+    caller owns its lifetime (``owns_engine`` is False and ``close()`` is not called).
+    """
     owns_engine = engine is None
     eng = engine if engine is not None else TestBenchEngine()
     inp = instream if instream is not None else sys.stdin

@@ -1,8 +1,23 @@
 """Reproducible benchmarking: environment provenance, statistics, workloads, comparison.
 
-Benchmarks never carry pass/fail policy: ``run_workload`` records a ``RunRecord`` with
-``profile='benchmark'`` whose status only reports whether the command itself ran, and
-``compare_benchmarks`` emits deltas, never a threshold verdict.
+Benchmarks carry no *performance* policy. ``run_workload`` records a ``RunRecord`` with
+``profile='benchmark'`` whose status reports only whether every iteration exited 0 —
+warmup included — never whether a number looked fast enough. ``compare_benchmarks``
+emits deltas and environment drift, never a threshold verdict.
+
+Why no percentage gate: a pass/fail cut on wall-clock noise converts machine state
+into a verdict. A 5% ceiling fails on a laptop running a video call and passes on an
+idle server for the same commit, so the signal says more about the host than the code.
+The alternative kept here is to publish the distribution (p50/p95/IQR/MAD), publish the
+provenance (CPU count, load average, compiler versions, git revision), and let the
+reader — usually a human comparing two runs of the same workload — decide whether a
+delta is interesting. ``comparable`` is the only gate, and it is about environment
+drift, not speed.
+
+Timing is measured by ``isolation.run_isolated_command`` around the whole child
+process, so it includes fork/exec and interpreter startup and the number answers
+"how long did this command take" rather than "how long did its kernel run". Subtract a
+baseline workload if you need the harness overhead; do not subtract a constant here.
 """
 
 from __future__ import annotations
@@ -26,7 +41,15 @@ _VERSION_TOOLS = ("rustc", "cargo", "cobc", "clang")
 
 
 def _scrub_identity(value: str) -> str:
-    """Remove home-directory and host-name traces from a version string."""
+    """Remove home-directory and host-name traces from a version string.
+
+    Applied to values that end up in the benchmark payload, which is persisted and
+    shared. Ordering is home first, then the literal ``Users/`` prefix (so a path that
+    lost its leading slash is still stripped), then the full nodename and its short
+    form. The short-form replacement is a plain substring swap and can therefore rewrite
+    unrelated text if the hostname is a common word — a cosmetic risk accepted over
+    leaking a username, and the reason this helper is never used on opaque data.
+    """
     text = str(value)
     home = str(Path.home())
     if home:
@@ -63,6 +86,9 @@ def _tool_version(tool: str) -> str:
 
 
 def _git(cwd: Path, *args: str) -> str:
+    # A git failure (not a repository, no HEAD, detached oddities) is "unknown
+    # provenance", not an error: the benchmark still ran. Empty string is the
+    # representation, so consumers must not read "" as "clean tree".
     try:
         proc = subprocess.run(
             ["git", "-C", str(cwd), *args],
@@ -79,7 +105,21 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def collect_environment_metadata(cwd: Path) -> Dict[str, Any]:
-    """Capture provenance for a benchmark run without leaking local identity."""
+    """Capture provenance for a benchmark run without leaking local identity.
+
+    One flat dict, all values JSON-safe, all strings scrubbed. It answers "was this the
+    same machine and the same toolchain" — not "was this a fair comparison", which
+    ``compare_benchmarks`` decides later by diffing this dict.
+
+    Cost: up to six subprocesses (``git`` twice, one ``--version`` per tool), each
+    capped at 10 s and failing to an empty string. Missing tools produce an empty
+    version rather than an error, so the payload shape is identical everywhere; a
+    reader must treat ``""`` as "unknown", not as "not installed at this version".
+
+    ``loadavg`` is the 1/5/15-minute triplet at collection time — a coarse hint, kept
+    because it is the cheapest signal that a sample set was taken under load. It is
+    not compared as drift (it would always differ).
+    """
     resolved = Path(cwd).expanduser()
     try:
         resolved = resolved.resolve(strict=True)
@@ -126,7 +166,16 @@ def collect_environment_metadata(cwd: Path) -> Dict[str, Any]:
 
 
 def _quantile(sorted_values: List[float], q: float) -> float:
-    """Linear-interpolation quantile (Type 7), matching common benchmark tooling."""
+    """Linear-interpolation quantile (Type 7), matching common benchmark tooling.
+
+    Type 7 (NumPy/Excel ``PERCENTILE.INC`` default) interpolates between order
+    statistics at ``q * (n - 1)``. With few samples the result sits between two real
+    observations, so p95 of a five-sample run is an interpolation, not a measured
+    point — quote ``runs`` alongside any percentile.
+
+    Takes an already-sorted list and trusts the caller: sorting inside would hide the
+    O(n log n) behind a helper that is called three times per sample set.
+    """
     if not sorted_values:
         raise ValueError("quantile of empty sample set")
     if len(sorted_values) == 1:
@@ -141,7 +190,22 @@ def _quantile(sorted_values: List[float], q: float) -> float:
 
 
 def compute_stats(samples_ms: List[float]) -> Dict[str, Any]:
-    """Describe a sample set. Dispersion fields are 0.0 for a single sample."""
+    """Describe a sample set. Dispersion fields are 0.0 for a single sample.
+
+    Fields: ``runs`` (n), min/max/mean, ``p50_ms`` (median), ``p95_ms``, ``iqr_ms``
+    (q75-q25), ``mad_ms`` (median absolute deviation from p50) and ``stdev_ms``
+    (sample standard deviation, n-1).
+
+    Why both IQR and MAD: IQR describes the middle half, so one extreme sample moves
+    it less than it moves a stdev; MAD describes typical distance from the median and
+    survives a few. Neither is derived from the other, and reporting both makes a
+    bimodal sample set (e.g. a GC pause in half the runs) visible in a way a single
+    stdev is not. ``stdev_ms`` is the non-robust number kept for familiarity, not the
+    one to trust on a noisy host.
+
+    Raises on an empty set instead of returning zeros: zero dispersion for zero
+    samples is a lie that a downstream threshold would happily consume.
+    """
     values = [float(v) for v in samples_ms]
     if not values:
         raise ValueError("compute_stats requires at least one sample")
@@ -178,7 +242,34 @@ def run_workload(
     timeout_s: float = 120.0,
     scratch_root: Optional[Path] = None,
 ) -> Tuple[RunRecord, Dict[str, Any]]:
-    """Execute ``warmup`` + ``repeats`` iterations and persist timing evidence."""
+    """Execute ``warmup`` + ``repeats`` iterations and persist timing evidence.
+
+    Semantics:
+
+    * ``warmup`` iterations run first and are timed, but their durations go only into
+      ``payload['warmup_ms']``. They exist to pay one-time costs (page cache, JIT,
+      dynamic linking) so the sample set describes steady state.
+    * ``repeats`` iterations produce ``samples_ms`` and ``exit_codes``; ``stats`` is
+      computed over those samples only.
+    * ``status`` is PASS only if *every* iteration — warmup included — exited 0 and
+      none timed out. A non-zero exit means the workload itself is broken; that is a
+      liveness verdict, not a performance one.
+    * ``pass_count``/``fail_count`` are derived from the sample exit codes alone, so a
+      warmup-only failure produces FAIL with ``pass_count == total_count``. Read
+      ``status`` and ``first_failure``, not the counts, when a warmup can fail.
+    * A timed-out sample is recorded with ``exit_code == -1`` and its (capped)
+      duration, and still enters ``stats``. The payload therefore describes "what the
+      command did within the timeout", including when what it did was time out.
+
+    The ``RunRecord`` is created before the first iteration so an interrupted run is
+    reconcilable from the store; on an exception mid-loop it is finalised as ERROR
+    with ``failure_kind='harness_error'`` and the exception is re-raised. Durations are
+    rounded to whole microseconds (3 decimal places of ms) to keep the payload stable
+    across machines without pretending to more precision than the clock has.
+
+    ``repro_instructions`` is an exact CLI line; ``--timeout`` is omitted when it
+    equals the CLI default so the printed command matches what a user would type.
+    """
     if not name or not isinstance(name, str):
         raise ValueError("workload name is required")
     if int(warmup) < 0:
@@ -292,18 +383,43 @@ def run_workload(
     return run, payload
 
 
+# Only three statistics are compared: p50 (typical), p95 (tail), IQR (predictability)
+# — the three questions a reader usually has, answerable separately. min/max/mean/stdev
+# stay in the payload for anyone who wants them; comparing all seven mostly produces
+# deltas nobody acts on.
 _COMPARED_STATS = ("p50_ms", "p95_ms", "iqr_ms")
+# Keys that invalidate a comparison. ``revision`` changes what is being measured;
+# the rest change how fast the machine measures it. Toolchain versions
+# (rustc/cargo/cobc/clang) and sqlite are collected but not compared — a compiler
+# upgrade can move a workload just as far as a CPU change, and today that drift is
+# reported as comparable. Load average is excluded on purpose: it always differs.
 _DRIFT_KEYS = ("revision", "cpu_count", "os_release", "arch", "python_version")
 
 
 def _ratio(candidate: float, baseline: float) -> float:
+    # 0/0 is "no change" (1.0) rather than NaN; x/0 is infinite rather than a crash,
+    # because a zero baseline is a real payload state and the renderer formats inf.
     if baseline == 0:
         return 1.0 if candidate == 0 else float("inf")
     return candidate / baseline
 
 
 def compare_benchmarks(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
-    """Pairwise deltas and environment drift notes. No verdicts, no policy."""
+    """Pairwise deltas and environment drift notes. No verdicts, no policy.
+
+    Output is per-stat ``{baseline, candidate, delta_ms, delta_pct, ratio}`` plus
+    ``drift_notes`` and ``comparable`` (true only when no drift key differs). The
+    caller decides what a delta means; nothing here knows a threshold.
+
+    Missing input is coerced, not rejected: an absent stat becomes 0.0 and a zero
+    baseline makes ``delta_pct`` 0.0 while ``ratio`` becomes ``inf``. Those two fields
+    therefore disagree for the same comparison, and a payload without ``stats``
+    produces a full table of zeros that looks like a real result. Compare stored
+    payloads, not hand-built dicts.
+
+    ``workload``/``project`` fall back to the baseline when the candidate omits them,
+    so a partially populated row still labels itself.
+    """
     base_stats = baseline.get("stats") or {}
     cand_stats = candidate.get("stats") or {}
     deltas: Dict[str, Dict[str, Any]] = {}
@@ -345,7 +461,13 @@ def compare_benchmarks(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> D
 
 
 def format_benchmark_comparison(comp: Dict[str, Any]) -> str:
-    """Render a comparison as plain text: deltas and drift, never a verdict."""
+    """Render a comparison as plain text: deltas and drift, never a verdict.
+
+    Fixed-width columns so two runs can be diffed in a terminal, and the drift section
+    is printed even when empty (``none``) — an absent drift section would read as "no
+    drift checked" rather than "no drift found". Ratio is rendered with three decimals
+    so a 1.05 and a 1.5 cannot be confused at a glance.
+    """
     lines: List[str] = []
     lines.append(f"benchmark comparison: {comp.get('workload', '')}")
     lines.append(

@@ -4,6 +4,31 @@ No I/O, no clocks, no curses: everything here is a pure function over
 :class:`TuiState` so the TUI can be exercised in-process (ADR-0003).
 Visual grammar mirrors ``hxmail`` ``render.rs``: zero borders, zero spinners,
 256-colour indexed palette, fixed-width status words, and ASCII fallback.
+
+Purity has two documented leaks, both intentional:
+
+* ``now_iso`` is supplied by the caller (``tui.py``); nothing here reads a
+  clock, so elapsed labels are reproducible from a fixture;
+* ``_fmt_timestamp`` renders in the *process* timezone. Same state under a
+  different ``TZ`` yields a different string, which is why the tests build their
+  expectation with the same ``astimezone()`` call instead of hard-coding an
+  offset.
+
+Geometry contract, relied on by the writer so it never has to query the terminal
+mid-draw: every returned line is exactly ``width`` display cells and
+``render_frame`` returns exactly ``height`` lines — for ``height >= 4`` and
+``width >= 10``. Below either threshold it returns ``height`` blank rows. Widths
+are counted in cells (``display_width``), not codepoints, so CJK text and
+combining marks cannot shear a column.
+
+Layout: row 0 is the header (identity left, counters right), rows ``1..h-3`` are
+the body, row ``h-2`` is the hint line, row ``h-1`` is the minibuffer. The body is
+a 2-column master/detail split at ``width >= 120``, one column with an optional
+inline inspector below that, and a full-screen sheet when ``Enter`` opens detail.
+
+Sanitisation: every string that reaches the frame passes ``sanitize_terminal_text``
+and ``_flatten``. The only escape sequences this module emits are its own SGR
+colours and the frame-control sequences in ``format_ansi_frame``.
 """
 
 from __future__ import annotations
@@ -34,7 +59,13 @@ _HISTORY_ORDERS = ("newest", "failures first", "longest")
 
 @dataclass(frozen=True)
 class TuiAction:
-    """A side effect the caller (``tui.py``) is allowed to perform."""
+    """A side effect the caller (``tui.py``) is allowed to perform.
+
+    ``kind`` is the contract: ``quit``, ``copy_repro``, ``rerun``,
+    ``run_profile``, ``cancel_run``. ``payload`` keys are per-kind and read
+    defensively by the caller, so a missing key degrades to an empty string
+    rather than a ``KeyError`` inside the TUI loop.
+    """
 
     kind: str
     payload: Dict[str, Any] = field(default_factory=dict)
@@ -42,6 +73,12 @@ class TuiAction:
 
 @dataclass(frozen=True)
 class ProfileOption:
+    """One row of the ``r`` picker.
+
+    ``billable`` is the only gate the picker honours; the engine enforces the
+    same rule again, so a stale flag here cannot cause a billable run.
+    """
+
     name: str
     billable: bool = False
     description: str = ""
@@ -49,6 +86,13 @@ class ProfileOption:
 
 @dataclass(frozen=True)
 class BenchmarkRow:
+    """Renderer-side projection of a ``benchmarks`` row.
+
+    ``baseline_p50_ms`` is already resolved by the caller (oldest recorded p50
+    for the same ``project:workload``), not a self-reference, so the delta
+    column means "versus first observation".
+    """
+
     project: str
     profile: str
     run_id: str = ""
@@ -73,6 +117,24 @@ class ConfirmPrompt:
 
 @dataclass(frozen=True)
 class TuiState:
+    """Everything a frame can depend on, split by owner.
+
+    Store-owned (replaced wholesale by ``tui._refresh_from_store``):
+    ``runs``, ``projects``, ``benchmarks``, ``profiles``, ``baselines``,
+    ``log_lines``, ``now_iso``, ``store_status``, ``error_banner``.
+
+    User-owned (only ``handle_key`` changes them; a refresh must preserve them):
+    ``view``, ``history_order``, ``selected``, ``project_filter``,
+    ``search_query``, the overlay flags, ``picker_index``, ``search_buffer``,
+    ``confirm``, ``minibuffer``, ``detail_scroll``, ``permanent_tab``.
+
+    Two consequences worth knowing before debugging a stale row:
+    ``selected`` is an *index into a derived list*, not a run id, so it is
+    re-anchored by ``preserve_history_selection`` after a reordering refresh;
+    and ``runs`` is only the newest window the caller fetched, so "not in
+    ``state.runs``" means "not loaded", never "not in the store".
+    """
+
     runs: Tuple[RunRecord, ...] = ()
     projects: Tuple[Any, ...] = ()
     benchmarks: Tuple[BenchmarkRow, ...] = ()
@@ -104,7 +166,17 @@ class TuiState:
 
 
 class Palette:
-    """256-colour indexed palette with a strict monochrome mode."""
+    """256-colour indexed palette with a strict monochrome mode.
+
+    Monochrome (``NO_COLOR`` or ASCII mode) collapses colour to the minimum that
+    still conveys structure: bold for emphasis, reverse video for the selected
+    row, nothing else. Indexed colour only — no truecolor — because the target is
+    tmux under a 256-colour terminfo.
+
+    ``primary()`` returns "" by design (the frame is unstyled by default) and
+    ``grey()`` is kept for parity with the ``hxmail`` palette; neither is
+    referenced by any row renderer today.
+    """
 
     def __init__(self, no_color: bool = False) -> None:
         self.no_color = bool(no_color)
@@ -145,6 +217,14 @@ _SGR_RE = re.compile(r"\x1b\[[0-9;]*m\Z")
 
 
 def _char_cells(ch: str) -> int:
+    """Display cells for one character: 0, 1, or 2.
+
+    Zero covers everything that occupies no column of its own — C0/C1 controls,
+    zero-width space/joiners, combining marks, and Hangul medial/final jamo.
+    Two covers East Asian Wide/Fullwidth. Anything else is one. The conservative
+    direction matters: over-counting a zero-width glyph would push the pad out
+    and wrap the pane, so ambiguous characters stay at 1.
+    """
     cp = ord(ch)
     if cp < 0x20 or cp == 0x7F:
         return 0
@@ -181,6 +261,11 @@ def _flatten(text: str) -> str:
 
 
 def display_width(text: str) -> int:
+    """Cells occupied by ``text`` once sanitised (escapes count zero).
+
+    Measured on the sanitised form, so this is the width the terminal will
+    actually paint — the same function the tests assert frame geometry with.
+    """
     width = 0
     for kind, chunk in _segments(text or ""):
         if kind == "text":
@@ -189,6 +274,17 @@ def display_width(text: str) -> int:
 
 
 def fit_cells(text: str, width: int) -> str:
+    """Return ``text`` padded or truncated to exactly ``width`` cells.
+
+    Strips every escape sequence that is not SGR, flattens CR/LF/TAB to spaces,
+    keeps this module's own colour sequences, pads on the right, and never splits
+    a wide glyph (``日本語`` in 5 cells becomes ``日本 `` — 5 cells, not 4 plus a
+    dangling half-cell). A truncation that cut through styled text appends a
+    ``reset`` so colour cannot bleed into the padding or the next column.
+
+    ``width <= 0`` returns "" — callers compute widths by subtraction and can go
+    negative on a very narrow pane.
+    """
     if width <= 0:
         return ""
     out: List[str] = []
@@ -235,6 +331,13 @@ _STATUS_WORD = {
     RunStatus.CANCELLED: "CNCL",
     RunStatus.ERROR: "ERR ",
 }
+# Every value above is exactly four cells (trailing space where the word is
+# shorter), so status columns never shift under NO_COLOR or ASCII mode.
+
+#: "Failure" for History ranking and for red styling. Deliberately narrower than
+#: the set ``tui._load_log_tail`` treats as failure evidence: a CANCELLED or
+#: BLOCKED run needs an explanation in the inspector, but it is not a regression
+#: and does not belong at the top of "failures first".
 _FAILURE_STATUSES = frozenset({RunStatus.FAIL, RunStatus.ERROR, RunStatus.TIMEOUT})
 _STATUS_RANK = {
     RunStatus.FAIL: 0,
@@ -286,6 +389,18 @@ def _fmt_duration(ms: Optional[float]) -> str:
 
 
 def _fmt_timestamp(value: Optional[str]) -> str:
+    """Render a UTC ISO stamp in the operator's local timezone, or ``UNSET``.
+
+    Only offset-aware input is displayed. A naive stamp is *not* assumed to be
+    local — it is shown as ``-``, because silently labelling an unknown zone as
+    "here" would be a nicer-looking lie than the honest dash. That is also why
+    ``QUEUED`` runs show ``started -``: ``spawn_async`` records no ``started_at``
+    until a worker claims the run.
+
+    Malformed and out-of-range values (``OverflowError`` from an absurd year,
+    ``OSError`` from a platform ``localtime`` limitation) collapse to ``UNSET``
+    rather than raising inside a frame.
+    """
     if not value:
         return UNSET
     try:
@@ -298,6 +413,13 @@ def _fmt_timestamp(value: Optional[str]) -> str:
 
 
 def _parse_iso(value: Optional[str]) -> Optional[float]:
+    """Epoch seconds from an ISO stamp, or ``None`` if it cannot be parsed.
+
+    Permissive compared to ``_fmt_timestamp``: a *naive* stamp is interpreted in
+    local time, which is fine for "which of these is newer" and unacceptable for
+    display. Keep the two behaviours in mind when a record sorts plausibly but
+    shows ``-`` for its start time.
+    """
     if not value:
         return None
     try:
@@ -307,6 +429,17 @@ def _parse_iso(value: Optional[str]) -> Optional[float]:
 
 
 def _elapsed_label(state: TuiState, run: RunRecord) -> str:
+    """``12.3s`` or ``12.3s / ~40.0s`` for an active run.
+
+    Baseline precedence: the run's own recorded ``environment.baseline_duration_ms``
+    first (a replayed or delegated run carries the figure it was measured
+    against), then the newest PASS duration for ``project:profile``. No invented
+    baseline: absent both, the label is elapsed only.
+
+    Elapsed is clamped at zero because ``now_iso`` is sampled on a different
+    clock read than ``started_at``; a negative duration would be a frame artifact,
+    not information. A missing or unparseable ``started_at`` yields ``-``.
+    """
     started = _parse_iso(run.started_at)
     now = _parse_iso(state.now_iso)
     if started is None or now is None:
@@ -343,6 +476,19 @@ def _run_sort_ts(run: RunRecord) -> float:
 
 
 def _overview_runs(state: TuiState) -> List[RunRecord]:
+    """Overview rows: every active run, then one row per project.
+
+    Active runs come first, RUNNING before QUEUED (a queued job never outranks
+    the job already executing), oldest first within a class — FIFO for queued
+    work, and ``-idx`` breaks timestamp ties toward the older row because
+    ``state.runs`` is newest-first.
+
+    The terminal half keeps only the latest run per project and drops
+    benchmark-profile runs (they belong to the Benchmarks view); the remainder is
+    ranked by status severity then project name, so failures surface without
+    pushing a project out of the list. One consequence: the overview shows at most
+    one historical row per project, so it is not a substitute for History.
+    """
     indexed = [(idx, r) for idx, r in enumerate(state.runs) if _project_ok(state, r.project) and _query_ok(state, r)]
     active = [
         r
@@ -364,6 +510,31 @@ def _overview_runs(state: TuiState) -> List[RunRecord]:
 
 
 def _history_runs(state: TuiState) -> List[RunRecord]:
+    """History rows for the current filters and the current ``history_order``.
+
+    Filters (project, search query) are applied *before* ordering, so every order
+    is a permutation of the same set — switching order can never add or hide a
+    run. That is the invariant the ``s`` keybinding and the PTY test rely on.
+
+    Base order is newest-first by ``created_at`` (not by ``started_at``: a queued
+    run has no start time, and History must still be stable while one waits).
+    Unparseable timestamps sort to the bottom of the base order rather than
+    raising. ``-idx`` breaks timestamp ties toward the *newer* row, matching
+    ``store.list_runs``' ``created_at DESC, rowid DESC``.
+
+    Then, one stable sort over the base:
+
+    * ``failures first`` — FAIL/ERROR/TIMEOUT above everything else, newest-first
+      inside each group;
+    * ``longest`` — descending duration, with ``duration_ms is None`` (never
+      completed, or a run still active) sorted last rather than as zero. A
+      genuinely instant run (0.0) therefore ranks below every positive duration
+      but above an unknown one.
+
+    Because each stabilization is a stable sort over an already newest-first
+    list, "equal key" keeps the honest tiebreak; nothing here has to re-state the
+    secondary order.
+    """
     indexed = [(idx, r) for idx, r in enumerate(state.runs) if _project_ok(state, r.project) and _query_ok(state, r)]
     runs = [r for _idx, r in sorted(indexed, key=lambda item: (_run_sort_ts(item[1]), -item[0]), reverse=True)]
     # Stable sorts preserve newest-first order within equal keys.
@@ -375,7 +546,20 @@ def _history_runs(state: TuiState) -> List[RunRecord]:
 
 
 def preserve_history_selection(previous: TuiState, current: TuiState) -> TuiState:
-    """Keep the same run selected when sorting or refreshing History."""
+    """Keep the same run selected when sorting or refreshing History.
+
+    ``selected`` is an index, so any reordering (``s``, or a refresh that
+    re-pages rows) would otherwise silently retarget ``R``/``x``/``y`` at a
+    different run. This maps the previously selected run's id into the new list
+    and rewrites ``selected`` to that index.
+
+    It is a no-op when either side is not in the History view (the mapping would
+    be meaningless for view-specific lists) and when the previous list is empty.
+    If the selected id is *gone* (pruned, or filtered out by a concurrent
+    refresh) the incoming index is kept as-is, which can point at a neighbouring
+    run — the caller must not assume the selection survived just because
+    ``selected`` is still in range.
+    """
     if previous.view != "history" or current.view != "history":
         return current
     old_runs = _history_runs(previous)
@@ -397,6 +581,13 @@ def _benchmark_rows(state: TuiState) -> List[BenchmarkRow]:
 
 
 def _view_items(state: TuiState) -> List[Any]:
+    """Items the current view lists, in display order.
+
+    The single source of truth for row order *and* for what ``selected`` indexes:
+    every navigation handler measures against ``_view_len`` (this list's length),
+    every row renderer iterates it, and ``_selected_run`` reads it. Adding a view
+    means adding a branch here and a ``VIEWS`` entry, nothing else.
+    """
     if state.view == "history":
         return _history_runs(state)
     if state.view == "projects":
@@ -424,6 +615,14 @@ def _latest_run_for(state: TuiState, project: str) -> Optional[RunRecord]:
 
 
 def _selected_run(state: TuiState) -> Optional[RunRecord]:
+    """The run the cursor is on, whatever the current view lists.
+
+    History and Overview list ``RunRecord`` directly. Projects resolve to that
+    project's latest run; Benchmarks resolve by ``run_id`` when the matching run
+    is still loaded, else fall back to the project's latest. A ``None`` here is
+    the normal empty-store case, not an error — every action key checks it and
+    flashes "no run selected" rather than acting on nothing.
+    """
     items = _view_items(state)
     if not items:
         return None
@@ -455,6 +654,15 @@ def _repro_for(run: RunRecord) -> str:
 
 
 def _counts(run: RunRecord) -> str:
+    """Compact counts column: ``pending``, ``4/5``, or ``4+2s``.
+
+    ``pending`` exists because adapters only learn counts as suites finish; a live
+    run must not render ``0/0`` as if nothing passed.
+
+    ``4+2s`` means "4 passed, 2 skipped" — the ``s`` is the skip marker, not
+    seconds, but it sits two columns from a duration field so it reads
+    ambiguously at a glance. The wide form (``_counts_detail``) spells it out.
+    """
     total = run.total_count or 0
     passed = run.pass_count or 0
     skipped = run.skip_count or 0
@@ -615,6 +823,19 @@ def _bench_row(pal: Palette, bench: BenchmarkRow, selected: bool, marks: Dict[st
 
 
 def _list_rows(state: TuiState, pal: Palette, width: int, marks: Dict[str, str], max_rows: int) -> List[str]:
+    """Render one row per visible item for the current view.
+
+    ``max_rows`` is the body height the caller can afford. Only History pages:
+    the window is aligned to a multiple of ``max_rows`` and clamped so the last
+    page is full, which keeps the selected row on screen after ``G`` or a sort
+    that moves a run across a page boundary.
+
+    The other views deliberately render from row 0 and let the caller's
+    ``_fit_body`` drop the overflow. Consequence, and a live defect lead: on
+    Overview, Projects, or Benchmarks a selection past the last visible row has
+    no cursor on screen — the count of projects, not the height of the pane,
+    decides whether that happens.
+    """
     items = _view_items(state)
     index = _clamped_index(state, items)
     start = 0
@@ -679,6 +900,23 @@ def _prioritized_logs(run: RunRecord, raw_logs: Sequence[str], limit: int = 4) -
 
 
 def _inspector_lines(state: TuiState, pal: Palette, run: Optional[RunRecord], max_width: int = 64) -> List[str]:
+    """Right-hand (or inline) master/detail panel for one run.
+
+    Fixed field order: identity, status, counts, duration, **started/ended in
+    local time**, then wrapped failure / repro-command / evidence fields, then a
+    short log window. Started and ended are printed from the record, never
+    derived from duration — a run with no ``finished_at`` shows ``ended -``
+    rather than a computed guess, which is the difference between "we did not
+    record it" and "it ended at this time".
+
+    ``repro`` is the command that replays the run (``testbench reproduce <id>``);
+    the recorded original command, when present, is the extra ``cmd`` field.
+
+    The log section is not a tail dump: ``_prioritized_logs`` pulls matching
+    failure lines first for a failed run, then fills with the tail, capped at four
+    lines. The count on the ``log`` row is the number of lines actually captured,
+    which is why a large run can say "80 lines" and show four.
+    """
     if run is None:
         return [_paint(pal, pal.dim(), "no run selected")]
     tb_repro = f"testbench reproduce {_clean(run.run_id)}"
@@ -713,6 +951,14 @@ def _inspector_lines(state: TuiState, pal: Palette, run: Optional[RunRecord], ma
 
 
 def _detail_lines(state: TuiState, pal: Palette) -> List[str]:
+    """Contents of the full-screen sheet opened by ``Enter`` (``< 120`` cols).
+
+    Every log line is numbered and shown — this is the only view that does not
+    prioritise or cap the tail — followed by a closing hint that also documents
+    the scroll keys. ``detail_scroll`` indexes this list, so its length is what
+    ``G`` jumps to; the renderer clamps the scroll again at draw time, which is
+    why a resized pane cannot scroll past the end.
+    """
     run = _selected_run(state)
     if run is None:
         return ["DETAIL", "", "no run selected"]
@@ -769,6 +1015,17 @@ def _help_lines(pal: Palette) -> List[str]:
 
 
 def _picker_options(state: TuiState) -> List[Tuple[str, str, bool]]:
+    """Rows of the open picker: ``(name, description, billable)``.
+
+    Profile picks come from ``state.profiles``; the fallback derives them from
+    ``ProfileName.STANDARD`` so a store-less start still offers something, and it
+    hard-codes agent-eval as the billable one rather than trusting a missing list.
+
+    Project picks are the union of the registry and every project that appears in
+    ``state.runs`` — an unregistered checkout can still be filtered by, which is
+    the difference between "not registered" and "not visible". ``ALL`` is always
+    first and maps to the empty filter.
+    """
     if state.picker_kind == "profile":
         profiles = state.profiles or tuple(
             ProfileOption(name, billable=(name == ProfileName.AGENT_EVAL)) for name in ProfileName.STANDARD
@@ -796,6 +1053,12 @@ def _picker_lines(state: TuiState, pal: Palette, marks: Dict[str, str]) -> List[
 
 
 def _minibuffer_line(state: TuiState, pal: Palette, width: int) -> str:
+    """Band ``h-1``: one line, strict precedence.
+
+    confirm > search > flash message > error banner > ``ready``. The precedence
+    is why a confirmation can never be hidden behind a stale "copied" flash, and
+    why an error banner cannot outrank a live prompt the operator must answer.
+    """
     if state.confirm is not None:
         text = " " + _clean(state.confirm.label) + "  (y confirm · any other key cancels)"
         return fit_cells(_paint(pal, pal.amber(), text), width) + pal.reset()
@@ -810,6 +1073,21 @@ def _minibuffer_line(state: TuiState, pal: Palette, width: int) -> str:
 
 
 def _header_line(state: TuiState, pal: Palette, width: int, marks: Dict[str, str]) -> str:
+    """Band 0: identity left, counters right, one space of gutter minimum.
+
+    Left is ``TESTBENCH · <PROJECT|ALL> · <view>`` plus the History order, so the
+    sort in force is visible without opening help. Right is live state: running,
+    queued, pass, fail, store status.
+
+    Read the counters with their scopes in mind — they are not all filtered the
+    same way. ``running``/``queued`` count **every** loaded run, ignoring the
+    project filter, while ``pass``/``fail`` count only the current view's filtered
+    set (and on Overview, only the deduped per-project rows). With a filter
+    applied, "1 running" can therefore refer to a run that has no row on screen.
+
+    ``store unavailable`` wins over the status word whenever an error banner is
+    set, so a banner and a "store ok" header can never disagree.
+    """
     sep = f" {marks['sep']} "
     project = _clean(state.project_filter).upper() or "ALL"
     left = (
@@ -848,6 +1126,13 @@ def _split_line(left: str, right: str, pal: Palette, left_w: int, right_w: int) 
 
 
 def _fit_body(lines: Sequence[str], body_h: int, width: int) -> List[str]:
+    """Crop/pad a body block to exactly ``body_h`` rows at exactly ``width`` cells.
+
+    Truncation is silent by design: the caller has already decided what matters
+    first (active rows, the selected page, the banner). Short blocks are padded
+    with empty strings and left to ``fit_cells``, so there is exactly one place
+    that decides how a row is filled to the frame width.
+    """
     rows = [line for line in lines]
     if len(rows) > body_h:
         rows = rows[:body_h]
@@ -869,12 +1154,31 @@ def _view_len(state: TuiState) -> int:
 
 
 def _is_billable(state: TuiState, profile: str) -> bool:
+    """Whether launching ``profile`` from the TUI must be refused.
+
+    Two rules, and it is deliberately an OR: the profile name itself (an
+    agent-eval run is billable by identity, not by manifest), or the loaded
+    profile option's flag. This is a UX guard only — the engine re-checks the
+    manifest and the ``--allow-billable``/``--max-tokens`` CLI contract, which is
+    what actually stops a billable spawn. A replay label such as ``repro:unit``
+    matches neither rule, which is why ``R`` on such a run is allowed to proceed
+    into a no-op SKIP (see ``tui._execute_action``).
+    """
     if profile == ProfileName.AGENT_EVAL:
         return True
     return any(option.name == profile and option.billable for option in state.profiles)
 
 
 def _is_owned(run: RunRecord) -> bool:
+    """Cheap pre-filter for the ``x`` cancel affordance.
+
+    Not an authorization check. Any TestBench-created id starts with ``tb_``, so
+    this only rejects records that obviously came from elsewhere; the engine's
+    ``cancel`` re-validates liveness and the pid/start-time fingerprint before
+    signalling anything. Reading this as security would be a mistake — it exists
+    so a foreign row shows "not TestBench-owned" instead of a confirmation prompt
+    that ends in an engine error.
+    """
     return run.worker_pid is not None or run.run_id.startswith("tb_")
 
 
@@ -899,6 +1203,30 @@ def _confirm_action(prompt: ConfirmPrompt) -> TuiAction:
 
 
 def handle_key(state: TuiState, key: str) -> Tuple[TuiState, Optional[TuiAction]]:
+    """Pure key dispatch: ``(next_state, action_or_None)``.
+
+    Three layers, in strict precedence — the order *is* the safety model:
+
+    1. a pending confirmation — only ``y``/``Y`` executes it; every other key,
+       including Enter, cancels. This is why ``Enter`` can never confirm
+       execution or cancellation (ADR-0003): double-tapping Enter to inspect
+       cannot launch or kill a suite.
+    2. overlays — help, detail sheet, picker, search. Each owns its keys and
+       closes with ``q``/``Esc``; nothing typed inside an overlay can reach the
+       top-level action keys.
+    3. top level — quit keys, view switching, the view-scoped History sort,
+       navigation, then the run actions (``R`` rerun, ``x`` cancel, ``y`` copy).
+       Every fresh top-level keypress clears ``minibuffer`` first, so a flash
+       never survives the next input.
+
+    View-scoped keys are silent elsewhere: ``s`` outside History returns the
+    state with the flash cleared and no action, which is deliberate (one
+    keystroke that means "sort" on one screen must not mutate another).
+
+    No branch reads a clock or a file, and no branch performs I/O; the only
+    outputs are a new frozen state and, at most, one action for the caller to
+    execute after the operator has confirmed it.
+    """
     # 1. Pending confirmation: only an explicit "y" may execute.
     if state.confirm is not None:
         prompt = state.confirm
@@ -1007,6 +1335,8 @@ def handle_key(state: TuiState, key: str) -> Tuple[TuiState, Optional[TuiAction]
     if key in ("1", "2", "3", "4"):
         return replace(base, view=VIEWS[int(key) - 1], selected=0, detail_scroll=0), None
     if key == "s" and state.view == "history":
+        # Cycle the order, then re-anchor the selection: the run under the cursor
+        # keeps the cursor even though its index changed.
         index = _HISTORY_ORDERS.index(state.history_order)
         order = _HISTORY_ORDERS[(index + 1) % len(_HISTORY_ORDERS)]
         return preserve_history_selection(state, replace(base, history_order=order)), None
@@ -1086,6 +1416,36 @@ def render_frame(
     no_color: bool = False,
     ascii_mode: bool = False,
 ) -> List[str]:
+    """Render exactly ``height`` lines of exactly ``width`` cells.
+
+    Degradation ladder, deliberately blunt rather than clever:
+
+    * ``width <= 0`` or ``height <= 0`` — return ``[]`` (the writer turns that
+      into a clear); there is no sane frame to draw in zero space.
+    * ``height < 4`` or ``width < 10`` — blank rows. Four bands cannot exist in
+      three rows, and ten columns cannot hold a status word plus a cursor.
+    * otherwise the four bands: header, body (``height - 3`` rows), hints,
+      minibuffer.
+
+    Body composition: an error banner costs one body row before anything else
+    (a store failure must not be scrolled off by content), then exactly one of
+    help / detail sheet / picker / split / single-column list.
+
+    Split threshold is ``width >= 120``, not a function of content: the two-column
+    layout is a promise the key help makes, so it must not flicker on and off as
+    the list grows. The left column is capped at 68 cells and the right takes the
+    remainder, which keeps the inspector readable on very wide panes instead of
+    stretching it.
+
+    Output lines carry their own SGR resets (each row renderer ends with one), so
+    a row can be written, truncated, or reordered without leaking colour into the
+    next. Hints fall back to the compact variant when the full line does not fit,
+    and the History variant inserts ``s sort`` in both cases.
+
+    ``ascii_mode`` implies monochrome: the glyph fallback exists for a terminal
+    that cannot be trusted with multi-byte marks, and such a terminal should not
+    be sent indexed colour either.
+    """
     if width <= 0 or height <= 0:
         return []
     monochrome = bool(no_color or ascii_mode)
@@ -1155,6 +1515,23 @@ def render_frame(
 
 
 def format_ansi_frame(lines: Sequence[str], height: int) -> str:
+    """Wrap rendered lines in the control sequences that make a stable frame.
+
+    Shape: hide cursor, home, then per line the text + erase-to-end-of-line, with
+    ``\\r\\n`` between lines, then erase-below and no trailing newline. Three
+    properties are load-bearing:
+
+    * no trailing newline — a newline at the bottom scrolls the pane by one row
+      under tmux, and the frame would creep upward every refresh;
+    * ``\\033[K`` per line — a shorter line must erase the previous frame's tail
+      without a full clear, otherwise an old longer row shows through;
+    * ``\\033[J`` at the end — removes rows left over after a height shrink.
+
+    Lines are written as exactly ``width`` cells; the row break is an explicit
+    ``\\r\\n`` rather than reliance on autowrap, so the frame does not depend on
+    the terminal's deferred-wrap behaviour. ``height <= 0`` degrades to a clear
+    rather than an empty write, which would leave the last frame on screen.
+    """
     if height <= 0:
         return "\033[?25l\033[H\033[J"
     rows = list(lines)[:height]

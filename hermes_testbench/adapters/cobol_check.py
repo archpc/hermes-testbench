@@ -20,13 +20,24 @@ A program that compiles cleanly and exits 0 still fails verification when its
 computed result disagrees with the oracle. That is the point: exit status alone
 proves nothing about arithmetic.
 
+Marker contract (consumed by ``parsers.parse_cobol``):
+
+* ``TB-PASS <name>`` — the case's checks all held;
+* ``TB-FAIL <name> <aspect>`` followed by indented ``| ``-prefixed evidence lines,
+  where ``aspect`` is ``compile``/``rc=N``/``output``/``reject``/``source``. The
+  inline label is the case name; the block below it is the excerpt. Do not reword
+  the marker: the parser matches ``TB-FAIL`` at line start and folds the block in
+  by label.
+
 Usage from a suite::
 
     python -m hermes_testbench.adapters.cobol_check --spec cases.json
 
 where ``cases.json`` is ``{"cases": [{"name": ..., "source": ...,
 "expected_stdout": ..., "expected_exit": 0}, ...]}``. The process exits 1 when
-any case fails and prints the aggregate ``N passed, 0 skipped, M failed`` line.
+any case fails and prints the aggregate ``N passed, 0 skipped, M failed`` line
+(``VerificationReport.text``) — that line is the numeric summary the parser reads
+when no markers survive truncation.
 """
 
 from __future__ import annotations
@@ -99,7 +110,14 @@ class Diagnostic:
 
 
 def parse_diagnostics(text: str) -> Tuple[Diagnostic, ...]:
-    """Extract ``file:line: error|warning|note: message`` lines from cobc output."""
+    """Extract ``file:line: error|warning|note: message`` lines from cobc output.
+
+    Warnings and notes are kept (``CompileResult.diagnostics``) because they explain a
+    build failure that has no ``error:`` line; ``CompileResult.errors`` filters to
+    ``error`` only. Lines that do not start with a ``.cob/.cbl/.cpy`` path are dropped:
+    cobc also prints bare ``error: ...`` lines for driver problems (missing file,
+    ``-o`` unwritable) and those carry no location to attach.
+    """
     found: List[Diagnostic] = []
     for raw in (text or "").splitlines():
         match = _COBC_DIAG_RE.match(raw.strip())
@@ -166,7 +184,19 @@ def compile_source(
     optimize: bool = True,
     timeout_s: float = 120.0,
 ) -> CompileResult:
-    """Compile one COBOL source into ``workdir`` and capture its diagnostics."""
+    """Compile one COBOL source into ``workdir`` and capture its diagnostics.
+
+    ``ok`` requires *both* a zero exit and the expected binary on disk: cobc can exit 0
+    while writing nothing when ``-o`` points somewhere it cannot write, and a later
+    ``run_program`` would then fail with a confusing ENOENT.
+
+    ``free_form``/``optimize`` default to the values the fixtures and the generated
+    suite use (``-free -O2``); fixed-format sources must pass ``free_form=False``.
+    ``subprocess.TimeoutExpired`` is *not* caught here: a hung compiler escapes as a
+    traceback, and ``parse_cobol`` has no traceback rule, so the run is reported from
+    the exit status with the traceback in the excerpt rather than as a clean compile
+    failure.
+    """
     compiler = cobc or find_cobc()
     if not compiler:
         raise FileNotFoundError("cobc (GnuCOBOL) is not installed")
@@ -205,7 +235,13 @@ def run_program(
     stdin_text: Optional[str] = None,
     timeout_s: float = 120.0,
 ) -> RunResult:
-    """Run a compiled COBOL binary once with optional argv and stdin."""
+    """Run a compiled COBOL binary once with optional argv and stdin.
+
+    ``stdin`` is closed with ``""`` rather than left open, so an ``ACCEPT`` in the
+    program sees EOF instead of hanging the verification run. Output is captured as
+    text; a byte-level difference is therefore already normalised by the locale
+    decoding, which is acceptable here because the oracle only compares ASCII digits.
+    """
     proc = subprocess.run(
         [str(binary), *argv],
         input=stdin_text or "",
@@ -247,7 +283,13 @@ def cobol_truncate(value: Decimal, places: int) -> Decimal:
 def enforce_picture(
     value: Decimal, *, int_digits: int, scale: int, signed: bool = True
 ) -> Decimal:
-    """Validate that ``value`` fits ``PIC [S]9(int_digits)V9(scale)``."""
+    """Validate that ``value`` fits ``PIC [S]9(int_digits)V9(scale)``.
+
+    Raises instead of wrapping: silent truncation on overflow is the classic COBOL bug
+    this oracle exists to catch, so the model refuses to imitate it. The limit is
+    ``10**int_digits - 10**-scale`` (9999999.99 for 7.2), i.e. the largest value the
+    edit pattern can actually represent. Unsigned PICTUREs additionally reject negatives.
+    """
     limit = Decimal(10) ** int_digits - _quantum(scale)
     magnitude = abs(Decimal(value))
     if magnitude > limit or (not signed and value < 0):
@@ -520,7 +562,22 @@ def verify_case(
     cobc: Optional[str] = None,
     timeout_s: float = 120.0,
 ) -> CaseOutcome:
-    """Compile, run, and judge one case; returns marker lines and a verdict."""
+    """Compile, run, and judge one case; returns marker lines and a verdict.
+
+    Checks run in this order, and the order is the contract:
+
+    1. missing source file → ``TB-FAIL <name> source`` (no spawn);
+    2. compile → ``TB-FAIL <name> compile`` with up to six rendered diagnostics;
+    3. ``expected_error`` set → the program must exit nonzero *and* print that text
+       (a "reference rejection": the oracle says this input is invalid);
+    4. exit status must equal ``expected_exit`` → ``TB-FAIL <name> rc=N``;
+    5. ``expected_stdout`` (when not ``None``) must match exactly → ``TB-FAIL
+       <name> output`` with the first differing line quoted both ways.
+
+    Exit code precedes stdout on purpose: reporting an output diff for a program that
+    crashed mid-run buries the real cause. A ``None`` ``expected_stdout`` means "do not
+    compare output", which is different from ``""`` ("must print nothing").
+    """
     stem = f"cobol:{case.name}"
     source = Path(case.source)
     case_dir = Path(workdir) / re.sub(r"[^A-Za-z0-9._-]+", "_", case.name)
@@ -656,6 +713,14 @@ def verify_cases(
 
 
 def _cases_from_spec(path: Path) -> List[CobolCase]:
+    """Load a JSON case list; ``source`` paths are relative to the spec file.
+
+    Relative-to-the-spec (not to the cwd) is what makes a suite work regardless of the
+    project directory the runner picked. The file is trusted input from the operator's
+    own tree: there is no schema validation, so a missing ``name``/``source`` raises
+    ``KeyError`` before any marker is printed and the run falls back to a nonzero exit
+    with a traceback — attributable, but not pretty.
+    """
     spec = json.loads(path.read_text(encoding="utf-8"))
     base = path.resolve().parent
     cases: List[CobolCase] = []
@@ -681,6 +746,12 @@ def _cases_from_spec(path: Path) -> List[CobolCase]:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    """CLI entry point: run every case in ``--spec`` and print the marker stream.
+
+    Exit codes are the suite contract: 1 on any failing case *or* an empty/malformed
+    case list (a spec that declares nothing is a mistake, not a pass), 0 only when
+    ``VerificationReport.ok`` — at least one case and zero failures.
+    """
     parser = argparse.ArgumentParser(
         prog="cobol_check",
         description="Compile and verify GnuCOBOL programs against expected output.",

@@ -1,4 +1,33 @@
-"""Standalone CLI for Hermes TestBench."""
+"""Standalone CLI for Hermes TestBench.
+
+One process, one store, one dispatch table. Shape of an invocation::
+
+    testbench [--home DIR] <command> [subcommand] [args...]
+
+``--home`` and ``--version`` are options of the *top-level* parser, so they must
+appear **before** the subcommand; argparse does not accept ``testbench run --home
+DIR``. Every internal spawn (``engine.spawn_async``, the ``_worker`` entry point)
+builds its argv in that order for the same reason.
+
+Exit codes, relied on by the skill workflows and by ``tape``/CI callers:
+
+* 0 — success, including a SKIP that means "nothing to do" (a missing explicit
+  ``--suite`` is the one exception, below) and an async spawn that is still
+  ACTIVE after ``--wait``;
+* 1 — a run that did not pass, an unknown id, a refused authorization, a bad
+  filter, or a flake sweep that was not uniformly ``always_pass``;
+* 2 — no command given, or a parser/usage rejection (argparse raises
+  ``SystemExit`` there, so ``parser.error`` does not return through ``main``).
+
+``--json`` variants exist on every read-only command; they print machine JSON to
+stdout and are stable enough for the MCP server and scripts. Human text and JSON
+never mix on stdout except for ``tape run``, which deliberately ends with a marker
+line consumed by the terminal-tape adapter.
+
+Errors are classified narrowly: ``AuthorizationError``/``KeyError``/``ValueError``
+become ``testbench error: ...`` on stderr with exit 1. ``OSError`` is *not*
+caught, so a missing path yields a traceback rather than a one-line message.
+"""
 
 from __future__ import annotations
 
@@ -41,11 +70,33 @@ def _version_string() -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the whole argument tree; also the input to ``shell_completion``.
+
+    Two levels of options, and the distinction is load bearing: ``--home`` and
+    ``--version`` belong to the root parser and therefore precede the subcommand.
+    The completion generator reads this tree at runtime, so anything added here
+    appears in the emitted scripts — with the caveats noted in
+    ``shell_completion`` (positional choices are not exported, and the scripts
+    assume the subcommand is the second word).
+
+    Commands with a second level — ``bench``, ``projects``, ``tape``, ``flake`` —
+    park the action in ``bench_action``/``proj_action``/``tape_action``/
+    ``flake_action``; ``main`` dispatches on that attribute rather than on argv
+    position.
+
+    ``--profile`` carries no argparse ``choices`` on purpose: the accepted set is
+    validated downstream (discovery decides what suites exist), and the
+    completion generator sources candidates from ``ProfileName.STANDARD``.
+    ``_worker`` is registered with ``help=argparse.SUPPRESS`` — it is a private
+    entry point for detached workers, and hidden here means hidden from help and
+    from both completion scripts.
+    """
     p = argparse.ArgumentParser(
         prog="testbench",
         description="Hermes TestBench: isolated testing, benchmarking, and verification CLI.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # Root-parser option: must precede the subcommand (see the module docstring).
     p.add_argument("--home", default="", help="Override TESTBENCH_HOME store directory")
     p.add_argument("--version", action="version", version=_version_string())
     sub = p.add_subparsers(dest="command")
@@ -80,6 +131,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     resp = sub.add_parser("results", help="Inspect persisted run results without rerunning tests")
     resp.add_argument("run_id", nargs="?", default="")
+    # Accepted for symmetry with the documented CLI; the dispatch below already
+    # means "latest" when no run_id is given, so this flag currently changes
+    # nothing (kept, not wired up).
     resp.add_argument("--last", action="store_true", help="Show most recent run")
     resp.add_argument("--project", default="")
     resp.add_argument("--format", choices=["text", "json", "junit"], default="text")
@@ -240,6 +294,32 @@ def _format_flake_history(history: FlakeHistory) -> str:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    """Parse, dispatch, and translate a run outcome into an exit code.
+
+    Order of operations matters:
+
+    1. split ``--`` first — everything after it is the benchmark payload command
+       (``bench run ... -- <cmd>``), so it is removed before argparse ever sees
+       it; a ``--`` anywhere else is ignored;
+    2. parse, then reject an empty command with usage + exit 2;
+    3. ``completion`` short-circuits **before** any store or home is touched, so
+       asking for a script can never create a database;
+    4. validate ``--mutation-gate`` once (NaN and out-of-range are refused with a
+       message rather than an argparse error, because argparse cannot say NaN);
+    5. ``mcp`` and ``tui`` own their own long-lived loops and construct the store
+       themselves; everything else runs inside one ``with TestBenchStore(home)``.
+
+    The big ``try`` is the error boundary: only ``AuthorizationError``,
+    ``KeyError`` and ``ValueError`` are translated. That is deliberate — those are
+    the shapes the engine raises for refusals and bad input. Anything else is a
+    bug and should keep its traceback.
+
+    The trailing ``return 2`` is a guard for a command that exists in the parser
+    but has no dispatch branch; every branch present today returns its own code
+    first, so it is not reachable from the current table. Note that one
+    second-level command with no action does not reach it either — see the defect
+    report on ``testbench bench``.
+    """
     raw_argv = list(argv if argv is not None else sys.argv[1:])
     extra_cmd: List[str] = []
     if "--" in raw_argv:
@@ -351,6 +431,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 0
 
             if args.command == "run":
+                # --stream has no meaning for a detached worker (its output goes to
+                # the evidence log, not this stdout) and would interleave with the
+                # JSON document; refuse rather than silently ignore the flag.
                 if args.stream and (args.async_run or args.json):
                     parser.error("--stream requires a foreground text run (no --async or --json)")
                 if args.async_run:
@@ -424,6 +507,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if rec is None:
                     sys.stderr.write("testbench: no matching run found\n")
                     return 1
+                # --json is an alias for --format json and wins when both appear.
                 fmt = "json" if args.json else args.format
                 if fmt == "json":
                     sys.stdout.write(render_run_json(rec))
@@ -634,6 +718,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                             hermes_agent_root=ha_root,
                             run_hermes_pytest=args.hermes_pytest,
                         )
+                        # Private engine hook: this command builds its own RunRecord
+                        # (profile "verification", outside ProfileName) instead of
+                        # going through run_sync, and only _populate_and_finalize
+                        # knows how to fold SuiteResults into counts/evidence.
                         done = eng._populate_and_finalize(run, suites, [], t0)
                 except Exception as exc:
                     run.status = RunStatus.ERROR
