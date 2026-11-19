@@ -206,6 +206,7 @@ def _refresh_from_store(store: TestBenchStore, prev: TuiState) -> TuiState:
         ProfileOption(ProfileName.SECURITY, False, "escape, sanitizer & confinement checks"),
         ProfileOption(ProfileName.REGRESSION, False, "full regression verification"),
         ProfileOption(ProfileName.BENCHMARK, False, "repeated workload measurements"),
+        ProfileOption(ProfileName.MUTATION, False, "opt-in mutation testing"),
         ProfileOption(ProfileName.AGENT_EVAL, True, "opt-in bounded LLM behavior probe"),
     )
 
