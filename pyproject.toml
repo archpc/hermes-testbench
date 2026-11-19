@@ -44,4 +44,5 @@ pytest_add_cli_args_test_selection = [
     "tests/test_review_remediation_parsers.py",
     "tests/test_pytest_quiet_summary.py",
     "tests/test_output_contract.py",
+    "tests/test_cobol_parser_coverage.py",
 ]
