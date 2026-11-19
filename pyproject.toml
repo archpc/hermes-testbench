@@ -28,3 +28,20 @@ path = "hermes_testbench/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["hermes_testbench"]
+
+# Mutation-testing opt-in for TestBench (ADR-0008). Scope: the evidence-integrity
+# surface (secret redaction and tool-output normalization) vs hermetic unit tests.
+# Slow recursive suites (test_mutation_testing, engine/CLI) are intentionally not
+# re-run per mutant; full-regression remains the sign-off gate.
+[tool.mutmut]
+source_paths = ["hermes_testbench/"]
+only_mutate = [
+    "hermes_testbench/sanitize.py",
+    "hermes_testbench/adapters/parsers.py",
+]
+pytest_add_cli_args_test_selection = [
+    "tests/test_sanitize.py",
+    "tests/test_review_remediation_parsers.py",
+    "tests/test_pytest_quiet_summary.py",
+    "tests/test_output_contract.py",
+]
