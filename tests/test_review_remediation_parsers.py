@@ -14,6 +14,7 @@ import unittest
 from hermes_testbench.adapters.parsers import (
     parse_cobol,
     parse_generic,
+    parse_mutmut,
     parse_python_unittest,
     parse_shell,
     parse_sqlite_probe,
@@ -147,6 +148,162 @@ class UnittestParseStillStructuredTests(unittest.TestCase):
             "FAILED (failures=1)\n"
         )
         self.assertEqual((outcome.total, outcome.passed, outcome.failed), (2, 1, 1))
+
+
+class MutmutUnicodeMutantNameTests(unittest.TestCase):
+    """mutmut >= 3 names method mutants with the Unicode class marker ``ǁ``
+    (U+01C1), e.g. ``pkg.mod.xǁStyleǁ__call____mutmut_2``. The results-line
+    parser must not silently drop them: dropping kills and survivors corrupts
+    the score denominator and hides per-mutant evidence. Observed live on
+    hermes-tmux-workspace run tb_20261119_190950_6c1b2120: 760 of 3178 verdicts
+    (every class-method mutant) vanished from the receipt.
+    """
+
+    def test_class_scoped_unicode_names_are_counted_and_preserved(self) -> None:
+        results_text = (
+            "    pkg.mod.xǁStyleǁ__init____mutmut_1: killed\n"
+            "    pkg.mod.xǁStyleǁ__call____mutmut_2: survived\n"
+            "    pkg.mod.x_plain__mutmut_3: killed\n"
+            "    pkg.mod.xǁStyleǁfg__mutmut_4: no tests\n"
+        )
+        outcome = parse_mutmut("", results_text=results_text)
+        self.assertEqual(outcome.buckets["caught"], 2)
+        self.assertEqual(outcome.buckets["survived"], 1)
+        self.assertEqual(outcome.buckets["inconclusive"], 1)
+        self.assertEqual(outcome.total, 4)
+        self.assertEqual(
+            {case["name"] for case in outcome.cases},
+            {
+                "pkg.mod.xǁStyleǁ__init____mutmut_1",
+                "pkg.mod.xǁStyleǁ__call____mutmut_2",
+                "pkg.mod.x_plain__mutmut_3",
+                "pkg.mod.xǁStyleǁfg__mutmut_4",
+            },
+        )
+
+    def test_unicode_survivors_change_the_score_denominator(self) -> None:
+        # Two killed method mutants + one survived module mutant: the true
+        # score is 2/3. Silently dropping the Unicode names yields 0/1.
+        results_text = (
+            "    pkg.mod.xǁKlassǁwork__mutmut_1: killed\n"
+            "    pkg.mod.xǁKlassǁwork__mutmut_2: killed\n"
+            "    pkg.mod.x_helper__mutmut_1: survived\n"
+        )
+        outcome = parse_mutmut("", results_text=results_text)
+        self.assertEqual(outcome.passed, 2)
+        self.assertEqual(outcome.failed, 1)
+        self.assertEqual(outcome.total, 3)
+
+    def test_hyphenated_module_names_still_parse(self) -> None:
+        outcome = parse_mutmut(
+            "", results_text="    my-module.x_f__mutmut_1: killed\n"
+        )
+        self.assertEqual(outcome.buckets["caught"], 1)
+        self.assertEqual(outcome.cases[0]["name"], "my-module.x_f__mutmut_1")
+
+
+class UnittestDocstringVerboseTests(unittest.TestCase):
+    """unittest -v prints docstring-described tests on TWO lines: the test
+    identity line without a state, then the docstring's first line carrying
+    ``... ok`` / ``... skipped 'reason'``. The parser must attach the state to
+    the pending identity instead of dropping the case. Observed live on
+    core-unit run tb_20261119_191953_3f2f1afc: 10 of 224 case identities were
+    lost and junit padded them with synthetic skip_N/pass_N placeholders.
+    """
+
+    def test_docstring_ok_and_skip_keep_their_identity(self) -> None:
+        text = (
+            "test_plain (tests.test_x.PlainTests.test_plain) ... ok\n"
+            "test_doc (tests.test_x.DocTests.test_doc)\n"
+            "First line of the docstring. ... ok\n"
+            "test_doc_skip (tests.test_x.DocTests.test_doc_skip)\n"
+            "Docstring skip. ... skipped 'capability unavailable'\n"
+            "Ran 3 tests in 0.001s\n"
+            "\n"
+            "OK (skipped=1)\n"
+        )
+        outcome = parse_python_unittest(text)
+        self.assertEqual((outcome.total, outcome.passed, outcome.skipped), (3, 2, 1))
+        by_name = {c["name"]: c for c in outcome.cases}
+        self.assertEqual(len(by_name), 3)
+        self.assertEqual(by_name["test_doc (tests.test_x.DocTests.test_doc)"]["status"], "PASS")
+        skip = by_name["test_doc_skip (tests.test_x.DocTests.test_doc_skip)"]
+        self.assertEqual(skip["status"], "SKIP")
+        self.assertEqual(skip["message"], "capability unavailable")
+
+    def test_docstring_failure_keeps_identity_and_detail(self) -> None:
+        text = (
+            "test_doc_fail (tests.test_x.DocTests.test_doc_fail)\n"
+            "Docstring fail. ... FAIL\n"
+            "\n"
+            "======================================================================\n"
+            "FAIL: test_doc_fail (tests.test_x.DocTests.test_doc_fail)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            '  File "x.py", line 3, in test_doc_fail\n'
+            "    self.assertEqual(1, 2)\n"
+            "AssertionError: 1 != 2\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 1 test in 0.001s\n"
+            "\n"
+            "FAILED (failures=1)\n"
+        )
+        outcome = parse_python_unittest(text)
+        self.assertEqual((outcome.total, outcome.failed), (1, 1))
+        self.assertEqual(len(outcome.cases), 1)
+        case = outcome.cases[0]
+        self.assertEqual(case["name"], "test_doc_fail (tests.test_x.DocTests.test_doc_fail)")
+        self.assertEqual(case["status"], "FAIL")
+        self.assertIn("1 != 2", case["message"])
+
+    def test_docstring_line_with_ellipsis_inside_still_parses(self) -> None:
+        text = (
+            "test_dots (tests.test_x.DocTests.test_dots)\n"
+            "Wait for it... then more... ... ok\n"
+            "Ran 1 test in 0.001s\n"
+            "\n"
+            "OK\n"
+        )
+        outcome = parse_python_unittest(text)
+        self.assertEqual(len(outcome.cases), 1)
+        self.assertEqual(outcome.cases[0]["status"], "PASS")
+        self.assertEqual(outcome.cases[0]["name"], "test_dots (tests.test_x.DocTests.test_dots)")
+
+
+class MutmutRedactedVerdictTests(unittest.TestCase):
+    """The in-stream redactor over-matches identifier: value lines whose key
+    merely CONTAINS a secret word: 'x_redact_secrets__mutmut_1: killed' has
+    its status replaced with [REDACTED] (sanitize._ENV_ASSIGN_RE). Observed on
+    run tb_20261119_192933_f59f14bb: all 37 verdicts of the redaction function
+    itself were corrupted and then silently dropped by the parser, shrinking
+    the score denominator. Redaction must stay fail-closed, but the loss must
+    be VISIBLE: a redacted verdict is an inconclusive case, never a drop.
+    """
+
+    def test_redacted_status_is_inconclusive_not_dropped(self) -> None:
+        results_text = (
+            "    pkg.x_redact_secrets__mutmut_1: [REDACTED]\n"
+            "    pkg.x_helper__mutmut_1: killed\n"
+        )
+        outcome = parse_mutmut("", results_text=results_text)
+        self.assertEqual(outcome.buckets["caught"], 1)
+        self.assertEqual(outcome.buckets["inconclusive"], 1)
+        self.assertEqual(outcome.total, 2)
+        by_name = {c["name"]: c for c in outcome.cases}
+        self.assertEqual(by_name["pkg.x_redact_secrets__mutmut_1"]["status"], "SKIP")
+        self.assertEqual(len(by_name), 2)
+
+    def test_fully_redacted_listing_is_structured_not_silent(self) -> None:
+        results_text = (
+            "    pkg.x_redact_secrets__mutmut_1: [REDACTED]\n"
+            "    pkg.x_redact_secrets__mutmut_2: [REDACTED]\n"
+        )
+        outcome = parse_mutmut("", results_text=results_text)
+        self.assertTrue(outcome.structured)
+        self.assertEqual(outcome.buckets["inconclusive"], 2)
+        self.assertEqual(outcome.total, 2)
+        self.assertEqual(outcome.passed, 0)
 
 
 if __name__ == "__main__":

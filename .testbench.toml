@@ -48,6 +48,21 @@ needs_tmux = true
 description = "In-stream secret redaction, Seatbelt effective permissions, symlink-safe cleanup, and pgid termination"
 
 [[suite]]
+name = "redaction-boundary"
+adapter = "shell"
+profile = "security"
+command = ["{python}", "scripts/redaction_boundary_probe.py"]
+timeout_s = 120.0
+description = "Deterministic seeded fuzz of the sanitize surface: escape-stripper invariants (independent oracle, idempotence) and StreamRedactor chunk-split secret containment incl. 70K over-cap values; found campaign F8"
+
+[[suite]]
+name = "mutmut-evidence-integrity"
+adapter = "mutmut"
+profile = "mutation"
+timeout_s = 1800.0
+description = "mutmut over sanitize.py and adapters/parsers.py vs hermetic parser/redaction tests (disposable staged copy, Seatbelt)"
+
+[[suite]]
 name = "full-regression"
 adapter = "python_unittest"
 profile = "regression"

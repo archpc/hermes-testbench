@@ -8,8 +8,11 @@ from typing import List, Optional
 _PEM_BLOCK_RE = re.compile(
     r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----[\s\S]*?-----END \1-----"
 )
-_PEM_BEGIN_RE = re.compile(r"^\s*-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----\s*$")
+_PEM_BEGIN_RE = re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----")
 _PEM_END_RE = re.compile(r"-----END ([A-Z0-9 ]*PRIVATE KEY)-----")
+# PEM key body: base64 charset, no whitespace. Used to tell a real key body
+# from prose after a mid-line BEGIN marker (mentions must not swallow lines).
+_PEM_BODY_RE = re.compile(r"[A-Za-z0-9+/=]{16,}")
 _URL_USERINFO_RE = re.compile(r"(https?://[^/\s:@]+:)([^@\s/]+)(@)")
 _BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)([^\s\"'`,;]{6,})")
 _KNOWN_TOKEN_RE = re.compile(
@@ -26,6 +29,35 @@ _ENV_ASSIGN_RE = re.compile(
     r"(?i)(\b[A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH_KEY)"
     r"[A-Z0-9_]*\s*[:=]\s*['\"]?)([^\s'\"`,;]{4,})"
 )
+# URL userinfo whose closing '@' has not arrived yet (buffer cut mid-password).
+# Only used on the fail-closed over-cap stream path, never in redact_secrets,
+# so a line-final host:port in ordinary text is not over-redacted.
+_URL_USERINFO_OPEN_RE = re.compile(r"(https?://[^/\s:@]+:)[^@\s/]+$")
+# Head ends inside a URL authority before any '@' or '/': a userinfo password
+# may follow beyond the cut (possibly with a long username).
+_URL_AUTHORITY_OPEN_RE = re.compile(r"https?://[^/\s@]*$")
+# Head ends with a secret key+separator (or Bearer) expecting a value: after a
+# whitespace split the retained tail would carry the value WITHOUT its key.
+_EXPECTS_VALUE_RE = re.compile(
+    r"(?i)(?:\b[A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH_KEY)"
+    r"[A-Z0-9_]*\s*[:=]\s*['\"]?|\bBearer\s+)$"
+)
+# Head ends with a key+separator and a value shorter than the 4-char minimum
+# of _ENV_ASSIGN_RE: the complete-pattern check cannot fire, but the value is
+# still a secret continuation across the cut.
+_ENV_ASSIGN_SHORT_RE = re.compile(
+    r"(?i)(\b[A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH_KEY)"
+    r"[A-Z0-9_]*\s*[:=]\s*['\"]?)[^\s'\"`,;]{0,3}['\"]?\s*$"
+)
+# A cut inside the literal 'https://' leaves neither side with a complete
+# scheme; detect user:pass shapes straddling the boundary window.
+_SPLIT_URL_USERINFO_RE = re.compile(r"https?://[^/\s:@]+:[^@\s/]")
+
+
+def _split_url_userinfo(head: str, tail: str) -> bool:
+    left = head[-8:]
+    m = _SPLIT_URL_USERINFO_RE.search(left + tail[:128])
+    return bool(m and m.start() < len(left) and m.end() > len(left))
 
 
 def redact_secrets(text: str) -> str:
@@ -41,6 +73,20 @@ def redact_secrets(text: str) -> str:
     return out
 
 
+def _ends_in_secret(head: str) -> bool:
+    """True when a secret pattern's match runs to the end of ``head``.
+
+    A buffer cut there leaves the retained tail INSIDE a secret value (an
+    assignment value, a long known token, a bearer token, or URL userinfo),
+    so the tail must be treated as secret continuation, not emitted raw.
+    """
+    for rx in (_ENV_ASSIGN_RE, _KNOWN_TOKEN_RE, _BEARER_RE, _URL_USERINFO_RE):
+        for m in rx.finditer(head):
+            if m.end() == len(head):
+                return True
+    return False
+
+
 class StreamRedactor:
     """Line-buffered chunk redactor so secrets split across read() boundaries never hit disk."""
 
@@ -51,6 +97,8 @@ class StreamRedactor:
         self._buf: str = ""
         self._in_pem: Optional[str] = None
         self._pem_redacted_emitted: bool = False
+        self._secret_tail: bool = False
+        self._pending_pem: Optional[str] = None
 
     def _redact_complete_lines(self, block: str) -> str:
         out_lines: List[str] = []
@@ -64,11 +112,41 @@ class StreamRedactor:
                     self._in_pem = None
                     self._pem_redacted_emitted = False
                 continue
+            if self._pending_pem is not None:
+                held = self._pending_pem
+                self._pending_pem = None
+                if _PEM_END_RE.search(line):
+                    out_lines.append(redact_secrets(held + line))
+                    continue
+                if _PEM_BODY_RE.fullmatch(line.rstrip("\r\n")):
+                    m_held = _PEM_BEGIN_RE.search(held)
+                    if m_held is not None:
+                        self._in_pem = m_held.group(1)
+                        self._pem_redacted_emitted = False
+                        out_lines.append(redact_secrets(held[: m_held.end()]) + "\n")
+                        continue
+                # Prose (or anything not key-shaped): the held line was a
+                # mention. Emit it and process the current line normally.
+                out_lines.append(redact_secrets(held))
             m_begin = _PEM_BEGIN_RE.search(line)
             if m_begin and not _PEM_END_RE.search(line):
-                self._in_pem = m_begin.group(1)
-                self._pem_redacted_emitted = False
-                out_lines.append(line)
+                prefix = line[: m_begin.start()]
+                remainder = line[m_begin.end():].rstrip("\r\n")
+                if not prefix.strip() or (remainder and _PEM_BODY_RE.fullmatch(remainder)):
+                    # Canonical line-start BEGIN, or key body already on the
+                    # marker line: enter PEM state, keep prefix + marker only.
+                    # The prefix may itself contain secrets — redact it.
+                    self._in_pem = m_begin.group(1)
+                    self._pem_redacted_emitted = False
+                    out_lines.append(redact_secrets(line[: m_begin.end()]) + "\n")
+                    continue
+                if not remainder:
+                    # Mid-line BEGIN with nothing after the marker: ambiguous
+                    # until the next line (key body vs prose mention). Defer.
+                    self._pending_pem = line
+                    continue
+                # Prose after the marker on the same line: a mention, not a key.
+                out_lines.append(redact_secrets(line))
                 continue
             out_lines.append(redact_secrets(line))
         return "".join(out_lines)
@@ -77,11 +155,22 @@ class StreamRedactor:
         if not chunk:
             return ""
         self._buf += chunk
+        prefix = ""
+        if self._secret_tail:
+            # Continuation of a secret value cut mid-stream: fail closed and
+            # discard up to the next newline (the head already shows [REDACTED]).
+            nl = self._buf.find("\n")
+            if nl < 0:
+                self._buf = ""
+                return ""
+            self._buf = self._buf[nl + 1 :]
+            self._secret_tail = False
+            prefix = "\n"
         last_nl = self._buf.rfind("\n")
         if last_nl >= 0:
             complete = self._buf[: last_nl + 1]
             self._buf = self._buf[last_nl + 1 :]
-            return self._redact_complete_lines(complete)
+            return prefix + self._redact_complete_lines(complete)
         if len(self._buf) > self.MAX_BUFFER_CHARS:
             if self._in_pem is not None:
                 # Cap memory inside an unclosed PEM stream while retaining tail for split END marker
@@ -95,11 +184,45 @@ class StreamRedactor:
             ws = self._buf.rfind(" ", 0, cut)
             split_at = ws + 1 if ws > 0 else cut
             head = self._buf[:split_at]
-            self._buf = self._buf[split_at:]
-            return redact_secrets(head)
-        return ""
+            tail = self._buf[split_at:]
+            if (
+                _ends_in_secret(head)
+                or _EXPECTS_VALUE_RE.search(head)
+                or _ENV_ASSIGN_SHORT_RE.search(head)
+                or _URL_USERINFO_OPEN_RE.search(head)
+                or _URL_AUTHORITY_OPEN_RE.search(head)
+                or _URL_USERINFO_OPEN_RE.search(tail)
+                or _split_url_userinfo(head, tail)
+            ):
+                # The cut landed inside a secret value, or separated a secret
+                # from its key (whitespace split: head keeps 'TOKEN = ', tail
+                # carries the value with no key to match on). The retained tail
+                # would be raw secret continuation: fail closed — redact what
+                # the head already exposes, drop the tail, suppress to newline.
+                expects_value = bool(_EXPECTS_VALUE_RE.search(head))
+                head = _URL_USERINFO_OPEN_RE.sub(r"\1[REDACTED]", head)
+                head = _ENV_ASSIGN_SHORT_RE.sub(r"\1[REDACTED]", head)
+                redacted = redact_secrets(head)
+                if expects_value and not redacted.endswith("[REDACTED]"):
+                    # The value was dropped with its key left behind: mark the
+                    # suppression so the log does not look merely truncated.
+                    redacted += "[REDACTED]"
+                self._buf = ""
+                self._secret_tail = True
+                return prefix + redacted
+            self._buf = tail
+            return prefix + redact_secrets(head)
+        return prefix
 
     def flush(self) -> str:
+        if self._secret_tail:
+            self._buf = ""
+            self._secret_tail = False
+            return ""
+        if self._pending_pem is not None:
+            held = self._pending_pem
+            self._pending_pem = None
+            return redact_secrets(held)
         if not self._buf and self._in_pem is None:
             return ""
         rem = self._buf

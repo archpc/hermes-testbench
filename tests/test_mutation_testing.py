@@ -398,9 +398,14 @@ class GatingAndAvailabilityTests(_MutationTestCase):
     def test_missing_binary_returns_skip_never_pass(self) -> None:
         project = self.root / "notool"
         _write_mutmut_project(project)
-        # Drop every directory that could hold a mutation tool. Confinement is mocked as
-        # available so this exercises Gate C (missing binary) alone: on Linux CI there is no
-        # ``sandbox-exec`` and the confinement gate would otherwise win.
+        # Drop every directory that could hold a mutation tool: PATH, the env
+        # overrides, AND the toolchain dirs resolve_tool appends from the real
+        # user home (~/.local/bin, Homebrew prefixes). Without the extra_bin_dirs
+        # mock, a standard `uv tool install mutmut` makes this test fail on the
+        # developer's own machine (observed 2026-11-19, core-unit gate).
+        # Confinement is mocked as available so this exercises Gate C (missing
+        # binary) alone: on Linux CI there is no ``sandbox-exec`` and the
+        # confinement gate would otherwise win.
         env = {
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "TESTBENCH_MUTMUT": "",
@@ -410,7 +415,8 @@ class GatingAndAvailabilityTests(_MutationTestCase):
             os.environ.pop("TESTBENCH_MUTMUT", None)
             os.environ.pop("TESTBENCH_CARGO_MUTANTS", None)
             with mock.patch.object(mutation_mod, "can_apply_seatbelt", return_value=True):
-                result, _ = self._run(self._suite(), project)
+                with mock.patch.object(mutation_mod, "extra_bin_dirs", return_value=[]):
+                    result, _ = self._run(self._suite(), project)
         self.assertEqual(result.status, RunStatus.SKIP)
         self.assertNotEqual(result.status, RunStatus.PASS)
         self.assertEqual(result.skip_count, 1)
