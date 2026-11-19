@@ -134,6 +134,52 @@ class StreamRedactorLongValueTests(unittest.TestCase):
         for i in range(0, len(pw) - 32, 4096):
             self.assertNotIn(pw[i:i + 32], out)
 
+    def test_whitespace_split_orphaned_value_never_leaks(self) -> None:
+        # SEC-1 (review R2): with a space before the cut, the head keeps the
+        # key+separator and the retained tail carries the value WITHOUT the
+        # key; redact_secrets(tail) cannot match, so the value must not be
+        # emitted raw. 'TOKEN = <75K>' leaked in full before this fix.
+        val = "Qw8" * 25000
+        sr = StreamRedactor()
+        out = sr.feed("TOKEN = " + val) + sr.flush()
+        self.assertIn("[REDACTED]", out)
+        self.assertNotIn(val[:64], out)
+        self.assertNotIn(val[-512:], out)
+
+    def test_bearer_orphaned_token_after_padding_never_leaks(self) -> None:
+        tok = "Zx5" * 1700
+        sr = StreamRedactor()
+        out = sr.feed("x " * 33000 + "Authorization: Bearer " + tok) + sr.flush()
+        self.assertIn("[REDACTED]", out)
+        self.assertNotIn(tok[:64], out)
+        self.assertNotIn(tok[-64:], out)
+
+    def test_short_value_straddling_cut_never_leaks(self) -> None:
+        # SEC-3: value shorter than the 4-char pattern minimum at the cut.
+        text = "a" * 65100 + "PASSWORD=***" + "z" * 509
+        sr = StreamRedactor()
+        out = sr.feed(text) + sr.flush()
+        self.assertNotIn("abcdef", out)
+
+    def test_long_username_url_password_never_leaks(self) -> None:
+        # Cut lands inside a long URL username; the tail lacks the scheme so
+        # the complete-URL pattern cannot match the password.
+        pw = "P" * 64
+        sr = StreamRedactor()
+        out = sr.feed("https://" + "u" * 66000 + ":" + pw + "@host/path") + sr.flush()
+        self.assertNotIn(pw, out)
+
+    def test_midline_pem_begin_body_never_leaks(self) -> None:
+        # SEC-4 (review R2): _PEM_BEGIN_RE was line-anchored, so a BEGIN marker
+        # with a prefix ('pad -----BEGIN...') never entered PEM state and every
+        # body line was emitted raw.
+        body = "\n".join("B" * 64 for _ in range(30))
+        text = "pad -----BEGIN RSA PRIVATE KEY-----\n" + body + "\n-----END RSA PRIVATE KEY-----\n"
+        sr = StreamRedactor()
+        out = sr.feed(text) + sr.flush()
+        self.assertNotIn("B" * 64, out)
+        self.assertIn("[REDACTED]", out)
+
     def test_benign_long_line_with_whitespace_is_preserved(self) -> None:
         sr = StreamRedactor()
         text = "word " * 15000

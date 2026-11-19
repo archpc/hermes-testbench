@@ -8,7 +8,7 @@ from typing import List, Optional
 _PEM_BLOCK_RE = re.compile(
     r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----[\s\S]*?-----END \1-----"
 )
-_PEM_BEGIN_RE = re.compile(r"^\s*-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----\s*$")
+_PEM_BEGIN_RE = re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----")
 _PEM_END_RE = re.compile(r"-----END ([A-Z0-9 ]*PRIVATE KEY)-----")
 _URL_USERINFO_RE = re.compile(r"(https?://[^/\s:@]+:)([^@\s/]+)(@)")
 _BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)([^\s\"'`,;]{6,})")
@@ -30,6 +30,22 @@ _ENV_ASSIGN_RE = re.compile(
 # Only used on the fail-closed over-cap stream path, never in redact_secrets,
 # so a line-final host:port in ordinary text is not over-redacted.
 _URL_USERINFO_OPEN_RE = re.compile(r"(https?://[^/\s:@]+:)[^@\s/]+$")
+# Head ends inside a URL authority before any '@' or '/': a userinfo password
+# may follow beyond the cut (possibly with a long username).
+_URL_AUTHORITY_OPEN_RE = re.compile(r"https?://[^/\s@]*$")
+# Head ends with a secret key+separator (or Bearer) expecting a value: after a
+# whitespace split the retained tail would carry the value WITHOUT its key.
+_EXPECTS_VALUE_RE = re.compile(
+    r"(?i)(?:\b[A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH_KEY)"
+    r"[A-Z0-9_]*\s*[:=]\s*['\"]?|\bBearer\s+)$"
+)
+# Head ends with a key+separator and a value shorter than the 4-char minimum
+# of _ENV_ASSIGN_RE: the complete-pattern check cannot fire, but the value is
+# still a secret continuation across the cut.
+_ENV_ASSIGN_SHORT_RE = re.compile(
+    r"(?i)(\b[A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH_KEY)"
+    r"[A-Z0-9_]*\s*[:=]\s*['\"]?)[^\s'\"`,;]{0,3}$"
+)
 
 
 def redact_secrets(text: str) -> str:
@@ -87,7 +103,9 @@ class StreamRedactor:
             if m_begin and not _PEM_END_RE.search(line):
                 self._in_pem = m_begin.group(1)
                 self._pem_redacted_emitted = False
-                out_lines.append(line)
+                # Keep any benign prefix and the marker itself; anything after
+                # the marker on this line is already key body — suppress it.
+                out_lines.append(line[: m_begin.end()] + "\n")
                 continue
             out_lines.append(redact_secrets(line))
         return "".join(out_lines)
@@ -125,21 +143,32 @@ class StreamRedactor:
             ws = self._buf.rfind(" ", 0, cut)
             split_at = ws + 1 if ws > 0 else cut
             head = self._buf[:split_at]
-            if ws <= 0 and _URL_USERINFO_OPEN_RE.search(head):
-                # Cut inside URL userinfo before the '@': redact the open
-                # password and suppress the continuation (fail closed).
+            tail = self._buf[split_at:]
+            if (
+                _ends_in_secret(head)
+                or _EXPECTS_VALUE_RE.search(head)
+                or _ENV_ASSIGN_SHORT_RE.search(head)
+                or _URL_USERINFO_OPEN_RE.search(head)
+                or _URL_AUTHORITY_OPEN_RE.search(head)
+                or _URL_USERINFO_OPEN_RE.search(tail)
+            ):
+                # The cut landed inside a secret value, or separated a secret
+                # from its key (whitespace split: head keeps 'TOKEN = ', tail
+                # carries the value with no key to match on). The retained tail
+                # would be raw secret continuation: fail closed — redact what
+                # the head already exposes, drop the tail, suppress to newline.
+                expects_value = bool(_EXPECTS_VALUE_RE.search(head))
                 head = _URL_USERINFO_OPEN_RE.sub(r"\1[REDACTED]", head)
+                head = _ENV_ASSIGN_SHORT_RE.sub(r"\1[REDACTED]", head)
+                redacted = redact_secrets(head)
+                if expects_value and not redacted.endswith("[REDACTED]"):
+                    # The value was dropped with its key left behind: mark the
+                    # suppression so the log does not look merely truncated.
+                    redacted += "[REDACTED]"
                 self._buf = ""
                 self._secret_tail = True
-                return prefix + redact_secrets(head)
-            if ws <= 0 and _ends_in_secret(head):
-                # No whitespace boundary and the cut landed inside a secret
-                # value: the retained tail would be raw secret continuation.
-                # Drop it and suppress the rest of the line (fail closed).
-                self._buf = ""
-                self._secret_tail = True
-                return prefix + redact_secrets(head)
-            self._buf = self._buf[split_at:]
+                return prefix + redacted
+            self._buf = tail
             return prefix + redact_secrets(head)
         return prefix
 

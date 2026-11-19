@@ -145,6 +145,17 @@ def stream_phase(rng: random.Random) -> list[str]:
     cases.append(("PASSWORD=" + long_val, long_val, "70K password, no newline"))
     pw = "".join(rng.choice(ALNUM) for _ in range(69000))
     cases.append(("https://user:" + pw + "@api.example.com/v1", pw, "70K URL userinfo"))
+    # SEC-1 class: whitespace split orphans the value from its key.
+    orphan = "".join(rng.choice(ALNUM) for _ in range(70000))
+    cases.append(("TOKEN = " + orphan, orphan, "70K orphaned value (ws split)"))
+    tok = "".join(rng.choice(ALNUM) for _ in range(5100))
+    cases.append(("x " * 33000 + "Authorization: Bearer " + tok, tok, "bearer orphaned after padding"))
+    cases.append(("https://" + "u" * 66000 + ":" + "P" * 64 + "@host/path", "P" * 64, "long-username URL"))
+    cases.append(("a" * 65100 + "PASSWORD=***" + "z" * 509, "abcdef", "short value straddling cut"))
+    # SEC-4 class: PEM BEGIN not at line start.
+    pem_body = "\n".join("".join(rng.choice(ALNUM) for _ in range(64)) for _ in range(30))
+    cases.append(("pad -----BEGIN RSA PRIVATE KEY-----\n" + pem_body + "\n-----END RSA PRIVATE KEY-----\n",
+                  pem_body.split("\n")[0], "mid-line PEM BEGIN"))
     pem = "-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(
         "".join(rng.choice(ALNUM) for _ in range(64)) for _ in range(30)
     ) + "\n-----END RSA PRIVATE KEY-----"
