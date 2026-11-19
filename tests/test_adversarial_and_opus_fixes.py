@@ -1,4 +1,40 @@
-"""TDD regression tests for all REQUIRED findings from Adversarial Review (R1-R6) and Opus 5.5 Critique."""
+"""Regression suite for the REQUIRED Adversarial Review findings (R1-R6) and the Opus critique.
+
+Each test is a red test written before its fix, so it encodes the *defect*, not the
+implementation: it asserts an externally observable property that was false once and
+must stay true. Keeping them in one module is deliberate — the findings share a theme
+(a hostile or unlucky environment breaks an assumption the harness made), and a
+regression here usually means an execution-boundary invariant was weakened.
+
+Mapping and the invariant each test pins:
+
+* R1 — ``cancel()`` must never signal the caller's process group. The fix narrowed the
+  signal to a group that is (a) recorded, (b) fingerprint-verified and (c) provably not
+  ``os.getpgrp()``. The test spawns a bystander *inside the test runner's own group*
+  because that was the blast radius of the bug: a group signal is not selective, so
+  anyone sharing the caller's group was a casualty.
+* R2 — a double-fork + ``setsid()`` descendant escapes the owned process group by
+  construction; only the sandbox-survivor sweep can find it. The test therefore checks
+  the escape *and* the sweep, since killing the group alone would pass a weaker test.
+* R3 — the Seatbelt profile must deny by default: writes outside the sandbox, reads of
+  Hermes state, ambient tmux sockets, DNS and CDP.
+* R4 — a manifest error (``cwd`` pointing at a file) must finalize ``ERROR`` with
+  evidence, never leave a row stuck in ``RUNNING``.
+* R5 — JUnit attributes must agree with the elements actually emitted, including the
+  synthetic back-fill elements; this is the contract CI consumers count on.
+* R6 — the stream redactor must stay bounded inside an unterminated PEM block, and must
+  not enter PEM state on a mid-line mention of a BEGIN marker.
+
+The Opus test covers the TUI projection rules: the overview is one row per project with
+benchmark runs excluded, and the header counters must be computed over that same
+deduped set or the header and the list disagree on screen.
+
+Tests here are mostly process-level and time-sensitive: they poll the store for a run
+row, wait for threads to join, and rely on a 15 s sleeping suite outliving a 5 s
+discovery window. They create all state under ``default_scratch_root()`` so nothing
+touches the real TestBench home, and they clean up with ``TemporaryDirectory`` plus an
+explicit bystander kill in ``finally`` (a failed assertion must not leak the child).
+"""
 
 from __future__ import annotations
 
@@ -26,6 +62,16 @@ PY = sys.executable
 
 
 class AdversarialAndOpusRegressionTests(unittest.TestCase):
+    """One test per finding; each is independent and safe to run alone.
+
+    ``setUp`` puts the run store and every project fixture inside a fresh scratch
+    directory. ``tb_home`` is a *TestBench home*, not ``HOME``: the engine writes
+    ``state.db`` and ``runs/<id>/`` beneath it, which is what lets a test read a run
+    row back without touching the developer's real store. Because the tests spawn
+    real processes, the per-test cleanup is not enough on its own — each test that
+    plants a child also terminates it explicitly.
+    """
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(dir=str(default_scratch_root()), prefix="tb-adv-")
         self.root = Path(self.tmp.name)
@@ -35,7 +81,37 @@ class AdversarialAndOpusRegressionTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_r1_cancel_never_signals_caller_process_group_or_bystander_processes(self) -> None:
-        """Probe A regression: cancelling a run_sync job must NEVER SIGTERM our own pgroup or bystanders."""
+        """R1: cancelling a run_sync job must never SIGTERM our own pgroup or bystanders.
+
+        The suite is a 15 s sleep, run on a background thread so this thread can
+        cancel it while it executes. ``cancel()`` is cooperative first: it writes the
+        flag, the in-suite read loop notices within ~50 ms and tears its own group
+        down, and the run finalizes ``CANCELLED``. If the run is still locked after a
+        1.5 s wait, ``cancel()`` escalates to ``terminate_process_group`` on a
+        recorded worker pgid whose start time is fingerprint-verified — never on
+        ``os.getpgrp()`` and never on an unverified pid. This test exercises the
+        cooperative path; the invariant under test is that no unverified group,
+        especially the caller's, is ever signalled. The two negative controls are
+        the point of the test:
+
+        * a SIGTERM handler installed in *this* process, so a stray group signal is
+          recorded instead of silently killing the test runner;
+        * an unaffiliated ``sleep 30`` child deliberately left in this process's
+          group — the exact victim class R1 was about.
+
+        The run id is discovered by polling the store rather than by intercepting the
+        engine, because ``run_sync`` commits the ``RUNNING`` row before it takes the
+        lock; that ordering is what makes an external cancel possible at all.
+
+        Known diagnostic weak point: the ``assertTrue(rid, ...)`` message says the run
+        "did not enter RUNNING state", but the loop can also expire because the run
+        already reached a terminal state (or because ``list_runs`` returned a row for a
+        different run) within the 5 s budget. If this assert fires, read the store —
+        the message names one cause among several. The 5 s poll is also the original
+        value and leaves little headroom on a loaded machine; the suite itself sleeps
+        15 s, a second 5 s is spent joining the thread, and ``cancel`` may spend 1.5 s
+        waiting for cooperative teardown.
+        """
         proj = self.root / "proj_r1"
         (proj / "tests").mkdir(parents=True)
         (proj / "tests" / "test_slow.py").write_text(
@@ -93,7 +169,29 @@ class AdversarialAndOpusRegressionTests(unittest.TestCase):
             bystander.wait(timeout=2.0)
 
     def test_r2_setsid_daemonized_descendant_is_reaped_on_timeout(self) -> None:
-        """Probe B regression: double-fork + os.setsid() child holding sandbox cwd/env is reaped on timeout."""
+        """R2: a double-fork + ``setsid()`` descendant holding sandbox cwd/env is reaped.
+
+        The child forks, calls ``setsid()`` in the first child (a new session *and*
+        group), forks again, and the grandchild ``chdir``s into the sandbox and writes
+        its pid before sleeping. That is a deliberate escape from the owned group, so
+        ``terminate_process_group`` can never reach it; it is found only because the
+        post-timeout survivor sweep matches processes that hold or name the per-run
+        sandbox directory.
+
+        Discrimination: the test asserts ``timed_out`` first, because the sweep only
+        runs for timeout/cancel/non-zero exits. The survivor sweep finds the grandchild
+        through an ``lsof +D`` holder scan (which includes a cwd inside the tree) and a
+        ``ps`` command-line scan of the per-run sandbox path. The pid file is the proof
+        it started; ``os.kill(pid, 0)`` polling with a 1.5 s budget allows for
+        SIGTERM-then-SIGKILL and reaping latency.
+
+        Timing sensitivity: the 0.6 s timeout must exceed interpreter startup plus two
+        forks plus the ``chdir``/write, or the pid file will be missing and the test
+        fails as "did not start before timeout" rather than as a reap failure. A pid
+        recycled into an unrelated process would also keep ``kill(pid, 0)`` alive;
+        the sweep runs immediately after the timeout, so that window is small but not
+        zero. ``use_seatbelt=False`` keeps the test about reaping, not confinement.
+        """
         pid_file = self.root / "daemon_pid.txt"
         script = (
             "import os, pathlib, sys, time\n"
@@ -134,7 +232,31 @@ class AdversarialAndOpusRegressionTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "macOS sandbox-exec unavailable")
     def test_r3_and_opus_sbpl_deny_by_default_writes_scoped_unix_sockets_and_hermes_read_denies(self) -> None:
-        """Probe C + Opus SBPL verification: LaunchAgents write, live tmux socket, DNS, 9222, config.yaml/state.db reads all denied."""
+        """R3 + Opus: the SBPL profile denies by default, not just at the obvious paths.
+
+        One probe process runs under a freshly built profile and reports a dict of
+        booleans; the parent asserts every value is True. Covered denials: reads of
+        Hermes config/state/sessions/profiles, writes to ``~/Library/LaunchAgents``,
+        ``~/.zshrc`` and ``~/.local/bin``, connect() to the ambient tmux socket, DNS
+        resolution, and localhost:9222 (CDP).
+
+        Two honest limits are encoded in that probe rather than hidden:
+
+        * A path that does not exist is reported as ``*_read_denied=True``. That is an
+          *inferred* deny (nothing was there to read), not an observed EPERM, so the
+          read half can pass on a machine without a Hermes home. The write half is a
+          real attempt, so its True is an observed failure rather than an inference —
+          but any ``OSError`` counts, not only a Seatbelt denial.
+        * The tmux check targets the hard-coded ``/private/tmp/tmux-501/default``. When
+          no server is listening there — or the uid is not 501 — connect() fails with
+          ENOENT and the assertion passes for the wrong reason. It proves the probe
+          cannot reach *that* socket, not that all sockets are unreachable.
+
+        Skips (conditional tests): absent ``sandbox-exec`` and a failing
+        ``can_apply_seatbelt()`` probe. The second case is read as "already inside an
+        outer Seatbelt", because a nested ``sandbox-exec`` cannot apply a second
+        profile; that is an inference, and the skip message says so.
+        """
         from hermes_testbench.isolation import can_apply_seatbelt
         if not can_apply_seatbelt():
             self.skipTest("already inside outer Seatbelt; cannot apply fresh profile")
@@ -198,7 +320,20 @@ class AdversarialAndOpusRegressionTests(unittest.TestCase):
             self.assertTrue(val, f"Expected {k}=True under Seatbelt, got {perms}")
 
     def test_r4_invalid_manifest_cwd_finalizes_run_as_error_not_orphaned_running(self) -> None:
-        """Probe E regression: suite with invalid cwd (file instead of dir) finalizes ERROR cleanly."""
+        """R4: a suite whose ``cwd`` is a file finalizes the run ``ERROR``, with evidence.
+
+        ``run_isolated_command`` resolves ``cwd`` strictly and raises ``ValueError``
+        before spawning anything; the adapter maps that to a suite-level ``ERROR``
+        with a ``spawn_error`` failure, and ``run_sync``'s exception path plus
+        ``_populate_and_finalize`` turn it into a persisted ``ERROR`` run. The failure
+        mode being protected against is a row left ``RUNNING`` (which the TUI shows as
+        an active run and the reconciler must later repair) or a missing evidence dir.
+
+        The test asserts three separate things because they fail independently: the
+        returned record, the *persisted* record (the store is the source of truth for
+        other processes), and the presence of ``run.json`` (evidence). A fix that only
+        updated the in-memory record would pass the first assert and fail the second.
+        """
         proj = self.root / "proj_r4"
         proj.mkdir()
         (proj / "afile.txt").write_text("not a dir\n", encoding="utf-8")
@@ -217,7 +352,23 @@ class AdversarialAndOpusRegressionTests(unittest.TestCase):
             self.assertTrue((Path(rec.evidence_dir) / "run.json").is_file())
 
     def test_r5_junit_xml_attributes_match_emitted_elements_for_timeout_and_blocked(self) -> None:
-        """R5 regression: JUnit XML tests/failures/errors/skipped attributes match child elements."""
+        """R5: JUnit ``tests``/``failures``/``errors``/``skipped`` match emitted elements.
+
+        The record is hand-built rather than produced by a run, which isolates the
+        renderer: a TIMEOUT suite with one failure record and a BLOCKED suite with no
+        cases at all. ``render_junit_xml`` back-fills synthetic testcases for counters
+        that the adapter never reported, so the invariant is not "counts equal input"
+        but "attributes equal the elements in the document". The test recomputes each
+        count from the parsed XML rather than trusting the renderer's own arithmetic,
+        which is why it can catch a mismatch between the two.
+
+        The document-level assert (``testsuites@tests`` equals the sum over suites)
+        catches the case where per-suite counts are internally consistent but the
+        roll-up is stale. Note that the TIMEOUT failure must become ``<error>`` and the
+        BLOCKED one ``<skipped>``; the negative-control value here is that a renderer
+        classifying both as ``<failure>`` would still pass the sum check but fail the
+        per-element counts.
+        """
         rec = RunRecord(
             run_id="tb_r5_junit",
             project="demo",
@@ -270,7 +421,24 @@ class AdversarialAndOpusRegressionTests(unittest.TestCase):
         )
 
     def test_r6_stream_redactor_caps_memory_inside_unclosed_pem_block(self) -> None:
-        """R6 regression: unclosed -----BEGIN PRIVATE KEY----- followed by 1 MB single line stays bounded."""
+        """R6: 1.28 MB inside an unterminated PEM block stays bounded and redacted.
+
+        On the first ``feed`` the line-anchored BEGIN marker puts the redactor into PEM
+        state; the following 20 chunks contain no newline, so no line is ever
+        complete. The buffer therefore has to be trimmed by the cap path: it keeps
+        only ``OVERLAP_TAIL`` (512 chars) and emits exactly one ``[REDACTED]``.
+        ``MAX_BUFFER_CHARS * 2`` is a loose upper bound. In this scenario every feed
+        pushes the buffer past the cap while in PEM state, so it ends at
+        ``<= OVERLAP_TAIL``; a sub-cap final feed would leave a larger buffer, so that
+        tighter bound holds only here. The loose bound is chosen so the assertion does
+        not pin an internal constant to the exact byte.
+
+        The second half is the negative control for the *other* direction: prose that
+        mentions the BEGIN marker mid-line must not be treated as a PEM header, because
+        otherwise every subsequent line of a test log would be swallowed. Both halves
+        matter: a cap that redacts everything unconditionally would pass the first and
+        fail the second.
+        """
         red = StreamRedactor()
         out = red.feed("-----BEGIN RSA PRIVATE KEY-----\n")
         for _ in range(20):
@@ -286,7 +454,28 @@ class AdversarialAndOpusRegressionTests(unittest.TestCase):
         self.assertIn("Ran 188 tests in 1.0s", prose_out)
 
     def test_opus_tui_overview_excludes_benchmarks_aligns_header_counts_and_surfaces_failures(self) -> None:
-        """Opus TUI critique: overview excludes benchmark runs, header counts match overview, FAIL logs lead."""
+        """TUI: the overview is one row per project, and the header counts that set.
+
+        Four synthetic runs set up three independent traps:
+
+        * a *newer* benchmark run for the same project — must not shadow the
+          regression PASS, because benchmarks live in their own view;
+        * an older UNIT failure superseded by the newer PASS — must not inflate the
+          fail count, because the overview keeps only the latest terminal run per
+          project;
+        * a failing run in a different project — must be visible and selected, so the
+          inspector shows its repro command and its ``[FAIL]`` log line.
+
+        ``1 pass`` / ``1 fail`` in the header is therefore computed over the deduped
+        overview set, not over ``state.runs``. ``assertNotIn("5/5", ...)`` is a coarse
+        guard against the benchmark row leaking into the body, and could in principle
+        collide with unrelated text; it is kept because the positive assertions
+        (``180/180``) already pin the intended row.
+
+        The narrow 80x24 check pins the hint band's fallback: the full hint line does
+        not fit, and the compact variant must still offer ``? help`` on the
+        second-to-last line (the minibuffer is the last line).
+        """
         r_pass = RunRecord(
             run_id="tb_20261114_100000_pass0001",
             project="hermes-testbench",

@@ -1,4 +1,30 @@
-"""TDD tests for TestBench mandatory isolation, in-stream secret filtering, timeouts, cancel, and cleanup."""
+"""Isolation contract tests: sandbox env, disk redaction, reaping, teardown safety.
+
+Each test drives ``run_isolated_command`` (the production path) and asserts on
+observable effects — files on disk, process liveness, what the child printed.
+Nothing here trusts ``isolation_meta`` counters (``reaped_survivors``,
+``leaked_children``): those describe what a run had to clean up, not whether the
+suite is well-behaved, so the tests observe the processes and files directly.
+
+Sandbox assumptions, because three of these tests are conditional and one
+depends on where the suite itself runs:
+
+* scratch space is created under ``~/.hermes/cache/scratch`` directly, not via
+  ``default_scratch_root()``, so ``TESTBENCH_SCRATCH_DIR`` does not redirect it;
+  that directory must be writable or every test in the class errors in ``setUp``.
+* the Seatbelt tests skip when ``sandbox-exec`` is absent. When the suite itself
+  runs inside an outer Seatbelt, ``can_apply_seatbelt()``'s probe fails and
+  ``run_isolated_command`` records ``inherited_outer``; the inner denials then
+  come from the outer profile, and the test cannot tell which layer denied.
+* the tmux tests skip when ``tmux`` is absent. Their assertions are about a
+  private server on a private socket, never the ambient one.
+
+Liveness is checked with ``os.kill(pid, 0)``: ``ProcessLookupError`` proves no
+process currently holds that pid. It does not prove the *same* process existed
+and died, but pid reuse inside these sub-second windows is implausible; a test
+that passed because the pid was recycled would be a flake, not a false green
+worth modelling.
+"""
 
 from __future__ import annotations
 
@@ -24,6 +50,8 @@ PY = sys.executable
 
 
 class IsolationTests(unittest.TestCase):
+    """One behaviour per test: env, redaction, streaming, reaping, teardown safety."""
+
     def setUp(self) -> None:
         scratch = Path.home() / ".hermes/cache/scratch"
         scratch.mkdir(parents=True, exist_ok=True)
@@ -38,6 +66,16 @@ class IsolationTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_env_scrubbing_removes_credentials_and_live_tmux_vars_and_isolates_home(self) -> None:
+        """Scrubbing is name-based; redirection moves HOME/TMPDIR; the tree is 0700.
+
+        ``SAFE_FLAG`` is the negative control: it proves the builder filters by
+        variable *name* rather than whitelisting a known environment — which is
+        also why an unrecognised secret name would survive. ``base_env`` is a
+        synthetic dict, so the ambient environment cannot mask a bug; nothing
+        outside that literal is copied in. ``HXMAIL_DB`` is asserted only as
+        "not the Application Support path": the test pins redirection off the
+        real mailbox, not the replacement location.
+        """
         fake_base = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "OPENAI_API_KEY": "sk-live-secret-1234567890",
@@ -67,6 +105,20 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(sb.stat().st_mode), 0o700)
 
     def test_in_stream_secret_redaction_prevents_secrets_from_ever_reaching_disk_logs(self) -> None:
+        """A token split across two writes is redacted in both files and the capture.
+
+        The child writes the key prefix, flushes, then writes the remainder plus
+        a newline: two ``read`` chunks that split the token. ``stdout.log`` is
+        not a raw transcript — ``_emit_out`` writes the ``StreamRedactor``
+        output — so the assertion covers ``stdout_path``, ``stderr_path``,
+        ``sanitized_path``, and the in-memory texts, i.e. every place the bytes
+        could land. ``[REDACTED]`` in both disk logs is the positive control
+        against a writer that dropped the line entirely; the OSC 52 absence in
+        ``sanitized.log`` shows the terminal-strip pass ran after redaction.
+        Mode ``0600`` is asserted on the raw log only, as a spot check of
+        ``_open_0600_write``. Seatbelt is left on here: the child writes only to
+        stdout, which the profile permits.
+        """
         res = run_isolated_command(
             [
                 PY,
@@ -100,9 +152,17 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(Path(res.stdout_path).stat().st_mode), 0o600)
 
     def test_sanitized_log_is_readable_while_the_command_still_runs(self) -> None:
-        """A live run's evidence must stream: the TUI reads sanitized.log while
-        the suite is still executing, so the writer flushes per chunk instead of
-        only at completion."""
+        """The disk log streams: the marker is visible before the child exits.
+
+        This is the property the TUI depends on (``_refresh_active_logs`` reads
+        ``*.sanitized.log`` for an ACTIVE run). The child blocks on a release
+        flag for up to 20s, and the test polls the file for 15s while the worker
+        thread is still alive; ``worker.is_alive()`` in the poll condition is
+        what makes the observation "mid-run" rather than "after the fact". A
+        buffered writer would make the file either absent or empty until close.
+        ``use_seatbelt=False`` keeps the timing signal about the writer rather
+        than about profile setup; the child touches no file of its own.
+        """
         release = self.evidence / "release.flag"
         script = (
             "import os, sys, time\n"
@@ -149,6 +209,18 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(Path(res.sanitized_path).stat().st_mode), 0o600)
 
     def test_timeout_reaps_entire_process_group_including_spawned_grandchild(self) -> None:
+        """A timed-out suite takes its whole process group with it, not just the leader.
+
+        The child spawns a grandchild and records its pid, so the assertion can
+        name a process the parent never waited on. ``os.kill(gc_pid, 0)``
+        raising ``ProcessLookupError`` proves the grandchild is gone; killing
+        only the leader would leave it running and fail here. ``elapsed < 5.0``
+        is the timing half: a reaper that waited out the 60s sleep, or a grace
+        period that ignored ``timeout_s=0.6``, would exceed it. The pid file is
+        asserted to exist first — otherwise a child that never got that far
+        would make the liveness check vacuous.
+        """
+
         pid_file = self.evidence / "grandchild.pid"
         script = (
             "import os, subprocess, sys, time\n"
@@ -178,6 +250,19 @@ class IsolationTests(unittest.TestCase):
             os.kill(gc_pid, 0)
 
     def test_cancel_flag_stops_running_command_and_cleans_up_children(self) -> None:
+        """A flag file observed mid-run cancels the command and reaps the child.
+
+        Cancellation is cooperative at the loop boundary: the flag is polled
+        between reads, so the test signals only once the child has written its
+        pid file — that ordering keeps the assertion about a *running* child
+        rather than a race with spawn. ``res.cancelled`` distinguishes this from
+        a timeout, which is the other path that terminates the same group; the
+        two flags are mutually exclusive by construction, so asserting
+        ``cancelled`` also rules out "it only looked cancelled because it timed
+        out". ``timeout_s=30`` is deliberately much larger than the 3s trigger
+        deadline, so a slow start cannot be misread as cancellation.
+        """
+
         cancel_flag = self.evidence / "cancel.flag"
         pid_file = self.evidence / "child.pid"
 
@@ -211,6 +296,17 @@ class IsolationTests(unittest.TestCase):
             os.kill(child_pid, 0)
 
     def test_symlink_inside_sandbox_cleanup_never_deletes_external_target(self) -> None:
+        """Teardown unlinks a child-planted symlink instead of walking it.
+
+        The child plants a link named ``escape_link`` inside its own ``HOME``
+        pointing at a directory outside the sandbox. The external file surviving
+        is the whole assertion: a recursive delete that followed links would
+        remove ``must survive``. The second assertion — no ``tbw-*`` directories
+        left under the scratch root — is the complementary half, proving cleanup
+        still happened rather than "nothing was deleted anywhere", which would
+        also keep the external file safe.
+        """
+
         precious_dir = self.root / "precious"
         precious_dir.mkdir()
         precious_file = precious_dir / "keep.txt"
@@ -238,6 +334,18 @@ class IsolationTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "macOS sandbox-exec unavailable")
     def test_seatbelt_blocks_network_and_hermes_home_writes_while_allowing_scratch(self) -> None:
+        """One profile enforces three different decisions at once.
+
+        Negative control and positive control in the same child: outbound DNS
+        and a write under the real ``~/.hermes`` must raise ``OSError``, while a
+        write to ``$TMPDIR`` (the sandbox ``tmp``) must succeed and read back.
+        Asserting the combined string pins all three outcomes in one run, so a
+        profile that denied everything — including scratch — fails instead of
+        looking maximally secure. The probe path under the real home is asserted
+        absent afterwards: the exception is the in-sandbox view, and a file on
+        disk would mean confinement was not applied at all.
+        """
+
         from hermes_testbench.isolation import real_user_home
         hermes_probe = real_user_home() / ".hermes" / "_tb_forbidden_write_probe"
         script = (
@@ -272,6 +380,18 @@ class IsolationTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("tmux"), "tmux unavailable")
     def test_disposable_tmux_server_is_isolated_and_killed_on_teardown(self) -> None:
+        """A private tmux server is reachable from the suite and gone after teardown.
+
+        ``needs_tmux=True`` gives the child a ``TMUX_TMPDIR`` and socket name of
+        its own; the child starts a server there and prints its pid. The poll
+        loop after teardown exists because the kill is asynchronous relative to
+        the ``run_isolated_command`` return: it waits up to 2s for
+        ``ProcessLookupError`` instead of sampling once. A socket-path too long
+        for ``sun_path`` would fail inside the child as ``bind: File name too
+        long`` and show up as ``exit_code != 0`` with stderr, not as a leaked
+        server, which is why the exit status is asserted first.
+        """
+
         script = (
             "import os, subprocess\n"
             "sock = os.environ['TESTBENCH_TMUX_SOCKET']\n"
@@ -310,6 +430,15 @@ class IsolationTests(unittest.TestCase):
         Adversarial case: the sandboxed child deletes ``$TMUX_TMPDIR`` and links it at a decoy
         base hosting an unrelated tmux server. Teardown must refuse to walk the link, so the
         decoy server stays alive and the decoy directory is left untouched.
+
+        Three assertions, each a different failure: the decoy pid still answers
+        ``kill(pid, 0)`` (no server was signalled), the decoy socket is still a
+        socket and its directory still exists (no directory sweep crossed the
+        link), and the planted link itself is gone (teardown unlinked rather than
+        ignored it, so the next run does not inherit the escape). ``realpath`` on
+        both sides is required because macOS reports ``$TMPDIR`` as ``/var/...``
+        while ``realpath`` yields ``/private/var/...``; comparing raw strings
+        would fail for the right behaviour.
         """
         # Short TMPDIR-based base: a socket under $TMPDIR/tmux-<uid>/decoy stays far below the
         # macOS 104-byte sun_path limit even inside the nested (already sandboxed) test run.
@@ -396,6 +525,21 @@ class IsolationTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "macOS sandbox-exec unavailable")
     def test_nested_process_inherits_effective_seatbelt_restrictions_and_detects_outer_sandbox(self) -> None:
+        """A nested run cannot widen the outer profile, and reports it as inherited.
+
+        The outer run launches an inner runner that launches a leaf; the leaf
+        probes the same four denials plus a scratch write. The inner run asks for
+        its own Seatbelt, but ``can_apply_seatbelt()`` fails inside an outer
+        sandbox, so it prints ``inherited_outer`` — that reported state, not a
+        stacked profile, is what the assertions pin. The branch selecting
+        ``protected_repo`` follows the same distinction: when Seatbelt is
+        applicable the temp repo is the target expected to be read-only, and when
+        the suite already runs inside an outer profile the source checkout is
+        used instead. Only one branch is reachable on a given host; both assert
+        that a write fails, so the test does not claim to prove *which* layer
+        denied it.
+        """
+
         from hermes_testbench.isolation import can_apply_seatbelt, real_user_home
         real_hermes_probe = real_user_home() / ".hermes" / "_tb_nested_effective_probe"
         real_ssh_dir = real_user_home() / ".ssh"
