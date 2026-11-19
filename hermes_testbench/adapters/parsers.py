@@ -3,6 +3,33 @@
 Each parser consumes already-captured text only: no I/O, no spawning, no re-runs.
 Parsers never invent counts or model usage: anything not present in the captured
 text stays zero/``None`` so the caller can reconcile against the exit status.
+
+The one promise a parser makes is ``ParseOutcome.structured``: ``True`` means the
+text contained something this parser recognises as a runner summary or marker set,
+so ``adapters.execute_suite`` trusts the counts and only cross-checks them against
+the exit status (see ``adapters._finalize_counts``). ``False`` means "nothing here
+I understand" and the caller must fall back to the exit status alone. Returning
+``structured=True`` with no cases, or raising on odd input, breaks that contract.
+
+Shared marker grammar (``_summarize_markers``)
+---------------------------------------------
+``PASS`` / ``TB-PASS`` / ``OK``, ``FAIL`` / ``TB-FAIL`` / ``FAILED`` and ``SKIP``
+at the start of a stripped line, case-sensitive on purpose: an ``ok:`` from a JSON
+log or a lowercase ``skip`` is not a verdict. An inline marker is one complete
+case; a bare marker owns the indented block under it, and that block becomes
+several failures only when it *opens* with a bullet or numbered item.
+
+What the shared marker scanner silently drops (by design, worth knowing before reading a
+run): TAP output (``ok 1 - name``), ``ERROR`` marker lines (``errors`` is filled from a
+numeric summary, or by ``parse_python_pytest`` from its own ``ERROR`` lines), lowercase
+``ok``/``skip``, and any count line that does not match ``_COUNT_PATTERNS``. Dropped
+detail never becomes a fabricated pass — it becomes "unstructured", i.e. an exit-status
+verdict.
+
+Counting is monotonic per field: ``_apply_summary`` takes the maximum of what
+markers already found and what the summary declares. ``total`` is therefore not
+guaranteed to equal ``pass + fail + skip + error`` when a log contains text from
+two different runs; treat the per-field counts as the more specific truth.
 """
 
 from __future__ import annotations
@@ -57,7 +84,22 @@ _SANITIZER_DIAG_RES = (
 
 @dataclass
 class ParseOutcome:
-    """Counts and detail extracted from one captured run."""
+    """Counts and detail extracted from one captured run.
+
+    ``total``/``passed``/``failed``/``skipped``/``errors`` are what lands on
+    ``SuiteResult``; ``failures`` and ``cases`` are dicts (not schema objects) so a
+    parser can stay free of imports from ``..schema``; the caller materialises them.
+    ``summary_line`` becomes ``SuiteResult.summary_excerpt`` when non-empty, which is
+    why parsers prefer the runner's own words over a synthesised sentence.
+
+    ``usage`` is only ever the verbatim ``TESTBENCH_MODEL_USAGE=<json>`` payload a
+    billable runner printed (``parse_agent_eval``); nothing estimates it.
+
+    ``buckets``/``baseline_failed`` exist for the two mutation adapters only. They
+    are kept separate from the five count fields so a mutation run can expose
+    ``metrics["mutation"]`` without pretending ``invalid``/``timeout`` are skips in
+    the generic sense (``_sync_mutation_counts`` maps them afterwards).
+    """
 
     total: int = 0
     passed: int = 0
@@ -79,6 +121,11 @@ def _clean(text: str) -> str:
 
 
 def _failure(case_name: str, kind: str, message: str, excerpt: str = "") -> Dict[str, Any]:
+    """Materialise one failure dict, bounded to 800 chars per text field.
+
+    ``file``/``line`` are always present-and-``None`` here; parsers that know a
+    source location (FileCheck, ``cobc``) build their dicts directly instead.
+    """
     return {
         "case_name": case_name or "<run>",
         "kind": kind,
@@ -90,7 +137,17 @@ def _failure(case_name: str, kind: str, message: str, excerpt: str = "") -> Dict
 
 
 def _summarize_markers(text: str) -> Tuple[int, int, int, int, List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Count PASS/FAIL/SKIP marker lines and build failure/case records."""
+    """Count PASS/FAIL/SKIP marker lines and build failure/case records.
+
+    Returns ``(passed, failed, skipped, errors, failures, cases)``. ``errors`` is
+    always 0: this scanner has no ``ERROR`` marker, so harness errors are only
+    visible through a numeric summary line. A bare FAIL owns the following indented
+    non-blank block; if the block starts with a bullet/numbered item each item is a
+    failure, otherwise the whole block is one failure's excerpt and the message is
+    the most specific line in it (a reversal scan for ``*Error:``-shaped text, else
+    the last line). Case names are synthesised (``failure_N``/``case_N``) when the
+    runner supplied none, so they are stable per position, not per test identity.
+    """
     passed = failed = skipped = 0
     failures: List[Dict[str, Any]] = []
     cases: List[Dict[str, Any]] = []
@@ -161,7 +218,14 @@ def _summarize_markers(text: str) -> Tuple[int, int, int, int, List[Dict[str, An
 
 
 def _summary_counts(text: str) -> Tuple[Dict[str, int], str]:
-    """Return counts from the last summary-looking line, plus that line."""
+    """Return counts from the last summary-looking line, plus that line.
+
+    "Last, not first" is deliberate: a suite that runs the real command twice (a
+    smoke pass then a strict pass) should be judged by its final verdict. The line
+    must contain a ``_SUMMARY_HINT_RE`` hit — ``<n> passed|failed|skipped|errors`` —
+    which is what keeps prose ("3 tests failed to start") from being read as a
+    summary. A line that mentions only ``warnings`` yields no counts at all.
+    """
     best: Dict[str, int] = {}
     best_line = ""
     for raw_line in text.splitlines():
@@ -215,6 +279,23 @@ def _apply_markers(outcome: ParseOutcome, text: str) -> bool:
 
 
 def parse_python_unittest(text: str) -> ParseOutcome:
+    """Parse ``unittest`` output: ``Ran N tests``, ``OK``/``FAILED (...)``, verbose lines.
+
+    Counts come from the ``Ran`` header plus the ``OK``/``FAILED`` clause; ``passed``
+    is *derived* (total - skipped - failures - errors), so a runner whose header and
+    clause disagree still yields a self-consistent set.
+
+    Failure detail is read twice on purpose: from ``FAIL: name (loc)`` / ``ERROR: ...``
+    headers (which own the traceback block below them) and from verbose
+    ``name (loc) ... ok|FAIL|skipped 'reason'`` lines. Cases are keyed by
+    ``name (loc)`` and headers win over verbose lines, which is what makes
+    ``-v`` output produce one case per test rather than two.
+
+    Dropped: anything before the first header, ``expected failure`` /
+    ``unexpected success`` verbose states (they land in the PASS branch, so an
+    unexpected success is counted as a pass), and runner text that is not one of the
+    two header forms.
+    """
     text = _clean(text)
     outcome = ParseOutcome()
     ran = re.search(r"^Ran (\d+) tests? in [^\r\n]+", text, re.MULTILINE)
@@ -311,6 +392,22 @@ def parse_python_unittest(text: str) -> ParseOutcome:
 
 
 def parse_python_pytest(text: str) -> ParseOutcome:
+    """Parse ``pytest`` output: the final summary rule, ``FAILED``/``ERROR`` lines, ``-v``.
+
+    The summary is accepted from either the ``===== 1 failed, 2 passed in 0.1s =====``
+    rule or a bare ``-q`` line, and only when the whole line matches pytest's own
+    grammar (``_PYTEST_QUIET_SUMMARY_RE``) — a log line that merely mentions counts
+    does not qualify. The last matching line wins.
+
+    ``FAILED path::test - msg`` / ``ERROR ...`` short-summary lines are the only
+    source of failure records, and each one raises ``failed``/``errors`` to at least
+    1 so a summary that undercounts cannot report zero failures. ``-v`` output adds
+    PASS/SKIP cases; plain output produces failure cases only.
+
+    Dropped: ``no tests ran in ...`` (no digits to match, so the run is unstructured
+    and the exit status 5 decides), ``xfail``/``xpass`` markers, warning blocks, and
+    the traceback body — the short summary line is the message, not the traceback.
+    """
     text = _clean(text)
     outcome = ParseOutcome()
     counts: Dict[str, int] = {}
@@ -365,6 +462,25 @@ def parse_python_pytest(text: str) -> ParseOutcome:
 
 
 def parse_cargo(text: str) -> ParseOutcome:
+    """Parse ``cargo test`` output by summing every ``test result:`` block.
+
+    Cargo prints one block per test binary (lib, each integration test), so counts
+    are *summed* rather than taken from the last block; ``blocks`` drives
+    ``summary_line`` and ``structured``. ``ignored`` is the skip bucket — cargo has
+    no separate "skipped" vocabulary.
+
+    ``test <name> ... FAILED`` lines add the failure records, but a compile error
+    (``error[E0xxx]: could not compile``) with no result block is also a structured
+    outcome with one synthetic ``cargo-compile`` failure: a build failure must not
+    degrade to "exit status 1" with no attributable reason.
+
+    Dropped: doctest blocks (``test src/lib.rs - foo (line 3) ... ok`` has extra text
+    between the name and ``...``, so it does not match the per-case regex),
+    ``failures:`` sections, and any ``test result:`` line whose shape drifts from
+    ``ok|FAILED. N passed; N failed; N ignored;`` — that last one is the version-drift
+    risk: nextest-style summaries land in the unstructured bucket instead of being
+    mis-counted.
+    """
     text = _clean(text)
     outcome = ParseOutcome()
     block_re = re.compile(
@@ -478,6 +594,29 @@ def _apply_cobol_details(outcome: ParseOutcome, text: str) -> None:
 
 
 def parse_cobol(text: str) -> ParseOutcome:
+    """Parse GnuCOBOL verification output: harness markers first, compiler text second.
+
+    Precedence is the whole contract here, because ``cobol_check`` deliberately
+    prints its own ``TB-PASS``/``TB-FAIL`` lines (the "flagship" path) while a plain
+    ``cobc``/selftest script prints only compiler output:
+
+    1. ``Ran N tests in ...`` means the suite ran a Python unittest harness —
+       delegate wholesale to ``parse_python_unittest``.
+    2. Harness markers win. When any marker is present, ``cobc`` diagnostics are
+       *not* mined (``_cobol_compile_errors`` is skipped) so one failure is not
+       reported twice: once as a marker and once as a compiler error.
+    3. Marker failure excerpts are refolded from the indented block under an inline
+       ``TB-FAIL <label>`` (``_apply_cobol_details``), because the shared scanner
+       treats an inline marker as a single-line failure.
+    4. No markers: a ``ALL TESTS PASSED``/``TESTS PASSED``/``SELFTEST OK`` banner is
+       one pass; ``cobc`` ``file:line: error:`` lines become attributable failures
+       with the diagnostic as the message.
+
+    Dropped: ``cobc`` warnings/notes (severity filter), diagnostics that do not
+    start with a ``.cob/.cbl/.cpy`` path, and everything past the tenth compile
+    error — ``failed`` still counts all of them, so ``failed`` can exceed
+    ``len(failures)`` on a very broken build.
+    """
     cleaned = _clean(text)
     if re.search(r"^Ran \d+ tests? in ", cleaned, re.M):
         return parse_python_unittest(cleaned)
@@ -524,6 +663,18 @@ def parse_cobol(text: str) -> ParseOutcome:
 
 
 def parse_c_sanitizer(text: str) -> ParseOutcome:
+    """Parse AddressSanitizer/LeakSanitizer/UBSan output plus optional markers.
+
+    Each diagnostic line is one failure; ``failed`` is raised to the diagnostic
+    count so a program that printed a sanitizer report and exited 0 still fails.
+    Marker lines and a summary line are still honoured, which is what lets the
+    generated C suite report per-source passes.
+
+    Dropped: sanitizer stack frames and ``SUMMARY:`` blocks (the ``ERROR:`` line is
+    the record), and the third pattern matches any line containing
+    ``runtime error:`` — including a program's own echo of that phrase, which is
+    why this parser is only wired to the ``c_sanitizer`` adapter.
+    """
     text = _clean(text)
     outcome = ParseOutcome()
     diagnostics = 0
@@ -558,6 +709,19 @@ def parse_c_sanitizer(text: str) -> ParseOutcome:
 
 
 def parse_shell(text: str) -> ParseOutcome:
+    """Parse a ``shell``/``shell_test`` suite: markers, else FileCheck, else summary.
+
+    Order matters. Markers are authoritative, and when any marker is present the
+    FileCheck diagnostic miner is skipped entirely — a script that both prints
+    ``TB-PASS`` and pipes FileCheck output is trusted to have already summarised
+    itself. With no markers, ``parse_filecheck_diagnostics`` owns the counts
+    (``failed = total = len(diagnostics)``, overwritten rather than maxed) so an
+    output contract reports one failure per assertion instead of one per process.
+    Otherwise the generic summary scan applies.
+
+    Dropped: shell exit-status-only scripts stay unstructured (the caller turns that
+    into one synthetic failure), and ``set -e`` traces carry no verdicts.
+    """
     from .filecheck import parse_filecheck_diagnostics
 
     text = _clean(text)
@@ -593,6 +757,13 @@ def parse_shell(text: str) -> ParseOutcome:
 
 
 def parse_re_project(text: str) -> ParseOutcome:
+    """Parse marker lines plus an optional summary, with markers as ground truth.
+
+    Adopts the summary's *total* only when it declares more cases than the markers
+    showed; the per-case counts stay whatever the markers said. That asymmetry is
+    the point: a harness that evaluates 40 assertions but prints a partial marker
+    set must not have its ``failed`` overwritten by a total.
+    """
     text = _clean(text)
     outcome = ParseOutcome()
     markers = _apply_markers(outcome, text)
@@ -613,6 +784,7 @@ def parse_re_project(text: str) -> ParseOutcome:
 
 
 def parse_sqlite_probe(text: str) -> ParseOutcome:
+    """Parse a ``sqlite_probe`` log: markers and an optional summary line only."""
     text = _clean(text)
     outcome = ParseOutcome()
     markers = _apply_markers(outcome, text)
@@ -624,6 +796,11 @@ def parse_sqlite_probe(text: str) -> ParseOutcome:
 
 
 def parse_pty_tmux(text: str) -> ParseOutcome:
+    """Parse a ``pty_tmux`` screen dump: markers and an optional summary line.
+
+    The captured text is the PTY transcript (ANSI already stripped by ``_clean``), so
+    the same marker grammar applies; there is no attempt to reconstruct screen state.
+    """
     text = _clean(text)
     outcome = ParseOutcome()
     markers = _apply_markers(outcome, text)
@@ -638,6 +815,13 @@ _USAGE_RE = re.compile(r"TESTBENCH_MODEL_USAGE=(\{.*\})\s*$")
 
 
 def parse_agent_eval(text: str) -> ParseOutcome:
+    """Parse a marker/summary log from an agent evaluation.
+
+    The only parser that fills ``usage``: it takes the last
+    ``TESTBENCH_MODEL_USAGE=<json object>`` line verbatim. A malformed payload is
+    skipped rather than defaulted, so ``usage`` stays ``None`` and the caller has no
+    number to bill against.
+    """
     text = _clean(text)
     outcome = ParseOutcome()
     for line in text.splitlines():
@@ -659,6 +843,14 @@ def parse_agent_eval(text: str) -> ParseOutcome:
 
 
 def parse_generic(text: str) -> ParseOutcome:
+    """Fallback for adapters with no dedicated parser: markers, summary, traceback.
+
+    An unstructured ``Traceback (most recent call last)`` is promoted to one
+    harness-error failure so a crashing tool is attributable rather than just a
+    nonzero exit. This parser is also what ``execute_suite`` uses for an adapter it
+    does not know (``ADAPTER_PARSERS.get(adapter, parse_generic)``), so a manifest
+    cannot smuggle in a novel adapter name and get invented counts.
+    """
     text = _clean(text)
     outcome = ParseOutcome()
     markers = _apply_markers(outcome, text)
@@ -794,7 +986,31 @@ def _mark_baseline_failed(outcome: ParseOutcome, reason: str) -> None:
 
 
 def parse_cargo_mutants(text: str, *, outcomes_json: str = "") -> ParseOutcome:
-    """Classify a ``cargo-mutants`` run from its console log or ``mutants.out/outcomes.json``."""
+    """Classify a ``cargo-mutants`` run from its console log or ``mutants.out/outcomes.json``.
+
+    Two sources, tried in that order:
+
+    1. ``outcomes_json`` — expected to be an object with an ``outcomes`` list whose
+       entries carry ``scenario`` (``"Baseline"`` or ``{"Mutant": {"name": ...}}``)
+       and ``summary`` (``CaughtMutant`` and friends). Only a payload of that exact
+       shape is used; anything else falls through to the console log. A non-``Success``
+       baseline marks the whole run ``baseline_failed`` and contributes one
+       ``inconclusive`` — no mutant verdict survives a broken baseline.
+       UNVERIFIED: whether the ``cargo-mutants`` version on a given host writes that
+       object shape or a bare JSON array of outcomes. If it writes an array, the
+       precise per-mutant path is dead and the console fallback (below) is what
+       classifies the run; ``tests/test_mutation_testing`` only exercises the object
+       shape. Resolving it needs one real ``mutants.out/outcomes.json`` from the
+       tool version in use.
+    2. Console log — ``CAUGHT|MISSED|TIMEOUT|UNVIABLE|FAILED <mutant>`` lines, each
+       one a case (the trailing ``in Ns build + Ns test`` timing is stripped from
+       the name). Only when no such line exists is the final
+       ``N mutants tested in Ns: N caught, N missed, ...`` tally consulted, so a log
+       carrying both is classified per mutant and never double-counted.
+
+    Unknown ``summary`` values and unknown keywords go to ``inconclusive``, never to
+    ``caught``: an unrecognised verdict can only understate the score.
+    """
     cleaned = _clean(text)
     outcome = ParseOutcome()
     outcome.buckets = _mutation_empty_buckets()
@@ -869,7 +1085,21 @@ def parse_cargo_mutants(text: str, *, outcomes_json: str = "") -> ParseOutcome:
 
 
 def parse_mutmut(text: str, *, results_text: str = "") -> ParseOutcome:
-    """Classify a ``mutmut`` run from ``mutmut run`` progress and ``mutmut results`` output."""
+    """Classify a ``mutmut`` run from ``mutmut run`` progress and ``mutmut results`` output.
+
+    ``results_text`` is the authoritative per-mutant source (``mutmut results --all true``
+    prints ``<name>: <status>`` lines); when it is empty the run log is used, which is
+    also the only source of the emoji tally. Per-mutant lines are matched first; the
+    emoji tally is consulted only when *no* per-mutant line was recognised, so a run
+    that printed both is never counted twice.
+
+    Unrecognised statuses are dropped (``bucket is None: continue``) rather than guessed
+    into a bucket — a mutmut vocabulary change understates a score instead of
+    inflating it, and the suite falls to ``inconclusive``/harness error rather than
+    a silent pass. A baseline marker (``failed to collect/run tests``) only counts as
+    a baseline failure when no per-mutant verdict exists: a partial run that produced
+    real verdicts still reports them.
+    """
     cleaned = _clean(text)
     results = _clean(results_text) if results_text.strip() else cleaned
     outcome = ParseOutcome()
@@ -924,6 +1154,13 @@ def parse_terminal_tape(text: str) -> ParseOutcome:
     The marker is authoritative: it carries the tape name, terminal status, and
     one entry per evaluated expectation. Without a marker the generic
     PASS/FAIL/SKIP marker and summary counters still apply.
+
+    ``TB-TAPE {json}`` is emitted by the tape runner itself, not by the program under
+    test, which is why it outranks everything else in the captured PTY text: a
+    program that prints ``FAIL`` on screen must not add a failure the tape did not
+    record. The last well-formed marker wins (a retry or relaunch prints a second
+    one). ``status=blocked`` converts the run to one error and a
+    ``BLOCKED_POLICY`` failure rather than a wall of assertion failures.
     """
     text = _clean(text)
     outcome = ParseOutcome()
@@ -985,6 +1222,11 @@ def parse_terminal_tape(text: str) -> ParseOutcome:
     return outcome
 
 
+# Adapter name -> parser. A name absent here falls back to ``parse_generic`` in
+# ``execute_suite``; that is the only place an unknown adapter is tolerated, and it
+# never produces invented counts. ``cargo_mutants``/``mutmut`` appear here so a direct
+# call (tests, tooling) works, but ``execute_suite`` routes those two to
+# ``run_mutation_suite`` before any parsing happens.
 ADAPTER_PARSERS = {
     "agent_eval": parse_agent_eval,
     "c_sanitizer": parse_c_sanitizer,

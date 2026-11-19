@@ -6,6 +6,21 @@ CLI subprocess, and then assert against the persisted store and evidence
 directories. The flaky fixture is a stateful counter: attempt 1 fails and every
 later attempt passes, which proves a passing retry never erases the failed
 attempt or its artifacts.
+
+Two layers, and only the second one pays for subprocesses:
+
+* ``FlakeClassificationUnitTests`` builds ``RunRecord`` objects in memory and
+  covers ``flake.py`` alone — verdict edges, target discovery, and the
+  participation gate. No store, no fixture, no timing.
+* ``FlakeHunterEndToEndTests`` shells out to ``python -m hermes_testbench``
+  with its own ``--home``, writes the manifest into a temp project, and reads
+  the results back from the store. Only the timeout test passes ``--timeout``
+  (0.5 s); the rest rely on a fast fixture and per-subprocess timeouts, so a
+  hung child fails the test rather than stalling the suite.
+
+Nothing here is skipped: a missing configured tool would be a fixture bug, not
+an environment difference, and the timeout/skip cases construct those states
+deliberately.
 """
 
 from __future__ import annotations
@@ -66,6 +81,7 @@ class SampleCases(unittest.TestCase):
 
 
 def _toml_value(value) -> str:
+    """Serialize one manifest value the way the discovery parser expects to read it."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):

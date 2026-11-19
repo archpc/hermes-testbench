@@ -1,4 +1,30 @@
-"""TDD tests for TestBench local stdio MCP server: wire protocol, SDK compatibility, authz, async survival."""
+"""TDD tests for TestBench local stdio MCP server: wire protocol, SDK compatibility, authz, async survival.
+
+Three layers, in ascending cost:
+
+* ``test_handshake_ping_tools_list_annotations_and_malformed_args`` drives
+  ``serve_stdio`` in-process over ``StringIO``. Six frames, five replies: the
+  ``notifications/initialized`` frame has no ``id`` and must produce nothing.
+  It also pins the advertised tool set, the advisory ``readOnlyHint`` split, and
+  the two failure shapes — an unauthorized root and a non-object ``arguments``
+  value — both of which come back as ``isError: true`` *tool results* rather
+  than JSON-RPC error frames, so the connection stays usable.
+* ``test_async_job_survives_mcp_subprocess_shutdown_and_settles_in_store`` runs
+  the real ``python -m hermes_testbench mcp`` entrypoint. The server is started
+  with ``start_new_session=True`` and its stdin is closed as soon as
+  ``testbench_run`` returns a handle, forcing the server to exit while the
+  detached worker — also its own session, via ``engine.spawn_async`` — is still
+  inside a 2 s suite. The worker must settle the run in ``state.db`` alone; the
+  test polls the store instead of waiting on a pipe that no longer exists.
+* ``test_real_hermes_mcp_2_sdk_client_handshake_discover_and_run`` is the only
+  case that speaks to an installed ``mcp`` SDK client, so it is ``skipUnless``
+  the Hermes venv interpreter exists. Protocol coverage does not depend on it;
+  the other two cases carry that.
+
+The ``SECRET=topsecret123`` value printed by the ``unit_ok`` fixture is
+deliberate: the SDK case asserts it never reaches tool output, which is where
+``sanitize_for_agent`` bounds and scrubs operator text at the model boundary.
+"""
 
 from __future__ import annotations
 
@@ -24,6 +50,13 @@ HERMES_VENV_PY = real_user_home() / ".hermes" / "hermes-agent" / "venv" / "bin" 
 
 
 class McpServerTests(unittest.TestCase):
+    """Each test gets its own ``tb_home``, allowlisted ``code_root`` and a two-suite project.
+
+    The temp tree is created under ``~/.hermes/cache/scratch`` rather than the
+    system temp dir because the child processes it holds are inspected (and, in
+    the async case, left running) after the test's own frame returns.
+    """
+
     def setUp(self) -> None:
         scratch = Path.home() / ".hermes/cache/scratch"
         scratch.mkdir(parents=True, exist_ok=True)
@@ -47,6 +80,12 @@ class McpServerTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _roundtrip(self, requests: list[dict]) -> list[dict]:
+        """Send ``requests`` as newline-delimited JSON and return the parsed replies.
+
+        ``rc == 0`` is asserted here rather than in every caller: ``serve_stdio``
+        returns 0 on EOF, so a non-zero return means the loop died and any later
+        assertion would be reading a truncated stream.
+        """
         raw_in = "".join(json.dumps(r) + "\n" for r in requests)
         instream = io.StringIO(raw_in)
         outstream = io.StringIO()
@@ -58,6 +97,17 @@ class McpServerTests(unittest.TestCase):
         return [json.loads(ln) for ln in lines]
 
     def test_handshake_ping_tools_list_annotations_and_malformed_args(self) -> None:
+        """Handshake, advertised surface and both tool-error shapes in one connection.
+
+        The offered protocol version is invalid on purpose: it must be answered
+        with the server default (``2025-11-25``), not echoed and not a protocol
+        error — the server advertises what it implements rather than emulating an
+        older dialect. The exact tool-name set and the ``readOnlyHint`` split are
+        what an agent plans against; the hints are advisory, so this pins the
+        advertisement, not the enforcement. Both ``isError`` assertions are
+        deliberately coarse: they prove the call failed as a tool result instead
+        of killing the loop, not which error code was returned.
+        """
         replies = self._roundtrip(
             [
                 {
@@ -116,6 +166,16 @@ class McpServerTests(unittest.TestCase):
         self.assertTrue(replies[4]["result"]["isError"])
 
     def test_async_job_survives_mcp_subprocess_shutdown_and_settles_in_store(self) -> None:
+        """A run started over MCP must outlive the MCP server that started it.
+
+        ``wait_up_to_s: 0.2`` against a 2 s suite forces the immediate reply to
+        be a handle (``QUEUED``/``RUNNING``) rather than a finished run; that
+        handle is the only link between the exited server and the store. Closing
+        stdin is the client-kill stand-in: EOF stops ``serve_stdio``, while the
+        worker's own session keeps the suite alive. The 8 s poll is slack over
+        the suite's 2 s, and the final assertion reads the *store's* terminal
+        status, because the server that would have reported it is gone.
+        """
         env = dict(os.environ)
         env["TESTBENCH_HOME"] = str(self.tb_home)
         env["TESTBENCH_ALLOWED_ROOTS"] = str(self.code_root)
@@ -191,6 +251,15 @@ class McpServerTests(unittest.TestCase):
 
     @unittest.skipUnless(HERMES_VENV_PY.is_file(), "Hermes venv python with mcp SDK unavailable")
     def test_real_hermes_mcp_2_sdk_client_handshake_discover_and_run(self) -> None:
+        """Handshake and a full discover→run→results cycle through the real SDK client.
+
+        The probe runs in a subprocess under the Hermes venv interpreter and
+        prints one ``SDK_OK=`` JSON line, so an import or transport failure shows
+        up as a non-zero exit plus captured stderr instead of an assertion on a
+        half-built session. ``tool_count == 7`` pins the advertised surface, and
+        the secret assertion is the end-to-end check that the sanitization
+        boundary is applied to text a model actually receives.
+        """
         probe_code = (
             "import asyncio, json, os\n"
             "from mcp import ClientSession, StdioServerParameters\n"

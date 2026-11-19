@@ -21,10 +21,22 @@ isolation, Seatbelt confinement, timeouts, evidence capture, in-stream secret
 redaction, exit-status accounting, and ``SKIP`` gating when ``FileCheck`` is absent
 are reused unchanged. No custom matching engine or FileCheck clone is implemented.
 
+The generated script is the only thing that aggregates verdicts: every step appends
+``|| rc=1``, and the script exits with the accumulated ``rc``. There is therefore one
+process for the suite, one exit status, and one captured log — per-assertion detail
+comes from parsing FileCheck's own diagnostics out of that log, not from separate
+per-step results. A step that crashes (not just fails) still only contributes ``rc=1``;
+its stderr text is the evidence.
+
 ``parse_filecheck_diagnostics`` is a pure text parser (no I/O, no spawning) wired
 into ``parsers.parse_shell`` so both ``execute_output_contract`` and direct
 ``FileCheck`` pipelines in ``shell`` suites produce ``FailureRecord`` entries with
-``kind="assertion"``, source file, line number, and diagnostic excerpt.
+``kind="assertion"``, source file, line number, and diagnostic excerpt. It recognises
+only FileCheck's own vocabulary: a diagnostic whose text contains a check directive
+(``CHECK``, ``CHECK-DAG``, ``CHECK-COUNT-n``, ``CHECK-NOT``, ``IMPLICIT-CHECK-NOT``,
+…) or one of FileCheck's global errors. Plain compiler errors ``file:line:col: error:``
+and ``warning:`` lines are ignored on purpose — this parser runs on *every* shell
+suite, and a C compiler's error must not be attributed to an output contract.
 """
 
 from __future__ import annotations
@@ -183,6 +195,10 @@ def find_filecheck() -> Optional[str]:
     Order: ``TESTBENCH_FILECHECK`` override, ``PATH`` (``FileCheck`` then
     ``FileCheck-30``..``FileCheck-10``), then keg-only Homebrew / Linux LLVM dirs.
     An override of ``0``/``off``/``none`` disables the tool explicitly.
+
+    The keg-only directory scan is cached for the life of the process: installing LLVM
+    while a long-running TUI/MCP server is up will not be noticed until restart. The
+    ``PATH`` lookup is *not* cached, so a newly linked binary is picked up.
     """
     override = os.environ.get("TESTBENCH_FILECHECK", "")
     if override.strip():
@@ -223,9 +239,14 @@ def build_check_steps(contract: OutputContract) -> Tuple[OutputCheckStep, ...]:
 
     FileCheck evaluates multiple ``--check-prefix`` groups as *one interleaved
     sequence* (verified on LLVM 23): a trailing DAG group also suppresses
-    ``--implicit-check-not`` regions. Keeping each intent in its own invocation is
+    ``--implicit-check-not``. Keeping each intent in its own invocation is
     therefore required for independent assertions. All steps execute inside one
     generated ``/bin/sh`` script in a single isolated ``execute_suite`` call.
+
+    ``counts`` with ``N == 0`` is expressed as a plain ``CHECK-NOT``; ``N > 0`` pairs
+    ``CHECK-COUNT-N`` with a trailing ``CHECK-NOT`` so an *extra* occurrence also
+    fails. Every step carries ``--allow-empty`` so an empty input can still satisfy a
+    "must not appear" assertion instead of erroring out on an empty file.
     """
     steps: List[OutputCheckStep] = []
 
@@ -359,6 +380,23 @@ def parse_filecheck_diagnostics(text: str) -> List[Dict[str, Any]]:
     Matches only genuine FileCheck ``error:`` diagnostics (never ``warning:`` or
     unrelated compiler errors) so ``parsers.parse_shell`` can invoke this safely on
     every shell suite's captured output.
+
+    Acceptance: the line must be ``file:line:col: error: …`` or a bare
+    ``[FileCheck ]error: …``, *and* the text after ``error:`` must look like FileCheck
+    (a check directive name, or one of ``_FC_GLOBAL_ERR_RE``'s phrases). A ``file``
+    field of ``command line``/``<command line>`` is a pseudo-file, so ``file``/``line``
+    are reported as ``None`` rather than as a path that does not exist.
+
+    The pattern shown in the case name is recovered from the check-file snippet in the
+    diagnostic window (``_pattern_from_window``), because FileCheck's message
+    ("expected string not found in input") does not name the string. If no snippet is
+    recognisable the case name is just the directive (``CHECK``, ``IMPLICIT-CHECK-NOT``).
+
+    Walk/stop behaviour: after a hit the cursor skips the whole window, so the ``note:``
+    lines FileCheck prints under its own error are not re-read as new diagnostics.
+    Duplicates with the same (case name, file, line, message) are collapsed — FileCheck
+    can repeat an error once per check prefix. Nothing here is fatal: an unparsable
+    diagnostic is dropped, and the suite still fails on the script's exit status.
     """
     lines = (text or "").splitlines()
     results: List[Dict[str, Any]] = []
@@ -439,6 +477,19 @@ def execute_output_contract(
     Pass exactly one input source: ``input_text``, ``input_path``, or ``producer_command``
     (executed once inside the isolated sandbox with combined stdout/stderr checked).
     When ``FileCheck`` is unavailable, ``execute_suite`` Gate 3 returns ``RunStatus.SKIP``.
+
+    Workspace, all under ``evidence_dir/filecheck/``: ``<slug>.input.txt`` (the literal
+    input), ``<slug>/stepN.check`` (one generated check file per intent) and
+    ``<slug>/run.sh``. They are written by the *parent* process, before the sandbox is
+    built, and the script only reads them — which is why an evidence dir outside the
+    project still works.
+
+    ``producer_command`` details that matter when reading a failure: its stdout *and*
+    stderr are captured into ``$TMPDIR/fc_captured.txt`` inside the sandbox, so the tool
+    under test is judged on what it printed, not on its exit code; a producer exit
+    status is preserved in the script's ``rc`` even if every FileCheck step then passes.
+    ``TMPDIR`` is therefore a hard dependency of this mode — the isolated env always
+    provides one, and ``set -u`` would abort the script loudly if it did not.
     """
     sources = sum(x is not None for x in (input_text, input_path, producer_command))
     if sources != 1:

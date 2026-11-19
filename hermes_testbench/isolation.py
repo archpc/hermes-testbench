@@ -1,4 +1,38 @@
-"""Mandatory execution isolation, Seatbelt sandboxing, process-group timeouts, and cleanup."""
+"""Execution isolation: sandboxes, Seatbelt, process-group lifecycle, teardown.
+
+Every suite process in TestBench is spawned here, with two documented exceptions:
+the messaging suites (``messaging_suite``) and ``PtySession`` spawn their own
+children outside this path. Three layers, in decreasing strength:
+
+1. **Environment** — a disposable ``tbw-<nonce>`` tree with ``0700`` ``HOME``, ``XDG_*``,
+   ``TMPDIR``, ``HERMES_HOME``, and credential variables scrubbed by *name*. This is
+   redirection, not confinement: a suite that opens an absolute path still reaches the
+   real file.
+2. **Kernel confinement (macOS only)** — a deny-by-default ``sandbox-exec`` profile built
+   by :func:`build_seatbelt_profile`. ``allow_network`` / ``allow_repo_write`` are
+   *recorded* on every platform but only *enforced* where Seatbelt exists.
+3. **Process ownership** — one ``setsid`` session per suite, so the leader's pid is also
+   the process-group id. Every signal goes to that group, or to a survivor that provably
+   holds this run's sandbox directory. ``terminate_process_group`` gates its group signal
+   on a ``ps -o lstart=`` start-time fingerprint so a recycled pid is never hit; the
+   post-reap member sweep (``_reap_group_after_leader_exit``) and ``PtySession.close``
+   signal the group without that fingerprint, within a bounded TOCTOU window.
+
+Invariant the rest of the package leans on: **containment is not lifecycle correctness.**
+``isolation_meta['seatbelt'] == 'active'`` says this process was confined;
+``leaked_children == 0`` says *this* process found nothing left to kill. Neither says the
+suite cleaned up after itself. A descendant that called ``setsid()``/``setpgid()`` into a
+new group is outside the owned group, and on a clean exit nothing hunts it — the survivor
+sweep only runs for timeout, cancel and non-zero exit. So a green run proves the
+environment was protected, not that the suite is well-behaved. Read
+``reaped_survivors``/``leaked_children`` as observations of what this run had to clean up,
+never as a verdict on the suite.
+
+Teardown (group signal, disposable tmux ``kill-server``, sandbox deletion) runs from a
+``finally`` block, so it also executes on ``KeyboardInterrupt`` and on adapter exceptions.
+It must never follow a symlink the sandboxed child planted: after spawn the child owns its
+``TMPDIR``/``TMUX_TMPDIR`` and may replace them with links to ambient directories.
+"""
 
 from __future__ import annotations
 
@@ -61,11 +95,27 @@ _SCRUB_KEY_RE = re.compile(
 )
 
 MAX_MEM_CAPTURE_CHARS = 4 * 1024 * 1024
+# Both budgets are counted in *decoded characters*, not bytes, and MAX_DISK_LOG_BYTES is a
+# single budget shared by stdout and stderr (whichever streams harder starves the other).
+# UTF-8 output can therefore reach up to ~4x this many bytes on disk. The cap is a runaway
+# guard, not a quota; the name is historical.
 MAX_DISK_LOG_BYTES = 64 * 1024 * 1024
 
 
 @dataclass
 class IsolatedExecResult:
+    """Everything the engine learns about one suite execution.
+
+    ``timed_out`` and ``cancelled`` are mutually exclusive (the reader loop breaks on the
+    first one it sees) but neither suppresses ``exit_code``: a killed leader yields
+    ``128 + signal`` — a timeout normally reports 143, not ``None``. Classify on the flags,
+    never on the code. ``stdout_text``/``stderr_text`` are the redacted in-memory capture
+    (each capped at ``MAX_MEM_CAPTURE_CHARS``); the ``*_path`` fields point at the ``0600``
+    logs, which are capped separately by ``MAX_DISK_LOG_BYTES``. ``isolation_meta`` is the
+    provenance record persisted with the run: it describes what isolation *was applied*, not
+    what the suite did.
+    """
+
     command: List[str]
     cwd: str
     exit_code: Optional[int]
@@ -127,7 +177,21 @@ def default_scratch_root() -> Path:
 
 
 def short_writable_tmux_base(preferred: Path) -> Path:
-    """Return a writable directory short enough for macOS 104-byte sockaddr_un."""
+    """Return a writable directory short enough for macOS ``sockaddr_un.sun_path``.
+
+    ``sun_path`` is 104 bytes on macOS (108 on Linux) *including* the terminating NUL, and
+    tmux appends ``/tmux-<uid>/<socket-name>`` to ``TMUX_TMPDIR``. A base of at most 68
+    characters leaves room for ``tx``+6 hex, ``tmux-501`` and ``default`` (68+9+9+8+NUL ≈ 95
+    < 104). A longer base does not fail here — it fails later as ``bind: File name too long``
+    from tmux, inside the suite, which reads as a suite bug.
+
+    Candidates are probed for writability in order, then ancestors of ``preferred`` are tried.
+    The walk stops before ``$HOME`` and ``~/.hermes`` themselves: a tmux socket directory
+    directly in a protected root is one the sandbox and the teardown sweeps may not legally
+    touch. If nothing qualifies the unresolved preference is returned anyway — a too-long path
+    is a visible failure, a redirected one is not.
+    """
+
     tb_sc = os.environ.get("TESTBENCH_SCRATCH_DIR", "").strip()
     if tb_sc:
         p = Path(tb_sc).expanduser().resolve()
@@ -189,6 +253,17 @@ def terminate_process_group(
     expected_start_time: Optional[str] = None,
     grace_s: float = 1.0,
 ) -> bool:
+    """SIGTERM a process group, then SIGKILL it after ``grace_s``.
+
+    Returns True when the group is gone (or never existed), False when the fingerprint
+    guard refused to signal. ``expected_start_time`` is the ``ps -o lstart=`` value sampled
+    from the leader at spawn time; if that group id now belongs to another process the
+    values differ and nothing is sent. Callers pass the sampled value unconditionally, which
+    is also why this function cannot finish a job whose leader has already been reaped: the
+    pgid then fingerprints as ``None``, the comparison fails, and the call returns False.
+    :func:`_reap_group_after_leader_exit` exists for exactly that state — it identifies the
+    group's members by ``ps`` instead of by the leader's identity.
+    """
     if pgid <= 1 or not pgroup_alive(pgid):
         return True
     if expected_start_time is not None:
@@ -221,6 +296,9 @@ def terminate_process_group(
 
 
 _HAS_WAITID_NOWAIT = hasattr(os, "waitid") and hasattr(os, "WNOWAIT")
+# macOS has no waitid(2) at the libc level before CPython 3.13, so on 3.11/3.12 there the
+# leader must be reaped by poll() and its pgid stops being reserved. Everything downstream of
+# this flag is written to survive both worlds: no code may assume the pgid is still pinned.
 
 
 def _leader_exited(proc: "subprocess.Popen[Any]") -> bool:
@@ -240,7 +318,16 @@ def _leader_exited(proc: "subprocess.Popen[Any]") -> bool:
 
 
 def _live_group_members(pgid: int, leader: int) -> List[int]:
-    """Live, non-zombie members of ``pgid`` other than ``leader``."""
+    """Live, non-zombie members of ``pgid`` other than ``leader``.
+
+    The ``killpg(pgid, 0)`` probe is a cheap group-exists test and its error codes are
+    load-bearing: ``ESRCH`` means the group is gone, while ``EPERM`` on macOS is what an
+    all-zombie group looks like (the unreaped leader still holds the id), so both are
+    reported as "no live members" rather than as a signal failure. The members themselves
+    come from ``ps`` because there is no portable way to enumerate a process group; a
+    member in state ``Z`` is excluded because killing it is a no-op that would otherwise
+    keep the caller waiting out its grace period.
+    """
     try:
         os.killpg(pgid, 0)
     except OSError:
@@ -268,6 +355,13 @@ def _reap_group_after_leader_exit(pgid: int, grace_s: float = 0.5) -> int:
     The group is re-checked for live members immediately before each signal, so ``killpg``
     only runs while the pgid is held by the leader's zombie or by a live member of the suite's
     own session. Returns the number of surviving members that were signalled.
+
+    This path is member-based, not fingerprint-based, on purpose: when the leader has been
+    reaped (always on macOS < 3.13, and after ``proc.wait()`` everywhere) its pid may already
+    be recycled, so ``terminate_process_group`` would refuse. That leaves a TOCTOU window
+    between the last ``ps`` sample and ``killpg``; it is bounded by the re-check immediately
+    before the signal and by the fact that a recycled pgid must also be spawned into a group
+    whose id equals the dead leader's pid inside those few milliseconds.
     """
     members = _live_group_members(pgid, pgid)
     if not members:
@@ -288,6 +382,15 @@ def _reap_group_after_leader_exit(pgid: int, grace_s: float = 0.5) -> int:
 
 
 def can_apply_seatbelt() -> bool:
+    """True when ``sandbox-exec`` exists *and* accepts a trivial profile.
+
+    The probe really executes ``/usr/bin/true`` under a one-rule deny profile, so it tests
+    the mechanism, not just the binary. A missing binary means "no Seatbelt on this host";
+    a present binary that fails the probe is read by the caller as "we are already inside an
+    outer Seatbelt" (TestBench nested in TestBench). That second inference is a guess: a
+    future macOS that rejects ``sandbox-exec`` for an unrelated reason is then reported as
+    ``inherited_outer`` — a claim about confinement this process cannot actually verify.
+    """
     sb_bin = shutil.which("sandbox-exec")
     if not sb_bin:
         return False
@@ -314,7 +417,20 @@ def _sb_quote(path: Path) -> str:
 
 
 def _sweep_sandbox_survivors(sandbox_dir: Path) -> Tuple[int, int]:
-    """Reap any daemonized/setsid descendants still holding files/cwd/argv inside sandbox_dir."""
+    """Kill processes that belong to this run but escaped its process group.
+
+    Two detectors because neither is complete: ``lsof +D`` finds holders of any file under
+    the directory, ``ps -ax`` finds the path in a command line or inherited cwd. Both are
+    *mentions*, not proofs of ownership — a process that merely quotes the path in argv is
+    killed too. That is acceptable only because the path carries a per-run nonce, so a false
+    positive has to be another process quoting this exact run's sandbox.
+
+    Never called on a clean exit (see :func:`run_isolated_command`): it costs tens of
+    milliseconds and would turn every fast, well-behaved suite into a full ``ps`` scan.
+    Returns ``(signalled, still_alive)``; a non-zero second element is what keeps the
+    sandbox tree on disk for inspection.
+    """
+
     if not sandbox_dir.exists():
         return 0, 0
     sb_str = str(sandbox_dir.resolve())
@@ -401,6 +517,34 @@ def build_seatbelt_profile(
     allow_repo_write: bool = False,
     allow_uv_cache_write: bool = False,
 ) -> str:
+    """Render the SBPL profile for one suite.
+
+    SBPL is *last match wins*, so the order below is load-bearing rather than cosmetic:
+    ``(allow default)``, then ``(deny file-write*)``, then one ``(allow file-write* ...)``
+    for the sandbox, TestBench-owned staging dirs and the specific ``/dev`` nodes. Writes are
+    deny-by-default because the set of places a suite may legitimately write cannot be
+    enumerated (LaunchAgents, dotfiles, cron, sibling repos, ``state.db``). Reads are a
+    *denylist*, and that asymmetry is deliberate: denying a read breaks tools that probe for
+    optional config, while allowing one leaks a credential. A credential file not named in
+    the ``deny file-read-data`` clause stays readable.
+
+    The tmux rules close a channel rather than a path: XNU resolves the *vnode* for
+    ``AF_UNIX``, so ``(deny file-read* (subpath /private/tmp/tmux-<uid>))`` defeats tmux's
+    ``chdir``+relative-``sun_path`` ``connect()`` where ``(remote unix-socket (subpath ...))``
+    would not, and the explicit ``network-outbound`` denies cover the same socket and
+    ``mDNSResponder`` by address (ADR-0005). Loopback is re-allowed for ``localhost:*`` after
+    the blanket ``(deny network*)`` so suites can host mock servers, with the Hermes
+    dashboard/dev ports (9119, 9222, 11434) denied again afterwards.
+
+    ``(allow process-exec (literal "/bin/ps") (with no-sandbox))`` exists because suites (and
+    tmux itself) shell out to ``ps`` to inspect processes, and a sandboxed ``ps`` cannot read
+    other processes' information. It is one literal path on purpose — not a prefix, not
+    ``/bin/*``.
+
+    ``allow_repo_write=False`` leaves the checkout read-only but still *readable*; the profile
+    never denies reads of the project tree, because a test suite that cannot read its own
+    sources is useless.
+    """
     u_home = real_user_home()
     hermes_dir = u_home / ".hermes"
     hxmail_support = u_home / "Library" / "Application Support" / "hxmail"
@@ -464,7 +608,11 @@ def build_seatbelt_profile(
     if allow_uv_cache_write and (u_home / ".cache" / "uv").is_dir():
         write_targets.append((u_home / ".cache" / "uv").resolve())
 
-    # Preserve comment reference to .cargo for auditability while deny-by-default blocks ~/.cargo writes
+    # Emitted as an SBPL ``;`` comment, not as a rule: it records inside the profile which
+    # roots are protected only by the *absence* of an allow rule. An audit reading the log
+    # should not expect a matching ``(deny file-write* ...)`` for these — deny-by-default is
+    # the mechanism. Keep the payload a syntactically valid SBPL comment; anything else here
+    # would be parsed as a rule and, being last, would win.
     rules.append(f"; deny-by-default protects {u_home / '.cargo'} and {hermes_dir}")
     allow_subpaths = " ".join(f"(subpath {_sb_quote(p)})" for p in write_targets)
     dev_allows = (
@@ -487,6 +635,40 @@ def build_isolated_env(
     env_overrides: Optional[Dict[str, str]] = None,
     base_env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
+    """Build one suite's environment: scrubbed, redirected, pinned.
+
+    Not a security boundary by itself. Scrubbing matches variable *names*
+    (``_SCRUB_EXACT`` plus ``_SCRUB_KEY_RE``), so a secret held in a variable with an
+    unrecognised name passes through untouched. The ``HOME``/``TMPDIR``/``XDG_*`` redirect
+    only moves tools that honour those variables; anything opening an absolute path reaches
+    the real file on Linux, and is stopped (if at all) by Seatbelt on macOS.
+
+    Choices worth not "cleaning up" later:
+
+    * ``TESTBENCH_SCRATCH_DIR`` points at the sandbox ``tmp``, so a suite that invokes
+      ``testbench`` (nested run, e.g. the terminal-tape or mutation adapters) puts its own
+      sandboxes inside this one and cannot leak them into the real scratch root.
+    * ``HERMES_TMUX=0`` keeps a suite from opening permanent ``hx:*`` windows on the
+      developer's live tmux server; ``HXMAIL_DB``/``HXMAIL_LOCAL_DIR`` keep the mail fixture
+      off the real mailbox.
+    * ``PYTHONHASHSEED=0``, ``TZ=UTC``, ``LANG``/``LC_ALL``/``TERM`` are pinned so two runs
+      of the same suite produce comparable evidence on different hosts.
+    * ``CARGO_HOME`` is a fresh directory containing *symlinks* to ``registry``/``git``/``bin``
+      only — ``credentials.toml`` sits at the ``CARGO_HOME`` root and is therefore absent,
+      which is what makes the read-only crate cache safe to share. ``uv`` caches are linked
+      per-item for the same reason.
+    * ``env_overrides`` is applied last and is *not* scrubbed: a declared name wins over the
+      scrubber. That is the point for build settings, and it is also a live bypass — a
+      manifest ``[suite.env]`` entry can put ``TMUX``, ``SSH_AUTH_SOCK`` or an
+      ``*_API_KEY`` back into the child (ADR-0005's trust gate covers ``allow_network`` and
+      ``allow_repo_write``, not ``env``). Do not "tidy" the ordering into scrub-after-
+      override without adding that gate; the mutation adapter already had one env-var
+      confinement bypass removed.
+
+    Subdirectory names are abbreviated (``xc``, ``xd``, ``xk``, ``tx``) purely to keep
+    Unix-socket and ``TMPDIR`` paths inside ``sun_path``; see
+    :func:`short_writable_tmux_base`.
+    """
     sandbox_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(str(sandbox_dir), 0o700)
     subdirs = {}
@@ -685,6 +867,8 @@ def _kill_disposable_tmux(
         _safe_rmtree_no_symlinks(tmux_tmpdir)
         return
     tmux_bin = shutil.which("tmux")
+    # Resolved from the *parent's* PATH, not the suite's: if the host has no tmux, no server
+    # can be killed here and the TMUX_TMPDIR survivor sweep below is the only cleanup left.
     if not tmux_bin:
         return
     env = {"PATH": os.environ.get("PATH", "/opt/homebrew/bin:/usr/bin:/bin"), "TMUX_TMPDIR": str(tmux_tmpdir)}
@@ -725,6 +909,42 @@ def run_isolated_command(
     on_spawn: Optional[Callable[[int, int, Optional[str]], None]] = None,
     on_output: Optional[Callable[[str], None]] = None,
 ) -> IsolatedExecResult:
+    """Run one suite argv under isolation and return the full record of how it ended.
+
+    Arguments that change behavior, not just labeling:
+
+    * ``cwd`` must already exist (resolved strict). It is the *only* directory the suite is
+      told to work in; it is not made writable unless ``allow_repo_write``.
+    * ``evidence_dir`` gets ``<slug>.stdout.log`` / ``.stderr.log`` / ``.sanitized.log`` at
+      ``0600``; the slug is derived from ``step_name``, so two suites with the same name in
+      one run overwrite each other's logs.
+    * ``cancel_flag_path`` is polled from inside the read loop; its presence counts as
+      cancellation and terminates the group. The flag is never removed here — its existence
+      is also what fences the run's final status.
+    * ``on_spawn(pid, pgid, start_fp)`` is called once, synchronously, before the loop, so a
+      *different* process can cancel this run without guessing. ``on_output`` receives
+      sanitized text only (never raw bytes), which is why foreground ``--stream`` cannot
+      print what the disk log withheld.
+    * ``use_seatbelt=False`` is for tests and for suites that must run unconfined; the
+      resulting ``isolation_meta['seatbelt'] == 'disabled'`` is recorded, not hidden.
+
+    Completion is not simply "the leader exited": the loop also needs both pipes at EOF.
+    A descendant that escapes the session but keeps an inherited pipe open keeps the loop
+    running until ``timeout_s``, and the suite is then reported TIMEOUT even though the
+    leader exited 0. That is deliberate — an open pipe is indistinguishable from output
+    still arriving, and cutting it off by pid would be a guess.
+
+    Teardown, in ``finally``, in this order: signal our own process group → kill disposable
+    tmux servers and sweep their ``TMUX_TMPDIR`` → sweep sandbox survivors (timeout, cancel
+    or non-zero exit only) → delete the sandbox tree unless a survivor is still holding it.
+    Consequences worth knowing before editing: a *clean* exit deliberately runs no sandbox
+    sweep, so a ``setsid()`` daemon survives it and its sandbox directory is then deleted
+    from under it; and a tree with a live survivor is left in place on purpose, because the
+    survivor's cwd/argv point into it and a human needs it more than the disk.
+
+    Raises ``ValueError`` for a malformed argv or a missing cwd — before spawning anything,
+    so an adapter's error path can report ``ERROR`` without having started a process.
+    """
     if not command or any(not isinstance(a, str) or "\x00" in a for a in command):
         raise ValueError(f"Invalid command argv: {command!r}")
 
@@ -976,6 +1196,11 @@ def run_isolated_command(
                 exit_code = rc
     finally:
         if pgid > 1:
+            # Safety net for exits that never reach proc.wait(): an adapter exception or a
+            # ^C raised inside the loop leaves the leader unreaped, so the fingerprint still
+            # matches and the group is really signalled. On the normal path the leader has
+            # been waited on by now, _process_start_fingerprint returns None, and this call
+            # refuses — by design, since the pgid may already belong to someone else.
             terminate_process_group(pgid, expected_start_time=start_fp, grace_s=0.2)
         if needs_tmux and tmux_socket and tmux_tmpdir is not None:
             _kill_disposable_tmux(tmux_socket, tmux_tmpdir, expected_parent=expected_tmux_parent)
@@ -990,6 +1215,8 @@ def run_isolated_command(
             swept, leaked_children = _sweep_sandbox_survivors(sandbox_dir)
             reaped_survivors += swept
         if leaked_children == 0:
+            # Left on disk when a survivor is still alive: its cwd/argv point into the tree, so
+            # it is the only evidence of what escaped this run.
             _safe_rmtree_no_symlinks(sandbox_dir)
 
     duration_ms = (time.monotonic() - t0) * 1000.0
@@ -1007,6 +1234,9 @@ def run_isolated_command(
         stderr_path=str(stderr_path),
         sanitized_path=str(sanitized_path),
         isolation_meta={
+            # Provenance, not a verdict: what isolation was applied and what this run had to
+            # clean up. A green run with rounded-down counters says nothing about whether the
+            # suite would clean up after itself on a clean exit (see module docstring).
             "seatbelt": seatbelt_state,
             "allow_network": allow_network,
             "allow_repo_write": allow_repo_write,

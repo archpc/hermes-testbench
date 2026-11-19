@@ -4,6 +4,8 @@ Zero I/O, zero runner dependencies, zero formatting (ADR-0004): the same rules
 drive a live ``flake run`` and ``flake analyze`` over runs already persisted in
 the store. An attempt is one complete ``TestBenchEngine.run_sync`` execution
 with its own independent ``run_id`` and preserved ``runs/RUN_ID/`` evidence.
+Nothing here reruns anything, so a classification is only as good as the rows
+it was given.
 
 Verdicts (evaluated over ``N`` attempts, 1-based ``attempt``):
 
@@ -16,6 +18,33 @@ Verdicts (evaluated over ``N`` attempts, 1-based ``attempt``):
 * ``inconclusive`` - fewer than two attempts, or any attempt ended in a
   non-decisive status (``TIMEOUT``/``CANCELLED``/``ERROR``/``BLOCKED``/
   ``SKIP``) without both a pass and a fail.
+
+What these verdicts actually prove
+----------------------------------
+Counts, not statistics. There is no pass rate, no confidence interval, no
+seed control, and no ordering model; ``mixed`` means "both outcomes were
+observed", and one pass plus one fail is enough to claim it. ``always_pass``
+over two attempts means "no variance observed in two samples", which is not the
+same claim as "deterministic" — say the sample size out loud before believing
+it. ``always_fail`` does not separate a broken target from a broken environment.
+
+Two things also make a verdict weaker than it looks:
+
+* Attempts are whole runs, not isolated repetitions. A stateful fixture (the
+  in-tree counter test is one) can produce ``mixed`` by design: the target
+  varies because its input state varies, not because the code under test does.
+* Attempts are linked only by ``environment['flake'].group_id`` — no foreign
+  key (ADR-0007). A deleted or pruned attempt shrinks the sample silently. The
+  group-level ``missing_attempts`` records the gap, but the *verdict* is still
+  computed over the survivors, so a truncated group can report ``always_pass``
+  while listing missing attempts; completeness is not
+  part of ``classify_statuses``.
+
+Grouping is by ``group_id`` alone. ``flake run`` allocates a fresh group per
+invocation, but ``--group``-style reuse across revisions is possible through
+the engine API, and ``analyze_flake_history(group_id=...)`` will happily mix
+them: a PASS→FAIL across a code change is not flakiness, and the report labels
+the mixed group with the first attempt's revision.
 """
 
 from __future__ import annotations
@@ -49,7 +78,13 @@ def flake_metadata(run: RunRecord) -> Optional[Dict[str, Any]]:
     """Return validated ``environment['flake']`` metadata, or ``None``.
 
     A run is only a flake attempt when the metadata names a group and carries a
-    1-based attempt index plus the intended repeat count.
+    1-based attempt index plus the intended repeat count. Everything else —
+    ordinary ``testbench run`` rows, hand-written metadata, a group with no
+    attempt number — is excluded rather than defaulted, because a defaulted
+    attempt would invent an attempt that never happened.
+
+    ``None`` is the whole participation gate for ``analyze_flake_history``; the
+    store query does not know about flake groups.
     """
     env = run.environment or {}
     raw = env.get(FLAKE_ENV_KEY)
@@ -75,7 +110,17 @@ def _order_key(run: RunRecord) -> Tuple[int, str, str]:
 
 
 def order_attempts(runs: Sequence[RunRecord]) -> List[RunRecord]:
-    """Order attempts by their recorded 1-based index (stable on ties)."""
+    """Order attempts by their recorded 1-based index.
+
+    Key is ``(attempt, created_at, run_id)``: the attempt index is authoritative
+    because it is what the runner wrote, and the other two only break ties
+    deterministically (clock resolution can collide; run ids cannot). The sort is
+    not "stable on ties" in the ``sorted()`` sense — the tie-break fields make
+    the order total, which is stronger and is what keeps two analyses of the same
+    rows byte-identical.
+
+    Non-flake runs sort as attempt 0 and are kept; callers filter them.
+    """
     ordered: List[RunRecord] = []
     seen: set = set()
     for run in sorted(runs, key=_order_key):
@@ -87,7 +132,28 @@ def order_attempts(runs: Sequence[RunRecord]) -> List[RunRecord]:
 
 
 def classify_statuses(statuses: Sequence[str]) -> str:
-    """Classify one target's per-attempt statuses into a :class:`FlakeVerdict`."""
+    """Classify one target's per-attempt statuses into a :class:`FlakeVerdict`.
+
+    Exact rules, in order:
+
+    * fewer than ``MIN_ATTEMPTS`` → ``inconclusive`` (nothing to compare)
+    * every status PASS → ``always_pass``
+    * every status FAIL → ``always_fail``
+    * at least one PASS and at least one FAIL → ``mixed``
+    * anything else → ``inconclusive``
+
+    The order matters at the edges. ``[PASS, FAIL, TIMEOUT]`` is ``mixed``: a
+    timeout does not erase variance that was already observed. ``[PASS, PASS,
+    FAIL, FAIL]`` is ``mixed`` as well — no rate, no majority, no threshold.
+    ``[PASS, PASS, TIMEOUT]`` is ``inconclusive`` even though the target never
+    failed, because "never failed in two of three attempts" is not a clean sweep
+    and the CLI's exit contract is "exit 0 only if every target is
+    always_pass".
+
+    Deliberately does not look at ``expected_repeats`` or at which attempt
+    numbers are present: a truncated sample classifies like a complete one. That
+    is the completeness gap described in the module docstring.
+    """
     total = len(statuses)
     passes = sum(1 for s in statuses if s == RunStatus.PASS)
     fails = sum(1 for s in statuses if s == RunStatus.FAIL)
@@ -102,7 +168,18 @@ def classify_statuses(statuses: Sequence[str]) -> str:
 
 
 def aggregate_verdict(verdicts: Sequence[str]) -> str:
-    """Worst verdict across targets; ``always_pass`` only if every target is."""
+    """Worst verdict across targets; ``always_pass`` only if every target is.
+
+    Precedence: ``mixed`` > ``always_fail`` > ``inconclusive`` > ``always_pass``.
+    ``mixed`` wins because an observed flake is the thing the feature exists to
+    find; ``always_fail`` beats ``inconclusive`` because a deterministic failure
+    is a definite negative while inconclusive is an absence of evidence.
+
+    That last choice has a consequence worth stating: a group with one
+    always-failing suite and one unverified suite reports ``always_fail``, and
+    the unverified target is only visible in ``inconclusive_targets``. Reading
+    the group verdict alone overstates what was established.
+    """
     vals = list(verdicts)
     if not vals:
         return FlakeVerdict.INCONCLUSIVE
@@ -117,7 +194,26 @@ def aggregate_verdict(verdicts: Sequence[str]) -> str:
 
 @dataclass
 class TargetClassification:
-    """One classified target (a suite or, when structured, a single case)."""
+    """One classified target (a suite or, when structured, a single case).
+
+    ``statuses`` is one entry per *expected slot*, so its length equals the
+    number of attempts examined, and ``MISSING_STATUS`` marks a target that a
+    given attempt did not report (a deleted suite, a case that never ran, a
+    suite absent from that revision). ``attempts`` counts those slots, not the
+    decisive ones; ``other_count`` counts MISSING plus every non-PASS/FAIL
+    status.
+
+    The three id/evidence lists are parallel and preserve attempt order, so
+    ``failing_evidence_dirs[i]`` is the directory for ``failing_run_ids[i]``.
+    They are the reason a mixed verdict is actionable: the failure's artifacts
+    and the later pass's artifacts both survive (ADR-0007).
+
+    ``missing_attempts`` is *1-based position within this target's ordered
+    pairs*, which equals the recorded attempt number only when no attempts are
+    absent from the group. For a group with a hole they disagree with
+    ``FlakeReport.missing_attempts`` (which uses recorded numbers). Reported as
+    a defect.
+    """
 
     target: str
     level: str
@@ -184,6 +280,8 @@ def _classify_target(
         statuses=statuses,
     )
     for (run, status), attempt_no in zip(pairs, range(1, len(pairs) + 1)):
+        # attempt_no is positional. With attempts 1 and 3 present, the second
+        # pair is labelled 2 — see the class docstring.
         evidence = run.evidence_dir or ""
         if status == RunStatus.PASS:
             tc.passing_run_ids.append(run.run_id)
@@ -239,7 +337,14 @@ def _suite_has_structured_cases(suite_name: str, runs: Sequence[RunRecord]) -> b
 
 @dataclass
 class FlakeReport:
-    """Classification of one flake group (all attempts sharing ``group_id``)."""
+    """Classification of one flake group (all attempts sharing ``group_id``).
+
+    ``project``/``revision``/``profile``/``created_at`` describe the *first*
+    ordered attempt, not a consensus: if a group was reused across revisions the
+    header names one of them. ``expected_repeats`` is the declared repeat count
+    (or the observed count when larger), and ``missing_attempts`` lists the
+    1-based attempt numbers inside that range that have no row.
+    """
 
     group_id: str
     project: str
@@ -281,6 +386,12 @@ class FlakeReport:
         return [t for t in self.targets if t.verdict == FlakeVerdict.INCONCLUSIVE]
 
     def failing_run_ids(self) -> List[str]:
+        """Run ids of attempts that did not succeed, for a human "what broke" scan.
+
+        Includes FAIL, TIMEOUT, ERROR, and CANCELLED; excludes BLOCKED and SKIP
+        because nothing ran. This is a convenience view, not the classifier:
+        the per-target verdict is what decides flakiness.
+        """
         out: List[str] = []
         for status, rid in zip(self.statuses, self.run_ids):
             if status in (RunStatus.FAIL, RunStatus.TIMEOUT, RunStatus.ERROR, RunStatus.CANCELLED):
@@ -312,7 +423,27 @@ def build_report(
     expected_repeats: Optional[int] = None,
     suite_names: Optional[Sequence[str]] = None,
 ) -> FlakeReport:
-    """Classify an ordered set of attempt runs into suite-level and case-level targets."""
+    """Classify an ordered set of attempt runs into suite-level and case-level targets.
+
+    Target discovery: explicit ``suite_names`` (the live path passes the selected
+    suites) or the union of suite names across attempts, first-seen order. Suite
+    targets always exist for those names; case targets exist only when at least
+    one attempt reported structured cases. A suite name that never appears in any
+    attempt becomes a MISSING status in every slot and therefore ``inconclusive``
+    — a requested-but-absent suite can never look green.
+
+    ``expected_repeats`` resolves as: caller's value, else the declared
+    ``repeats`` from attempt metadata, else the observed attempt count. The
+    report's value is floored at ``len(ordered)`` so a group with more attempts
+    than it declared still shows ``attempts == expected``.
+
+    ``missing_attempts`` is filled only when at least one attempt carried flake
+    metadata, and it uses the *recorded* attempt numbers (unlike the per-target
+    list). Attempt numbers above ``expected_repeats`` are not reported as
+    surplus — they are silently extra.
+
+    Classification itself ignores gaps: see ``classify_statuses``.
+    """
     ordered = order_attempts(runs)
     metas = [flake_metadata(r) for r in ordered]
     group_id = next((m["group_id"] for m in metas if m), "")
@@ -427,6 +558,16 @@ def analyze_flake_history(
     Only runs carrying ``environment['flake']`` metadata participate; runs from
     ordinary ``testbench run`` invocations are ignored. Filters are applied
     before grouping so ``project``/``revision`` scope mirrors the store query.
+
+    Grouping is by ``group_id`` alone and nothing here checks that members share
+    a revision or a suite set: the caller's query is the only scope. A group
+    that spans a code change will mix a real regression into a flake verdict.
+
+    The caller supplies the candidate rows, and the CLI takes them from
+    ``store.list_runs(limit=...)`` — newest first, globally. An old group whose
+    early attempts fall outside that window is classified on the survivors, with
+    ``missing_attempts`` as the only clue. Nothing in this function can tell a
+    truncated group from a small one.
     """
     buckets: Dict[str, List[RunRecord]] = {}
     for run in order_attempts(runs):

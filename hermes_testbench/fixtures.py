@@ -50,6 +50,38 @@ Haunted Terminal (Phase 1C)
     resizes, interrupted UTF-8, and per-area invariant cases. ``fault_injection``
     routes the same checker through the defective renderer / geometry-caching
     child so a broken implementation is provably caught.
+
+Fixture contract
+----------------
+Every probe reports what it *observed* — exit codes, the geometry the child read
+back, per-writer result files, decoded bytes — alongside booleans derived from
+those same fields. No probe applies a configurable external threshold or policy:
+a caller persists the dict as evidence and a later reader re-interprets the same
+numbers under whatever threshold it needs. Only ``run_haunted_terminal_probe``
+aggregates per-case PASS/FAIL/SKIP counts.
+
+Three properties a reader must not over-read:
+
+* ``leaked_children`` is ``0`` in every probe except ``run_signal_crash_probe``.
+  It is a placeholder for a shape the consumers expect, not a measurement. Several
+  probes *do* raise from their ``finally`` block when a child survived teardown, so
+  a returned report implies reaping succeeded — but it never counts survivors, and
+  it cannot see a descendant that moved to its own process group.
+* ``SKIP`` cases exist only in ``run_haunted_terminal_probe``: missing tmux, no
+  PTY, or an over-long socket path downgrades a case to ``SKIP`` with the reason
+  attached, so a missing dependency never reads as a silent success.
+  ``run_tmux_lifecycle_probe`` reports a missing tmux as ``available=False`` with
+  ``clean=True`` ("nothing was created"); consumers must check ``available``
+  before reading ``clean``.
+* Aggregate fields (``all_passed``, ``*_phase`` sums, ``idempotent``) are derived
+  from the per-case or per-writer records printed alongside them. They add no
+  independent evidence.
+
+Teardown is uniform: scratch trees go through
+:func:`hermes_testbench.store._safe_rmtree_no_symlinks` (never follows a link a
+child might have planted), tmux servers are killed by ``-L`` socket name, and
+every process group is signalled with a bounded grace period. All of it runs from
+``finally``, so an exception or ``KeyboardInterrupt`` still tears the fixture down.
 """
 
 from __future__ import annotations
@@ -85,6 +117,9 @@ from .store import TestBenchStore, _safe_rmtree_no_symlinks
 from .tui_render import TuiState, display_width, fit_cells, render_frame
 
 SQLITE_CONTENTION_TABLE = "contention"
+# Busy timeout (ms) baked into the fixture DB so a caller that opens the file
+# without setting one still gets a bounded wait instead of an immediate
+# SQLITE_BUSY. The probe overrides it per connection on purpose.
 SQLITE_FIXTURE_BUSY_TIMEOUT_MS = 5000
 
 
@@ -99,9 +134,16 @@ class CorpusEntry:
     note: str = ""
 
     def payload(self) -> bytes:
+        """Return the bytes a consumer must feed to the code under test.
+
+        ``raw`` wins whenever it is non-empty, because some samples are not valid
+        UTF-8 by design (truncated JSON, a lone continuation byte); encoding
+        ``text`` for those would silently repair the very defect being tested.
+        """
         return self.raw if self.raw else self.text.encode("utf-8")
 
     def to_dict(self) -> Dict[str, Any]:
+        """Serialise to a JSON-safe dict; ``raw`` becomes a list of byte values."""
         return {
             "name": self.name,
             "kind": self.kind,
@@ -269,7 +311,25 @@ def terminal_escape_corpus() -> List[CorpusEntry]:
 
 
 def create_sqlite_contention_fixture(db_path: Path) -> Dict[str, Any]:
-    """Create an empty, WAL-mode ``contention`` DB ready for multi-process writers."""
+    """Create an empty, WAL-mode ``contention`` DB ready for multi-process writers.
+
+    The fixture is deliberately rebuilt from scratch: ``db``, ``db-wal`` and
+    ``db-shm`` are unlinked first, because a leftover WAL from an earlier run
+    would replay its frames into a new database and leave rows behind that no
+    writer in *this* run committed. The parent directory is created, and the file
+    is chmod'ed ``0600`` after schema creation — SQLite honours ``umask``, so the
+    file would otherwise be group/world readable on a permissive umask.
+
+    The connection runs with ``isolation_level=None`` (autocommit), so each
+    statement lands immediately and nothing is left in an implicit transaction at
+    ``close()``. The returned ``rows`` count is read *after* the delete, so a
+    non-zero value means the table could not be cleared and the caller should not
+    trust a later "expected rows" comparison.
+
+    Returns measured facts only — ``journal_mode`` is read back from SQLite rather
+    than echoed from the request, so a filesystem that silently refuses WAL
+    reports ``delete`` instead of lying.
+    """
     path = Path(db_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     for suffix in ("", "-wal", "-shm"):
@@ -309,6 +369,28 @@ def create_sqlite_contention_fixture(db_path: Path) -> Dict[str, Any]:
     }
 
 
+# Child program for one contention writer: ``python3 writer.py db writer ops
+# timeout_ms hold_ms start_at result_path table``.
+#
+# Every writer spins on ``time.time() < start_at`` (an absolute wall-clock stamp
+# chosen by the parent) instead of sleeping a relative interval, so all writers
+# hit ``BEGIN IMMEDIATE`` within a millisecond or two of each other and the
+# contention is real rather than scheduled. ``writer == 0, seq == 0`` sleeps
+# ``hold_ms`` *inside* its transaction, which is what forces the other writers to
+# observe a busy database at all.
+#
+# Two timeout regimes share the loop. A busy hit is counted as a ``busy_retry``
+# in both (proof the probe measured contention), and the regime only decides what
+# happens next: with ``timeout_ms == 0`` the writer retries up to 20000 times at
+# 2 ms; with a non-zero timeout the same hit is also counted as a ``writer_error``
+# and the operation is abandoned, because a configured timeout that still expires
+# is a real failure, not a retry opportunity.
+#
+# The child reports through a result file, not stdout: ``stdout`` is a pipe the
+# parent never drains, so writing per-op output there would fill the pipe buffer
+# and deadlock the run on a slow machine. The file is written only after
+# ``conn.close()``, so a missing result file is itself the signal that the writer
+# died mid-transaction.
 _SQLITE_WRITER = r'''
 import json
 import sqlite3
@@ -402,6 +484,25 @@ def _sqlite_phase(
     result_dir: Path,
     phase: str,
 ) -> Dict[str, Any]:
+    """Run one generation of writers and fold their result files into totals.
+
+    Spawn order is the only ordering here: all ``workers`` children are started
+    before the parent waits on any of them, otherwise the second writer would
+    begin after the first had already committed and no contention would occur.
+    ``start_new_session=True`` gives each child its own process group so teardown
+    can signal a writer that is wedged inside ``BEGIN IMMEDIATE`` rather than a
+    single pid that leaves its siblings holding the write lock.
+
+    The per-writer result file is the contract. A writer that exits without one
+    is counted as exactly one ``writer_error`` — indistinguishable, by design,
+    from a writer that reported an error, because both mean an operation that was
+    requested did not complete. ``max_wait_ms`` is a max across writers, not a
+    sum, so it stays meaningful when the writer count changes.
+
+    Overrunning the 60 s deadline terminates the group from ``finally`` and then
+    raises: a phase that cannot finish is not reported as a slow success, and the
+    raise replaces any value the function was about to return.
+    """
     start_at = time.time() + 0.45
     procs: List[subprocess.Popen] = []
     result_paths: List[Path] = []
@@ -479,7 +580,28 @@ def run_sqlite_contention_probe(
     ops_per_writer: int = 20,
     busy_timeout_ms: int = 5000,
 ) -> Dict[str, Any]:
-    """Drive real multi-process WAL contention, then prove ``busy_timeout=0`` handling."""
+    """Drive real multi-process WAL contention, then prove ``busy_timeout=0`` handling.
+
+    Two phases run against the *same* file, in this order:
+
+    1. ``no-timeout`` — ``busy_timeout=0``, so a writer that loses the lock gets
+       SQLITE_BUSY immediately and must retry in a loop. This is the phase that
+       proves contention was actually measured: ``measurable_contention`` is just
+       ``busy_retries > 0`` over these writers.
+    2. ``timeout`` — the caller's timeout, where a busy database should be waited
+       out rather than retried.
+
+    The rows committed by phase 1 are deleted between phases so ``rows_in_db`` at
+    the end describes phase 2 alone; a stale row would otherwise make
+    ``all_ops_committed`` pass on leftovers. ``expected_rows`` is arithmetic over
+    the arguments, never a fabricated constant, and ``all_ops_committed`` requires
+    both the row count *and* the distinct ``(writer, seq)`` count to match, which
+    is what catches a writer that duplicated its own sequence range.
+
+    ``leaked_children`` here is a placeholder ``0``: the phase helper raises if a
+    writer survived teardown, so reaching this return means none did, but nothing
+    in this function counts survivors. Do not cite it as a measurement.
+    """
     writers = max(1, int(writers))
     ops_per_writer = max(1, int(ops_per_writer))
     busy_timeout_ms = max(0, int(busy_timeout_ms))
@@ -488,6 +610,10 @@ def run_sqlite_contention_probe(
         create_sqlite_contention_fixture(path)
     expected = writers * ops_per_writer
 
+    # Materialise the writer program under the scratch root rather than passing it
+    # via ``-c``: the child then gets a real argv and a real file, so a traceback
+    # names a path a human can open, and the program text cannot be mangled by a
+    # shell quoting mistake. Prefix ``tb-wal-`` keeps it recognisable in sweeps.
     work = Path(tempfile.mkdtemp(dir=str(default_scratch_root()), prefix="tb-wal-"))
     script_path = work / "writer.py"
     script_path.write_text(_SQLITE_WRITER, encoding="utf-8")
@@ -557,6 +683,10 @@ def run_sqlite_contention_probe(
 # ------------------------------------------------------------------------ pty resize
 
 
+# Child for the PTY resize probe. It records geometry on entry, on every
+# SIGWINCH, and once more after a short settle delay, then writes the list and
+# exits. The repeated read matters: a handler that only counts signals proves
+# nothing about whether the process can observe the new size.
 _PTY_CHILD = r'''
 import fcntl
 import json
@@ -604,7 +734,25 @@ def run_pty_resize_probe(
     initial_size: Tuple[int, int] = (80, 24),
     resized: Tuple[int, int] = (120, 36),
 ) -> Dict[str, Any]:
-    """Spawn a real PTY child, resize it via ``TIOCSWINSZ``, and confirm ``SIGWINCH`` geometry."""
+    """Spawn a real PTY child, resize it via ``TIOCSWINSZ``, and confirm ``SIGWINCH`` geometry.
+
+    The child is a session leader (``start_new_session=True``) but never claims the
+    pty as its controlling terminal — there is no ``TIOCSCTTY`` — so the kernel
+    does not deliver the implicit ``SIGWINCH`` that a real terminal would. The
+    probe therefore: sets the size with ``TIOCSWINSZ`` on *both* fds (slave before
+    spawn so the child's first read is the initial geometry, master for the
+    resize), then sends ``SIGWINCH`` itself. A child that only reacts to the
+    signal and never re-reads ``TIOCGWINSZ`` still fails, because the record it
+    writes is the geometry it read, not the number of signals it saw.
+
+    ``geometry_transition_ok`` is the conjunction: first read equals the initial
+    size, last read equals the resized size, and at least one signal arrived.
+    Nothing here asserts the child exited cleanly — a non-zero exit raises instead,
+    so a returned dict always describes a child that reached the end of its script.
+
+    ``leaked_children`` is a placeholder ``0``, not a count; teardown raises from
+    ``finally`` if the child outlived the probe, which is the actual guarantee.
+    """
     initial_cols, initial_rows = int(initial_size[0]), int(initial_size[1])
     resized_cols, resized_rows = int(resized[0]), int(resized[1])
     work = Path(tempfile.mkdtemp(dir=str(default_scratch_root()), prefix="tb-pty-"))
@@ -640,6 +788,9 @@ def run_pty_resize_probe(
                 break
             time.sleep(0.01)
         if not ready_path.is_file():
+            # The child writes "ready" only after installing its handler, so a
+            # missing file means the signal would land before it could be
+            # recorded — a hang or a mis-timed resize, never a valid observation.
             raise RuntimeError("pty child never became ready")
 
         fcntl.ioctl(
@@ -700,6 +851,13 @@ def run_pty_resize_probe(
 # --------------------------------------------------------------------- signal crash
 
 
+# Crash child: disables core dumps (``RLIMIT_CORE`` 0) so a deliberate SIGSEGV
+# cannot drop a multi-megabyte core file into the scratch tree, spawns a
+# grandchild that sleeps 60 s, records its pid, then kills itself with the signal
+# under test. The grandchild exists only so the parent can prove that teardown
+# reaches *descendants* of the crashing pid rather than just the pid itself: a
+# plain ``wait()`` on a crashed leader would look clean while the grandchild kept
+# running.
 _CRASH_CHILD_TEMPLATE = r'''
 import os
 import resource
@@ -727,6 +885,22 @@ def run_signal_crash_probe(sig: int = signal.SIGKILL) -> Dict[str, Any]:
 
     Defaults to SIGKILL: on macOS, SIGABRT/SIGSEGV make ReportCrash file a report and
     show a "Python quit unexpectedly" dialog for every probe run.
+
+    Classification comes from ``Popen.wait()``'s encoding of a signalled exit: a
+    negative return code ``-N`` means signal ``N``, so ``signal_num`` is ``-rc``
+    and ``exit_code`` is normalised to ``128 + N`` (the shell convention). An exit
+    that was *not* a signal leaves ``signal_num`` as ``None`` and passes the raw
+    code through, which is why ``classification`` can be ``"exited"`` on a run the
+    caller expected to be ``"signalled"`` — that mismatch is the finding, not a bug
+    in the probe.
+
+    This is the only probe whose ``leaked_children`` is measured rather than
+    stubbed: it is ``0`` when the grandchild is gone and ``1`` when it is still
+    alive. ``grandchild_reaped`` is decided with ``kill(pid, 0)`` after the group
+    teardown, so ``ProcessLookupError`` is the positive evidence. If the pid file
+    was never written (child died before spawning), ``grandchild_pid`` stays ``0``
+    and the flag reports ``True`` because there is nothing to check — read that as
+    "not observed", not as "verified absent".
     """
     signal_num_expected = int(sig)
     work = Path(tempfile.mkdtemp(dir=str(default_scratch_root()), prefix="tb-crash-"))
@@ -793,7 +967,25 @@ def run_signal_crash_probe(sig: int = signal.SIGKILL) -> Dict[str, Any]:
 
 
 def run_repeated_init_probe(times: int = 5) -> Dict[str, Any]:
-    """Initialise the same store home and mail fixture repeatedly; prove idempotence."""
+    """Initialise the same store home and mail fixture repeatedly; prove idempotence.
+
+    Each iteration opens ``TestBenchStore`` against the *same* home, closes it, and
+    then reads the file directly: ``user_version``, the sorted non-``sqlite_%``
+    table names, and the ``runs`` row count. That triple is the fingerprint. A
+    store that re-ran its DDL would leave the fingerprint unchanged anyway, so the
+    failure this catches is the one that matters — a second initialisation that
+    seeds rows, bumps the version, or leaves a table behind.
+
+    ``idempotent`` requires exactly one distinct fingerprint over exactly ``times``
+    iterations *and* no errors. An iteration that raised contributes an error
+    string and no fingerprint, so a partially failed run can never look
+    idempotent by having produced one clean sample.
+
+    Mail determinism is checked separately: two databases built from scratch must
+    hash equal. That holds only because the builder checkpoints the WAL and
+    truncates it before closing, so the main file contains every page and no
+    frame ordering can vary between runs.
+    """
     times = max(1, int(times))
     work = Path(tempfile.mkdtemp(dir=str(default_scratch_root()), prefix="tb-init-"))
     home = work / "store-home"
@@ -852,6 +1044,16 @@ def run_repeated_init_probe(times: int = 5) -> Dict[str, Any]:
 
 
 def _tmux_env(work: Path, socket: str) -> Dict[str, str]:
+    """Environment for a disposable tmux server, with no handle on the ambient one.
+
+    ``TMUX`` is deliberately absent (and ``socket`` is only used via ``-L``): an
+    inherited ``TMUX`` would let tmux commands attach to the user's real server,
+    so the probe could kill or inspect panes it never created. ``HOME`` and
+    ``TMUX_TMPDIR`` point inside the per-run scratch directory so the server's
+    socket and state die with it. ``LANG``/``LC_ALL`` are pinned to UTF-8 because
+    tmux fails to start under some C locales, and ``TERM`` to a fixed 256-color
+    entry so the SGR set a pane emits does not depend on the caller's terminal.
+    """
     return {
         "PATH": os.environ.get("PATH", "/opt/homebrew/bin:/usr/bin:/bin"),
         "HOME": str(work / "home"),
@@ -864,7 +1066,27 @@ def _tmux_env(work: Path, socket: str) -> Dict[str, str]:
 
 
 def run_tmux_lifecycle_probe(scratch_root: Optional[Path] = None) -> Dict[str, Any]:
-    """Exercise an isolated tmux server: session/window/pane ``@hx``, crash recovery, teardown."""
+    """Exercise an isolated tmux server: session/window/pane ``@hx``, crash recovery, teardown.
+
+    The server is reached only through a random ``-L`` socket and ``-f /dev/null``,
+    so no user ``.tmux.conf`` applies and no ambient server is touched. ``@hx`` is
+    set at three scopes (session, window, pane) because the product addresses panes
+    by that option; the probe reads each one back with the matching ``show-options``
+    scope flag, which is the only way to catch a value written at the wrong level.
+
+    Crash recovery uses ``remain-on-exit`` plus a deliberate ``SIGKILL`` of the pane
+    process: ``pane_dead`` must flip to ``1`` (tmux noticed) and back to ``0`` after
+    ``respawn-pane -k``. Skipping the dead check would pass on a pane that never
+    died at all.
+
+    ``server_gone`` is decided by polling the server pid, not by trusting
+    ``kill-server``'s exit status — tmux can exit 0 while a child server lingers.
+    ``clean`` additionally requires the scratch tree to be gone.
+
+    If tmux is missing this returns a degraded dict instead of raising:
+    ``available=False`` with ``clean=True``, which means "nothing was created",
+    not "something was cleaned up". Callers must branch on ``available`` first.
+    """
     tmux_bin = shutil.which("tmux")
     if not tmux_bin:
         return {
@@ -982,6 +1204,15 @@ def run_tmux_lifecycle_probe(scratch_root: Optional[Path] = None) -> Dict[str, A
 
 
 def _pid_alive(pid: int) -> bool:
+    """Signal-0 liveness probe, tolerant of the two answers ``kill`` cannot give.
+
+    ``PermissionError`` means the pid exists but belongs to someone else, so it
+    counts as alive; every other ``OSError`` (including a pid below 2, which can
+    never be a fixture child) counts as gone. This is a point-in-time observation:
+    a pid recycled between the check and a later ``kill`` would alias another
+    process, which is why teardown elsewhere pairs it with a start-time
+    fingerprint.
+    """
     if pid <= 1:
         return False
     try:
@@ -998,6 +1229,20 @@ def _pid_alive(pid: int) -> bool:
 # --------------------------------------------------------------------- mail fixtures
 
 
+# The mailbox schema both consumers agree on, so a fixture built here is readable
+# by ``hxmail`` (SQLite) and ``listbench.cob`` (GnuCOBOL over the same file)
+# without a translation step.
+#
+# Shape worth knowing before touching it:
+# * ``rid`` is the integer row identity and the join key: ``body.rid`` and the
+#   FTS ``rowid`` are both the ``email.rid`` value, so an email and its body can
+#   never disagree about which message they belong to.
+# * ``mailbox`` and ``email_mailbox`` are ``WITHOUT ROWID``; the latter's primary
+#   key is ``(mailbox_id, received_at DESC, rid)``, which is exactly the covering
+#   order a mailbox listing walks — no sort at query time.
+# * ``email_fts`` is contentless (``content=''``) with ``contentless_delete=1``:
+#   the index stores terms only and still supports deletes, which matters to a
+#   consumer that syncs by removing messages.
 MAIL_SCHEMA = """
 CREATE TABLE mailbox (id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT, parent_id TEXT,
                       sort_order INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
@@ -1024,7 +1269,26 @@ _HOSTILE_BODY = (
 
 
 def create_cross_lang_mail_db(db_path: Path) -> Dict[str, Any]:
-    """Create the deterministic 5-table mail DB shared by ``hxmail`` and ``listbench.cob``."""
+    """Create the deterministic 5-table mail DB shared by ``hxmail`` and ``listbench.cob``.
+
+    Four emails cover the cases the readers get wrong: an ordinary modern message,
+    a pre-epoch timestamp (``-86400``), a 1900 date (``-2208988800``), and a
+    ``rid`` of ``2**32 + 7`` that overflows any 32-bit consumer. The last one's
+    subject is non-ASCII and its body carries NUL, BEL, OSC 52, CSI 2J and DCS so
+    anything that renders it through an unsanitized path is caught downstream.
+
+    Determinism is a property of the file bytes, which is why the connection
+    checkpoints the WAL with ``TRUNCATE`` before closing: after that the main file
+    holds every page, no ``-wal`` sidecar remains, and two builds hash equal. Every
+    value below is a literal in this function — nothing is read from the clock,
+    ``random``, or the hostname.
+
+    The ``sha256`` is taken over the finished file and is the determinism signal —
+    compare two builds' hashes rather than diffing rows. Everything else in the
+    returned dict is a read-back (counts, ``min_rid``/``max_rid``, whether the FTS
+    index answers a query), so it reports what SQLite stored, not what the insert
+    loop intended.
+    """
     path = Path(db_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     for suffix in ("", "-wal", "-shm"):
@@ -1186,6 +1450,11 @@ def create_cross_lang_mail_db(db_path: Path) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------- haunted terminal
 
+# The eight integrity areas, and the report's bucket order. Every area is expected
+# to carry at least one case: a probe that silently drops an area would otherwise
+# report "all passed" over seven. ``run_haunted_terminal_probe`` seeds its area
+# table from this tuple and any area a case names that is missing here is added on
+# the fly, so this order is presentation, not a whitelist.
 HAUNTED_TERMINAL_AREAS: Tuple[str, ...] = (
     "combining_unicode",
     "wide_display_cells",
@@ -1197,6 +1466,11 @@ HAUNTED_TERMINAL_AREAS: Tuple[str, ...] = (
     "interrupted_output_partial_utf8",
 )
 
+# Degenerate geometries. Below 10 columns or 4 rows ``render_frame`` returns blank
+# rows by design (no four bands fit), so these sizes test the degradation path, not
+# layout: every one must still produce exactly ``rows`` lines of at most ``cols``
+# cells. Exact cell filling is only asserted from 10x4 up — see
+# ``narrow_frames_fit_exact_cells``.
 HAUNTED_NARROW_SIZES: Tuple[Tuple[int, int], ...] = (
     (1, 1),
     (2, 2),
@@ -1207,6 +1481,11 @@ HAUNTED_NARROW_SIZES: Tuple[Tuple[int, int], ...] = (
     (20, 3),
 )
 
+# Resize schedule for the PTY child: the first entry is the spawn geometry, the rest
+# are applied on a wall-clock cadence while the child is writing. It runs wide
+# (120) then very narrow (18) then settles at 48x16, so a geometry the child caches
+# once can never match the last frame. Order is significant — the final entry is
+# what the probe asserts convergence to.
 HAUNTED_RESIZE_SCHEDULE: Tuple[Tuple[int, int], ...] = (
     (80, 24),
     (52, 18),
@@ -1222,6 +1501,10 @@ HAUNTED_RESIZE_SCHEDULE: Tuple[Tuple[int, int], ...] = (
     (48, 16),
 )
 
+# Shorter schedule for the tmux transport: each resize costs a tmux round trip, so
+# the cadence is coarser and the run would otherwise dominate the probe's wall time.
+# Six steps cross five distinct widths (60/40/100/30/70) and end away from the
+# spawn size; the tmux case only asserts at least three distinct widths.
 HAUNTED_TMUX_RESIZE_SCHEDULE: Tuple[Tuple[int, int], ...] = (
     (80, 24),
     (60, 20),
@@ -1238,7 +1521,13 @@ HAUNTED_PARTIAL_SEQUENCE = b"\xe6\x97"  # first two bytes of U+65E5
 HAUNTED_PARTIAL_BEGIN = b"@@HAUNTED_PARTIAL_BEGIN"
 HAUNTED_PARTIAL_END = b"@@HAUNTED_PARTIAL_END"
 
+# The child's frame header: ``@@HAUNTED_FRAME <seq> <cols> <rows> <kind>``. The
+# marker is plain ASCII so it survives a PTY in any locale, and it is emitted by
+# the child rather than inferred by the parent — the parent never guesses which
+# bytes were meant to be a frame.
 _HAUNTED_FRAME_RE = re.compile(r"@@HAUNTED_FRAME (\d+) (\d+) (\d+) (\w+)")
+# SGR only. Any other escape that survives into a line is a violation, so the
+# checker strips this exact shape (and nothing broader) before looking for ESC.
 _HAUNTED_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 _PARTIAL_UTF8_CHUNKS: Tuple[bytes, ...] = (
@@ -1255,7 +1544,13 @@ _PARTIAL_UTF8_EXPECTED = "latin \u00e9 ok \u20ac cjk \u65e5 emoji \U0001f600 don
 
 @dataclass(frozen=True)
 class HauntedCase:
-    """One observable Haunted Terminal invariant and its measured outcome."""
+    """One observable Haunted Terminal invariant and its measured outcome.
+
+    ``status`` is a ``RunStatus`` value (``PASS``/``FAIL``/``SKIP``), not a bool:
+    ``SKIP`` exists so an unavailable transport is never silently counted as a
+    pass. ``message`` is empty on success and carries the first few concrete
+    violations on failure — the numbers, not a restatement of the invariant.
+    """
 
     name: str
     area: str
@@ -1263,6 +1558,7 @@ class HauntedCase:
     message: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
+        """Serialise for the probe's JSON report; ``status`` is a plain string."""
         return {
             "name": self.name,
             "area": self.area,
@@ -1480,14 +1776,25 @@ def haunted_partial_utf8_expected() -> str:
 
 
 def haunted_narrow_sizes() -> List[Tuple[int, int]]:
+    """Narrow/degenerate geometries as mutable ``(cols, rows)`` pairs."""
     return [(int(size[0]), int(size[1])) for size in HAUNTED_NARROW_SIZES]
 
 
 def haunted_resize_schedule() -> List[Tuple[int, int]]:
+    """The PTY resize schedule as mutable ``(cols, rows)`` pairs."""
     return [(int(size[0]), int(size[1])) for size in HAUNTED_RESIZE_SCHEDULE]
 
 
 def _haunted_zero_width(ch: str) -> bool:
+    """True when ``ch`` occupies no cell and must travel with its base character.
+
+    Three sources are folded together because the terminal treats them the same
+    way: explicit joiners (ZWSP/ZWNJ/ZWJ/BOM), Hangul Jamo medial/final vowels
+    (``0x1160``–``0x11FF``, which compose onto the preceding leading jamo), and
+    anything Unicode marks as combining (``Mn``/``Me``) or format (``Cf``). ``Cf``
+    also covers the bidi controls, so they measure zero — correct for width, and
+    harmless here because the checker separately forbids them outright.
+    """
     cp = ord(ch)
     if cp in (0x200B, 0x200C, 0x200D, 0xFEFF):
         return True
@@ -1499,12 +1806,26 @@ def _haunted_zero_width(ch: str) -> bool:
 
 
 def _haunted_cell_width(ch: str) -> int:
+    """Reference cell width: 0 for joining marks, 2 for East Asian ``W``/``F``, else 1.
+
+    This is the oracle the production ``display_width`` is compared against, so it
+    is intentionally a small, independent reimplementation rather than a call into
+    the module under test — comparing a function to itself proves nothing.
+    """
     if _haunted_zero_width(ch):
         return 0
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
 def _haunted_run_record(text: str = "haunted") -> RunRecord:
+    """A fixed FAIL run whose project name carries the hostile text.
+
+    Every field is a constant so two renders of the same input are byte-identical;
+    the hostile text rides in ``project`` and ``first_failure``, which the header
+    and the log body read, and ``_haunted_state`` also copies it into the
+    minibuffer — three render paths that are each expected to clean it
+    independently.
+    """
     flat = text.replace("\n", " ") or "haunted"
     return RunRecord(
         run_id="tb_haunted_phase1c",
@@ -1519,6 +1840,12 @@ def _haunted_run_record(text: str = "haunted") -> RunRecord:
 
 
 def _haunted_state(text: str) -> TuiState:
+    """A deterministic TUI state with ``text`` in every field the renderer reads.
+
+    ``detail_open``/``detail_scroll`` are pinned so no scroll offset can drift
+    between two renders of the same input, and they bias the body toward the
+    detail sheet — the widest of the body variants.
+    """
     run = _haunted_run_record(text)
     lines = tuple(text.splitlines()) or ("",)
     flat = text.replace("\n", " ") or "ready"
@@ -1549,10 +1876,23 @@ def haunted_render_naive(text: str, width: int, height: int) -> List[str]:
 
 
 def _haunted_label(cp: int) -> str:
+    """``U+XXXX`` form, at least four digits, for messages a human has to act on."""
     return "U+%04X" % cp
 
 
 def _haunted_forbidden_codepoints(text: str) -> List[str]:
+    """Return the forbidden code points present, deduplicated, in first-seen order.
+
+    The ranges are spelled out rather than derived from a general "is this
+    category dangerous" test: each one is a specific attack (bidi override, tag
+    payload, soft hyphen, zero-width joiner), and spelling them out means a Unicode
+    database upgrade cannot quietly widen or narrow what the checker accepts. Tab
+    and newline are exempt — they are layout, not payload, and a blob that
+    legitimately spans lines would otherwise fail on every call.
+
+    Order is first appearance, not code-point order, so the message leads with the
+    character that actually appears first in the offending input.
+    """
     found: List[int] = []
     labels: List[str] = []
     for ch in text:
@@ -1577,6 +1917,14 @@ def _haunted_forbidden_codepoints(text: str) -> List[str]:
 
 
 def _haunted_orphan_marks(text: str) -> List[str]:
+    """Detect combining marks left without a base after sanitization or truncation.
+
+    Two cases: the string starts with a mark (the leading base was dropped), or a
+    mark directly follows a space/tab (a cell-fitter cut between base and mark).
+    At most two problems are returned — the leading mark plus the first detached
+    mark after a space/tab; the loop breaks only after that second case, so a long
+    line does not produce one message per mark.
+    """
     problems: List[str] = []
     if text and unicodedata.combining(text[0]):
         problems.append("starts with a detached combining mark")
@@ -1590,7 +1938,18 @@ def _haunted_orphan_marks(text: str) -> List[str]:
 
 
 def check_haunted_text(text: str) -> List[str]:
-    """Return violations for untrusted text about to reach a terminal."""
+    """Return violations for untrusted text about to reach a terminal.
+
+    This is the string-level half of the checker: it knows nothing about cells,
+    frames or layout, so it is safe to call on a raw payload before rendering. It
+    does look for the base64 clipboard payloads explicitly — an OSC 52 write whose
+    introducer was stripped can still leave ``ZXZpbA==`` in the text, and a
+    sanitizer that only removes the escape sequence would pass a weaker check.
+
+    An empty list means none of those specific hazards were found, not that the
+    text is safe to emit: control characters outside the enumerated ranges, and
+    payloads outside the clipboard set, are not detected here.
+    """
     violations: List[str] = []
     forbidden = _haunted_forbidden_codepoints(text)
     if forbidden:
@@ -1607,7 +1966,20 @@ def check_haunted_text(text: str) -> List[str]:
 def check_haunted_frame(
     lines: Sequence[str], width: int, *, height: Optional[int] = None
 ) -> List[str]:
-    """Return violations for one rendered frame at ``width`` display cells."""
+    """Return violations for one rendered frame at ``width`` display cells.
+
+    Checks run per line and every violation is reported rather than the first: a
+    frame that both leaks BEL and overflows its cell budget is one defect to fix,
+    twice. Generated SGR is tolerated — it is stripped before the escape scan so a
+    colored frame is not accused of leaking, while any other CSI/OSC/DCS still is.
+    ``height``, when given, makes the line count part of the contract; without it
+    the check is per-line only.
+
+    The width test is ``cells > width``, not ``!=``: a short line is a separate
+    concern (``narrow_frames_fit_exact_cells`` asserts exact filling for the cases
+    that promise it) and mixing the two would make every unpadded row look like an
+    overflow.
+    """
     violations: List[str] = []
     width = int(width)
     if height is not None and len(lines) != int(height):
@@ -1649,6 +2021,12 @@ def decode_haunted_stream(
 
     ``faithful=False`` models the classic defect: each chunk decoded alone with
     ``errors="ignore"``, so an interrupted code point vanishes without a trace.
+
+    ``mode`` names which path ran, so a report can never be misread: ``incremental``
+    with ``replacements == 1`` means the decoder held the partial sequence and
+    reported it exactly once at end of stream; ``silent_drop`` with ``replacements
+    == 0`` means bytes disappeared. The replacement count is the observable, and it
+    is what distinguishes "recovered the text" from "deleted the evidence".
     """
     if faithful:
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -1663,7 +2041,20 @@ def decode_haunted_stream(
 
 
 def split_haunted_stream(raw: bytes) -> List[bytes]:
-    """Split captured bytes exactly where the child interrupted a code point."""
+    """Split captured bytes exactly where the child interrupted a code point.
+
+    The cut lands immediately after the partial sequence the child wrote between
+    its sentinels, so the first chunk ends mid-codepoint *by construction* rather
+    than by hoping a random read boundary landed there. Trailing CR/LF are walked
+    back off the cut first, so the split point is a byte boundary inside the
+    sequence rather than the line ending after it; the guard below then raises a
+    too-short cut so it still covers the whole sequence.
+
+    Returns ``[raw]`` unchanged when the sentinels are missing or the computed cut
+    is degenerate (at or past the end). A caller then decodes one whole buffer —
+    a valid fallback, and visibly different from a real split because the report
+    from ``_haunted_partial_cases`` checks for the sentinel separately.
+    """
     start = raw.find(HAUNTED_PARTIAL_BEGIN)
     if start < 0:
         return [raw]
@@ -1684,7 +2075,20 @@ def split_haunted_stream(raw: bytes) -> List[bytes]:
 
 
 def parse_haunted_frames(text: str) -> List[Dict[str, Any]]:
-    """Parse the child's frame markers and their ruler widths."""
+    """Parse the child's frame markers and their ruler widths.
+
+    A frame starts at a ``@@HAUNTED_FRAME`` line and owns every following line made
+    entirely of ``#`` (the ruler the child draws at its current width). Ruler
+    lengths are recorded as character counts — every ``#`` is one cell — so a frame
+    that drew 30 hashes while claiming 40 columns shows up as a mismatch instead of
+    being trusted.
+
+    Attribution is deliberately loose: any non-ruler line is ignored and the current
+    frame stays the last marker seen, so a ruler arriving after intervening output is
+    still credited to that frame. Frames are returned in stream order and never
+    deduplicated, because seeing the same geometry twice is itself evidence about how
+    many frames the child got out.
+    """
     frames: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
     for raw_line in text.splitlines():
@@ -1724,6 +2128,22 @@ def _reference_fit(text: str, width: int) -> Tuple[str, int]:
 
 # ----------------------------------------------------------------- pty transport
 
+# Child for the haunted PTY/tmux transports; argv is
+# ``plan.json result.json ready``. Everything the child should do arrives in the
+# plan so the same script serves both transports and both fault modes.
+#
+# Protocol: every iteration emits ``@@HAUNTED_FRAME <seq> <cols> <rows> <kind>``
+# followed by either a ruler of ``cols`` hashes (kind ``ruler``) or the hostile
+# payload (kind ``hostile``, every fourth iteration). The parent parses markers and
+# ruler lengths only — it never tries to reconstruct frames from raw bytes, which
+# would be undecidable once escape sequences and wide cells are in play.
+#
+# Two plan flags exist to model defects, not to test them: ``cache_geometry`` reads
+# the size once and reuses it (a stale-geometry implementation), and
+# ``ignore_sigwinch`` skips installing the handler entirely. The plan carries
+# ``hostile_hex`` already sanitized, so the faithful child can never accidentally
+# be the thing that leaks: this transport tests framing and geometry, while text
+# sanitization is covered by the in-process cases.
 _HAUNTED_PTY_CHILD = r'''
 import fcntl
 import json
@@ -1804,6 +2224,19 @@ def _haunted_plan(
     partial: bool,
     cache_geometry: bool,
 ) -> Dict[str, Any]:
+    """Build the child's plan dict; the JSON form is the only channel between them.
+
+    The hostile sample is run through the production sanitizer *here*, in the
+    parent, and then hex-encoded. Hex matters: the plan is JSON, and a raw control
+    byte would have to survive JSON escaping and a file write before the child ever
+    saw it — a decode step that could drop or reintroduce escapes, with the probe
+    then measuring its own transport. Sending clean bytes keeps a downstream failure
+    attributable to the terminal path rather than to the plan.
+
+    ``partial_at`` is fixed at iteration 7 so the interruption lands after several
+    frames have already been emitted — a stream cut at the first iteration would
+    leave nothing to resync to.
+    """
     hostile_text = "\u65e5\u672c\u8a9e e\u0301 \x1b]52;c;ZXZpbA==\x07tail"
     hostile_clean = sanitize_terminal_text(hostile_text).replace("\n", " ")
     return {
@@ -1818,6 +2251,13 @@ def _haunted_plan(
 
 
 def _write_haunted_plan(work: Path, plan: Dict[str, Any]) -> Tuple[Path, Path, Path, Path]:
+    """Materialise the plan, the child script and its result/ready paths under ``work``.
+
+    Returns ``(plan, result, ready, child)`` in that order, matching the child's
+    argv. All four live in the same directory so teardown is a single rmtree, and so
+    the ready/result files can never be confused with a previous run's: the caller
+    hands in a fresh directory.
+    """
     work.mkdir(parents=True, exist_ok=True)
     plan_path = work / "plan.json"
     result_path = work / "result.json"
@@ -1829,6 +2269,12 @@ def _write_haunted_plan(work: Path, plan: Dict[str, Any]) -> Tuple[Path, Path, P
 
 
 def _set_pty_size(fd: int, cols: int, rows: int) -> None:
+    """``TIOCSWINSZ`` with the ``(rows, cols)`` order the ioctl actually expects.
+
+    ``struct winsize`` is ``ws_row, ws_col, ws_xpixel, ws_ypixel``; every call site
+    elsewhere in this module talks in ``(cols, rows)``, so the swap is done once,
+    here, rather than at each caller.
+    """
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", int(rows), int(cols), 0, 0))
 
 
@@ -1842,7 +2288,28 @@ def _run_haunted_pty_child(
     sleep_s: float = 0.025,
     resize_interval_s: float = 0.07,
 ) -> Dict[str, Any]:
-    """Run the hostile child on a real PTY while resizing it rapidly."""
+    """Run the hostile child on a real PTY while resizing it rapidly.
+
+    The resize loop is driven by the parent's clock, not by the child's output:
+    resize *n* is applied once ``resize_interval_s * n`` has elapsed, so the schedule
+    lands on a fixed timeline even if the child stalls. That is what makes this a
+    test of a resized-while-writing implementation rather than a test of a renderer
+    that happens to finish between resizes.
+
+    Reading is non-blocking (``select`` then ``os.read``): a blocking read would hang
+    on the final frame if the child exited without the master reporting EOF, and
+    ``EAGAIN`` is treated as "nothing yet", never as an error. When the child has
+    exited *and* every scheduled resize has been applied, the loop gives the master
+    one extra 0.05 s drain before declaring EOF — a PTY can hold the last chunk after
+    the writer is gone, and dropping it would lose the frame the assertions look at.
+
+    Raw bytes are returned undecoded (``raw``) so the caller chooses a decode
+    strategy; decoding here would hide the exact defect area 8 exists to find.
+
+    Teardown closes the master fd and, if the child outlived the run, terminates its
+    group and raises from ``finally`` — so a leaked child surfaces as an exception,
+    never as a report. ``leaked_children`` in the returned dict is a fixed ``0``.
+    """
     plan = _haunted_plan(
         iterations=iterations,
         sleep_s=sleep_s,
@@ -1906,7 +2373,9 @@ def _run_haunted_pty_child(
             readable, _w, _x = select.select([master_fd], [], [], 0.01)
             if not readable:
                 if proc.poll() is not None and next_resize >= len(schedule):
-                    # Give the master one final drain before declaring EOF.
+                    # Child is gone and nothing is left to apply: one bounded drain
+                    # so a chunk the PTY buffered after exit is not lost. If the
+                    # master still has nothing, the stream is over.
                     extra, _w, _x = select.select([master_fd], [], [], 0.05)
                     if not extra:
                         break
@@ -1981,7 +2450,26 @@ def _run_haunted_tmux_child(
     socket: str = "",
     tmux_bin: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Run the same hostile child inside a disposable ``-L`` tmux server."""
+    """Run the same hostile child inside a disposable ``-L`` tmux server.
+
+    Unlike the PTY path, the resize is requested through tmux
+    (``resize-window``), which is the only way to exercise tmux's own geometry
+    propagation to a pane. The child still reads ``TIOCGWINSZ`` and reports the
+    sizes it saw, so a tmux that reports a resize to the client but never updates
+    the pane fails here rather than passing on the command's exit status.
+
+    Pane geometry is queried *before* the result file is waited for: once the child
+    exits, tmux tears the session down and the query would fail on a target that no
+    longer exists.
+
+    ``server_gone``/``clean`` are written in ``finally`` after ``kill-server``.
+    The success-path dict never sets either; only the failure-default dict seeds
+    them (``available=False``, ``clean=True``), so the ``finally`` values are what
+    a caller actually reads — a run that produced perfect results but left a
+    server behind is reported unclean. If tmux is absent the function returns
+    ``available=False`` instead of raising, so the caller can downgrade the case
+    to SKIP.
+    """
     tmux_bin = tmux_bin or shutil.which("tmux")
     if not tmux_bin:
         return {"available": False, "reason": "tmux binary not found on PATH", "clean": True}
@@ -2085,15 +2573,60 @@ def _run_haunted_tmux_child(
 
 
 def _haunted_case(name: str, area: str, ok: bool, message: str = "") -> HauntedCase:
+    """Wrap a boolean outcome as PASS/FAIL; the message is kept only for failures."""
     return HauntedCase(name=name, area=area, status=RunStatus.PASS if ok else RunStatus.FAIL, message="" if ok else message)
 
 
 def _haunted_skip(name: str, area: str, message: str) -> HauntedCase:
+    """A SKIP case; ``message`` is the reason, and is required by the signature."""
     return HauntedCase(name=name, area=area, status=RunStatus.SKIP, message=message)
 
 
 def _haunted_process_cases(fault_injection: bool) -> List[HauntedCase]:
+    """Grade areas 1–6 in-process, against the real sanitizer and renderer.
+
+    Everything here runs in this process: corpora go through
+    ``sanitize_terminal_text`` / ``fit_cells`` / ``display_width`` / ``render_frame``
+    directly, so no PTY, tmux, or child is involved. That keeps the text and width
+    invariants cheap and deterministic, and leaves the transports
+    (``_run_haunted_pty_child``, ``_run_haunted_tmux_child``) to prove only that
+    geometry survives being written through a terminal.
+
+    ``fault_injection`` swaps exactly one thing: the renderer, to
+    ``haunted_render_naive``. Sanitization, cell measurement and fitting stay real.
+    That is deliberate and it is what makes the negative control honest — cases that
+    never call the renderer (``combining_cells_count_once``,
+    ``eof_partial_utf8_uses_single_replacement``) must keep passing, so a fault run
+    that fails *everything* would itself be a broken test rather than a detected
+    defect.
+
+    Cases, by area:
+
+    1. ``combining_unicode`` — base characters and marks survive sanitization; marks
+       contribute no cells (compared both against the text minus marks and against
+       the independent cell reference); fitting to 1–4 cells and rendering never
+       orphans a mark.
+    2. ``wide_display_cells`` — ``W``/``F`` characters measure two cells, a wide
+       character is never split at a cell boundary (``fit_cells`` must equal
+       ``_reference_fit`` padded to exactly the width), and a rendered frame at
+       10/11/12/20 columns stays inside its budget.
+    3. ``bidi_and_invisible_controls`` — overrides and isolates are gone before
+       emit; the Plane-14 tag payload is removed while its visible base emoji
+       survives; the surviving visible characters keep their logical order.
+    4. ``malformed_ansi_osc`` — an unterminated OSC fails closed *without* swallowing
+       the text after its newline, an absurd CSI cannot swallow text, a truncated
+       tail is dropped, and a rendered frame contains only generated SGR.
+    5. ``osc52_clipboard`` — neither the ``]52`` introducer nor any known base64
+       payload reaches sanitized text or a rendered frame, and BEL / 8-bit ST are
+       removed.
+    6. ``narrow_dimensions`` — every degenerate size yields exactly ``rows`` lines
+       within ``cols`` cells; from 10x4 up each line fills the width exactly.
+
+    Messages carry at most the first four violations: enough to identify the class
+    of defect, bounded so a systemic failure does not produce a megabyte of report.
+    """
     cases: List[HauntedCase] = []
+    # The one knob fault injection turns. Everything else below stays production.
     render = haunted_render_naive if fault_injection else haunted_render_frame
 
     # 1. Combining Unicode: clusters stay whole and count as one cell.
@@ -2578,7 +3111,20 @@ def _haunted_partial_cases(pty_report: Optional[Dict[str, Any]], pty_error: str)
 
 
 def _haunted_faulty_partial_cases(pty_report: Optional[Dict[str, Any]]) -> List[HauntedCase]:
-    """Fault control: per-chunk decoding loses the interrupted code point and resync."""
+    """Fault control: per-chunk decoding loses the interrupted code point and resync.
+
+    Same captured bytes and the same split point as the faithful case, decoded with
+    ``faithful=False``. The invariant is asserted unchanged, so this case is
+    *expected to fail* — that is the control. The lossy decode drops the two-byte
+    partial sequence silently, so ``replacements`` comes back ``0`` where the
+    faithful path reports exactly ``1``; a defect that merely reshuffled the frame
+    sequence without changing the replacement count would slip past the count check
+    and be caught by the ``frames[-1]["seq"]`` comparison instead.
+
+    Because it measures the decoder rather than the transport, it stays in the case
+    list under fault injection in place of the faithful variant — not alongside it,
+    so a single area never reports both "passed" and "failed" for one invariant.
+    """
     if pty_report is None or not pty_report.get("available"):
         return [
             _haunted_skip(
@@ -2615,7 +3161,43 @@ def run_haunted_terminal_probe(
     tmux_resize_schedule: Optional[Sequence[Tuple[int, int]]] = None,
     use_tmux: bool = True,
 ) -> Dict[str, Any]:
-    """Drive the Haunted Terminal invariants over a real PTY and disposable tmux."""
+    """Drive the Haunted Terminal invariants over a real PTY and disposable tmux.
+
+    Work happens in four stages, cheapest first, so a failure in the in-process
+    cases does not cost a PTY run: areas 1–6 in-process, then the PTY transport,
+    then tmux, then the interrupted-UTF-8 cases that need the PTY stream.
+
+    ``fault_injection`` turns three independent knobs, all of which model a real
+    defect class:
+
+    * the renderer becomes ``haunted_render_naive`` (areas 1–6),
+    * the PTY child caches its initial geometry instead of re-reading it, so frames
+      keep reporting the spawn size while the terminal is resized (area 7),
+    * the interrupted-UTF-8 case is replaced by ``_haunted_faulty_partial_cases``,
+      which decodes each chunk alone and therefore drops the split code point
+      (area 8).
+
+    The result is that a fault run must fail in at least seven areas while the
+    cases built on untouched primitives (``combining_cells_count_once``,
+    ``eof_partial_utf8_uses_single_replacement``) keep passing. That asymmetry is
+    the point: an all-red fault run would mean the probe is measuring its own
+    plumbing.
+
+    Transport failures SKIP rather than FAIL, with the reason carried in
+    ``tmux.error`` / ``pty.error``: no tmux binary, no PTY, or a scratch path too
+    long for ``sockaddr_un`` is an environment fact, not a product defect. For tmux
+    the base directory prefers the caller's ``TMUX_TMPDIR`` when it is short enough
+    and writable, then falls back to ``short_writable_tmux_base``. ``sun_path`` is
+    104 bytes, and tmux appends its own ``/tmux-<uid>/<name>`` suffix, so the base
+    gets a 68-character budget; an over-long base skips the case instead of failing
+    inside tmux with "File name too long".
+
+    ``all_passed`` is ``failed == 0 and passed > 0`` — an all-SKIP report is not a
+    pass. ``leaked_children`` is a fixed placeholder ``0``: teardown reaps or raises,
+    and ``no_leaked_children_and_clean_teardown`` checks the scratch tree, but no
+    field here counts survivors. ``scratch_clean`` is computed in ``finally`` from
+    what is still on disk, so it cannot be optimistic.
+    """
     schedule = [(int(s[0]), int(s[1])) for s in (resize_schedule or HAUNTED_RESIZE_SCHEDULE)]
     tmux_schedule = [
         (int(s[0]), int(s[1])) for s in (tmux_resize_schedule or HAUNTED_TMUX_RESIZE_SCHEDULE)
@@ -2831,7 +3413,19 @@ def run_haunted_terminal_probe(
 
 
 def haunted_invariant_selftest() -> Dict[str, Any]:
-    """Prove the checker flags known-bad frames/text and accepts known-good ones."""
+    """Prove the checker flags known-bad frames/text and accepts known-good ones.
+
+    A checker that returns ``[]`` for everything would pass every case in the probe,
+    so this pins both directions: the production renderer's output must be clean,
+    the naive renderer's output must be rejected, and each single-hazard case (wide
+    overflow, a leading orphan mark) must be caught on a hand-built frame. The
+    hazards are constructed rather than rendered, so a renderer bug cannot mask a
+    checker bug on the same input.
+
+    ``ok`` is the conjunction of all six checks; ``checks`` names each one so a
+    failure says *which* direction broke — a checker that accepts too much and one
+    that rejects too much are different bugs.
+    """
     good_lines = haunted_render_frame("\u65e5\u672c\u8a9e e\u0301", 20, 5)
     bad_lines = haunted_render_naive("\u65e5\u672c\u8a9e e\u0301 \x1b]52;c;ZXZpbA==\x07", 10, 4)
     good_text = sanitize_terminal_text("\x1b]52;c;ZXZpbA==\x07abc\u202edef\u202c")

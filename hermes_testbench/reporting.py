@@ -1,4 +1,32 @@
-"""Structured report serializers and concise formatters (ADR-0004)."""
+"""Structured report serializers and concise formatters (ADR-0004).
+
+Everything in this module is **derived**. ``run.json``, ``junit.xml``,
+``repro.sh`` and the terminal summary are all projections of one in-memory
+``RunRecord``; none of them is evidence about the run that the database does
+not already hold. Two consequences the owner should keep in mind:
+
+* A JUnit ``testcase`` element is not proof that a case ran. Cases the adapter
+  actually reported are emitted from ``suite.cases``/``suite.failures``; the
+  rest of the element tree is *back-filled* from the counters
+  (``total_count``/``pass_count``/``skip_count``/``error_count``) so the XML
+  agrees with the numbers the run recorded. That is a deliberate trade
+  (report consumers expect ``tests == sum(elements)``) and it means the XML
+  can describe cases whose names are synthetic — ``suite:fail_1``,
+  ``suite:pass_1`` — rather than real ones.
+* ``repro.sh`` is a best-effort reconstruction from ``command``/``cwd``, not a
+  captured invocation: environment, sandbox profile, trust state and the
+  disposable ``HOME`` are not reproduced. It reproduces the *command*, not the
+  *conditions*.
+
+Sanitization happens at render time (``_clean_field``/``_deep_clean``), on top
+of store-time redaction, so a record built in memory — a config error, an
+adapter message — is still scrubbed on the way out. Output escaping is
+ElementTree's job; this module never hand-builds XML, which is why a case name
+containing ``&`` or ``<`` cannot produce malformed XML.
+
+``parse_junit_xml_bounded`` is the one inbound path: untrusted XML with a size
+cap, a DTD/ENTITY refusal and no external entity resolution.
+"""
 
 from __future__ import annotations
 
@@ -12,10 +40,30 @@ from .schema import RunRecord, RunStatus, run_to_dict
 
 
 def _clean_field(value: str) -> str:
+    """Redact then strip: secrets first, escapes second.
+
+    Order matters. ``redact_secrets`` pattern-matches on text, so it must see
+    the escapes intact (a token split by an SGR sequence is a different token
+    after stripping); ``sanitize_terminal_text`` then removes the control
+    characters that would otherwise be persisted into XML/JSON.
+    """
     return sanitize_terminal_text(redact_secrets(value or ""))
 
 
 def _deep_clean(obj: Any) -> Any:
+    """Apply ``_clean_field`` to every string *value* in a nested structure.
+
+    Used for the JSON projection so there is no "unimportant" field: a secret
+    can arrive in a command argument, a case name, an ``isolation_meta`` value
+    or an environment snapshot, and a redaction pass that special-cases the
+    obvious fields leaks on the others.
+
+    Values are cleaned; keys are only stringified. So a secret used as a dict
+    *key* survives into ``run.json``. Keys in practice are field names and
+    environment variable names, never values, so this is a theoretical gap
+    rather than a live leak — but it is a gap, and it is asymmetric with the
+    treatment of values.
+    """
     if isinstance(obj, str):
         return _clean_field(obj)
     if isinstance(obj, list):
@@ -26,6 +74,34 @@ def _deep_clean(obj: Any) -> Any:
 
 
 def render_junit_xml(run: RunRecord) -> str:
+    """Render a JUnit document whose counters always agree with the run's numbers.
+
+    Four emit passes per suite, in a fixed order, because each later pass
+    depends on what the earlier ones produced:
+
+    1. ``suite.cases`` — the adapter's real case results.
+    2. ``suite.failures`` — failures that were never promoted to a case
+       (parser-level, or an adapter that only reports failures). Skipped when
+       a case with that name already exists, so one failure is never counted
+       twice; classified by ``suite.status`` **and** ``fail.kind``, since a
+       blocked suite's failure is a ``<skipped>`` and a timeout's is an
+       ``<error>``.
+    3. Back-fill for skips/errors/failures the counters claim but the emitted
+       elements do not cover (``target_skip`` vs ``cur_s``, and so on). These
+       are the synthetic ``suite:skip_1`` elements — see the module docstring:
+       they exist to keep ``tests == len(testcase)``, not to claim a case name.
+    4. Back-fill passes and plain cases up to ``total_count``.
+
+    Classification of a "bad" case is deliberately conservative on the
+    ``<error>`` side: TIMEOUT/ERROR/harness-level kinds become ``<error>`` so a
+    CI consumer distinguishes "the tests failed" from "we could not run them".
+
+    Every text field goes through ``_clean_field`` here (this function can be
+    called on a record that never passed through the store, e.g. ``testbench
+    results --format junit`` on a fresh run) and messages are truncated to 500
+    chars in the ``message`` attribute while the full (still redacted) text
+    goes in the element body.
+    """
     root = ET.Element(
         "testsuites",
         {
@@ -189,6 +265,20 @@ def render_junit_xml(run: RunRecord) -> str:
 
 
 def parse_junit_xml_bounded(xml_bytes: bytes, max_bytes: int = 2_000_000) -> Dict[str, Any]:
+    """Parse a JUnit document defensively; counters only, no case-level output.
+
+    Three gates, in this order: size (refuse before touching the parser), a
+    DTD/ENTITY scan of the first 4096 bytes, then ``ET.fromstring``. The scan
+    is head-only because that is where a prolog must live — but "must" is the
+    parser's rule, not this check's: bytes padded past 4096 can hide a
+    ``<!DOCTYPE>`` that ElementTree will still accept and whose internal
+    entities it will expand. The size cap is what bounds that exposure.
+
+    Counters come from attributes, not from counting children, so a document
+    with zero ``<testcase>`` elements but ``tests="3"`` reports 3. That is
+    intentional for consumers that only want the summary, and it means this
+    function cannot be used to validate a JUnit document's self-consistency.
+    """
     if len(xml_bytes) > max_bytes:
         raise ValueError(f"JUnit XML exceeds max_bytes ({len(xml_bytes)} > {max_bytes})")
     upper_head = xml_bytes[:4096].upper()
@@ -230,11 +320,29 @@ def parse_junit_xml_bounded(xml_bytes: bytes, max_bytes: int = 2_000_000) -> Dic
 
 
 def render_run_json(run: RunRecord) -> str:
+    """Canonical JSON projection: sorted keys, two-space indent, trailing newline.
+
+    This exact string is what the store keeps in ``runs.payload_json`` and what
+    ``testbench status --json`` prints, so stability matters beyond cosmetics:
+    sorted keys make two runs byte-diffable, and the trailing newline keeps a
+    shell redirect well-formed. Values are deep-cleaned (values only — keys are
+    field names); ``model_usage`` stays ``null`` unless it was measured, since
+    a fabricated zero would read as "this run cost nothing".
+    """
     cleaned = _deep_clean(run_to_dict(run))
     return json.dumps(cleaned, indent=2, sort_keys=True) + "\n"
 
 
 def format_terminal_summary(run: RunRecord) -> str:
+    """One-screen, human summary: status, identity, counts, first failure, repro.
+
+    Kept terse on purpose — this is what the CLI prints after every run and
+    what the TUI detail sheet reuses. ``first_failure`` is shown capped at 220
+    chars; ``run.json`` stores the 300-char form captured at finalize. The point
+    is a pointer to evidence, not the evidence. An orphan reconciled to ``ERROR`` has no counts, so the
+    tally reads all-zero by design (the reconciler invents no numbers) and the
+    only substantive line is its ``first_failure``.
+    """
     dur_s = f"{(run.duration_ms or 0.0) / 1000.0:.2f}s" if run.duration_ms is not None else "-"
     lines = [
         (
@@ -255,6 +363,30 @@ def format_terminal_summary(run: RunRecord) -> str:
 
 
 def format_repro_script(run: RunRecord) -> str:
+    """Build ``repro.sh``: shell-quoted commands, one suite after another.
+
+    Three precedence rules, because a record's shape varies: per-suite commands
+    (with their ``cwd``) when suites were recorded, else ``run.commands`` from
+    the run root, else a comment carrying ``repro_instructions``. It is a
+    ``/bin/sh`` script, not a copy of the harness: no environment is exported,
+    no sandbox is applied, and ``set -eu`` aborts on the first failing command —
+    which also means a suite whose ``command`` is empty is silently absent from
+    the repro rather than visible as a gap.
+
+    Relative ``cwd`` values *chain*: each ``cd`` applies to the directory left
+    by the previous suite, so a run whose suites declare ``cwd = "sub"`` and
+    then ``cwd = "."`` reproduces the second suite inside ``sub`` rather than at
+    the project root. ``repro_instructions`` (the single-command case) does not
+    have this problem; the multi-suite path does.
+
+    Two honest limitations. The script is *not* redacted: command argv is
+    interpolated through ``shlex.quote`` only, so a manifest that puts a token
+    in ``command`` writes it verbatim to a ``0700`` file under the store, even
+    though the same string is ``[REDACTED]`` in ``run.json``. And when suites
+    exist the script never ``cd``s to ``project_root`` — it relies on each
+    suite's declared ``cwd``, which for discovered suites is ``"."``, i.e. the
+    invoker's working directory.
+    """
     lines = [
         "#!/bin/sh",
         "# Generated by Hermes TestBench — deterministic reproduction script",

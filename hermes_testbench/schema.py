@@ -1,6 +1,28 @@
 """Canonical pure data contracts for Hermes TestBench.
 
-Zero regex, XML, I/O, formatting, or runner dependencies (ADR-0004).
+Every other module in the package sits downstream of this one (ADR-0004):
+``schema`` -> ``{sanitize, reporting, store}`` -> ``isolation`` ->
+``{adapters, engine}`` -> ``{cli, mcp_server, tui}``. Nothing here may import
+``re``, ``xml``, ``sqlite3``, ``subprocess``, ``pty``, ``termios``,
+``select`` or ``fcntl``; ``tests/test_schema.py`` asserts that set by walking
+the AST, so adding one of those imports fails the suite rather than review.
+The only ambient dependencies are ``threading`` (to make the clock and the ID
+generator monotonic under concurrency) and ``os.urandom`` (ID entropy) — no
+filesystem, process, or network calls.
+
+``SCHEMA_VERSION`` is the on-disk contract, not a cosmetic number:
+``TestBenchStore`` sets it as ``PRAGMA user_version`` when it creates
+``state.db`` and refuses to open any database whose ``user_version`` differs
+(``SchemaMismatchError``). There is no migration code. Bumping this constant
+therefore makes every existing store unreadable to the new release, which is
+why OPERATING-GUIDE ties schema bumps to an explicit migration step and
+forbids switching a release across one.
+
+Run status vocabulary (``RunStatus``) is partitioned: ``ACTIVE`` = {QUEUED,
+RUNNING}, ``TERMINAL`` = everything else. Persistence and reconciliation both
+lean on that partition, so a new intermediate state must be added to exactly
+one of the two sets — a status in neither is invisible to pruning, to the TUI
+refresh, and to ``reconcile_orphans``.
 """
 
 from __future__ import annotations
@@ -15,6 +37,15 @@ SCHEMA_VERSION = 1
 
 
 class RunStatus:
+    """Lifecycle vocabulary; persisted verbatim into ``runs.status``.
+
+    ``ACTIVE`` vs ``TERMINAL`` is load-bearing, not decorative:
+    ``reconcile_orphans`` only inspects ACTIVE rows, ``prune_runs`` refuses to
+    delete ACTIVE rows, the TUI tails logs only for ACTIVE rows, and
+    ``spawn_async`` polls until the row leaves ACTIVE. The aggregate in
+    ``engine._aggregate_run_status`` has no "unknown" state on purpose: every
+    run ends in exactly one of these strings or stays ACTIVE until reconciled.
+    """
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     PASS = "PASS"
@@ -31,6 +62,14 @@ class RunStatus:
 
 
 class ProfileName:
+    """Profile names select suites (``SuiteSpec.profile``) and group history.
+
+    ``STANDARD`` is the allowlist a manifest's ``profile`` must fall inside,
+    append-only in intent: mutation before agent-eval is deliberate (the
+    expensive, rarely-wanted eval stays last). The TUI picker uses its own
+    ``default_profiles`` tuple, which currently omits MUTATION, so the allowlist
+    and the picker are not identical.
+    """
     UNIT = "unit"
     INTEGRATION = "integration"
     TERMINAL = "terminal"
@@ -44,6 +83,16 @@ class ProfileName:
 
 
 class FailureKind:
+    """Why a run or suite did not pass; persisted into ``runs.failure_kind``.
+
+    These are closed-vocabulary strings consumed by the TUI, by JUnit
+    derivation (``reporting.render_junit_xml`` maps several of them to
+    ``<error>`` rather than ``<failure>``) and by ``testbench status``. Values
+    are also written as free-form ``FailureRecord.kind`` by adapters, which is
+    why the report layer compares against literals instead of this class in
+    places — keep the string values stable; adding an alias silently changes
+    the JUnit shape.
+    """
     ASSERTION = "assertion"
     HARNESS_ERROR = "harness_error"
     SPAWN_ERROR = "spawn_error"
@@ -57,6 +106,22 @@ class FailureKind:
 
 @dataclass
 class SuiteSpec:
+    """A discovered, not-yet-executed suite: the unit of selection and gating.
+
+    ``custom_from_manifest`` records provenance, and provenance is what the
+    trust gate reads: the engine only enforces the ``allow_network`` /
+    ``allow_repo_write`` veto when the spec came from the project's own
+    ``.testbench.toml`` (``discovery._suite_from_manifest`` passes
+    ``custom_from_manifest=True``). Suites synthesised by zero-config
+    detection, or by an operator-supplied external manifest, are marked
+    ``False`` and are therefore never subject to that veto — they were
+    authored by the caller, not by the repository under test.
+
+    ``required_paths``/``required_binaries`` are run-time facts, not discovery
+    facts: a missing one becomes SKIP with a named reason instead of a
+    discovery-time crash, so a machine without ``cobc`` still yields a full
+    profile listing.
+    """
     name: str
     adapter: str
     profile: str
@@ -149,6 +214,25 @@ class SuiteResult:
 
 @dataclass
 class RunRecord:
+    """One run: the canonical record, and the sole input to every artifact.
+
+    The store persists this two ways in the same transaction: a set of
+    denormalised columns (``run_id``, ``status``, ``created_at``, counts,
+    ``pinned`` ... ) used for filtering, ordering and reconciliation, and
+    ``payload_json`` = ``render_run_json(self)`` which is the *only* thing
+    ``get_run``/``list_runs`` read back. Columns are the index; the payload is
+    the record. Any new field must reach both, or it will be silently lost on
+    read-back while still appearing in ``runs.status``-style queries.
+
+    ``created_at`` is immutable after insert (the upsert in ``store`` never
+    rewrites it) because it is the ordering key for history, retention and
+    "latest run per project". ``run_id`` and the ``*_path`` fields are filled
+    by ``store._prepare_run_paths``; the paths are derived pointers into
+    ``evidence_dir`` and carry no independent truth.
+
+    ``run_nonce`` is declared but unpopulated anywhere in the package today —
+    treat it as reserved, not as data.
+    """
     run_id: str
     project: str
     project_root: str
@@ -194,6 +278,16 @@ _LAST_RID_SEQ = -1
 
 
 def utc_now_iso() -> str:
+    """UTC timestamp, strictly increasing within a process, ``...Z`` suffixed.
+
+    Ordering keys throughout the store are these strings compared
+    lexicographically, so a clock that steps backwards would silently reorder
+    history (and with it "latest run per project" and retention order). The
+    guard bumps by one microsecond instead of returning a smaller value. It is
+    per-process only: two processes racing the same second can still emit
+    equal timestamps, which is why every ordering query has ``rowid`` /
+    ``run_id`` tiebreakers behind it.
+    """
     global _LAST_UTC_US
     with _CLOCK_LOCK:
         now = datetime.now(timezone.utc)
@@ -206,6 +300,17 @@ def utc_now_iso() -> str:
 
 
 def new_run_id() -> str:
+    """``tb_<UTCyyyymmdd_HHMMSS>_<4 hex seq><4 hex random>``.
+
+    The stamp and the seq are per-process monotonic (seq is derived from the
+    microsecond field, then bumped on collision), so IDs sort in creation
+    order and two runs started in the same second still order correctly —
+    history order is a product requirement, not cosmetics
+    (``tests/test_evidence_quality_fixes`` pins the same-second case). Two
+    *processes* share no state, so cross-process uniqueness rests on the
+    16-bit seq bucket plus two random bytes; the store does not detect a
+    collision, it upserts over it. Treat uniqueness as probabilistic.
+    """
     global _LAST_RID_STAMP, _LAST_RID_SEQ
     with _CLOCK_LOCK:
         now = datetime.now(timezone.utc)
@@ -229,6 +334,12 @@ def run_to_dict(run: RunRecord) -> Dict[str, Any]:
 
 
 def _suite_from_dict(raw: Dict[str, Any]) -> SuiteResult:
+    """Rebuild one suite, re-hydrating its two nested record lists.
+
+    Nested failures/cases are plain dicts in JSON, so they need explicit
+    construction; anything else is a field-for-field copy. Unknown keys raise
+    here too, for the same reason as ``run_from_dict``.
+    """
     failures = [FailureRecord(**f) for f in (raw.get("failures") or [])]
     cases = [CaseResult(**c) for c in (raw.get("cases") or [])]
     copy = dict(raw)
@@ -238,6 +349,15 @@ def _suite_from_dict(raw: Dict[str, Any]) -> SuiteResult:
 
 
 def run_from_dict(data: Dict[str, Any]) -> RunRecord:
+    """Inverse of ``run_to_dict``; the only read path out of ``state.db``.
+
+    Deliberately strict (``RunRecord(**raw)``): an unknown key is a TypeError,
+    not a silent drop. That is safe only because ``TestBenchStore`` refuses to
+    open a database written by a different ``SCHEMA_VERSION`` — payload shape
+    and on-disk version move together. If a migration ever lands, it must
+    rewrite ``payload_json``; loosening this function instead would let
+    half-understood records into history.
+    """
     raw = dict(data)
     raw["suites"] = [_suite_from_dict(s) for s in (raw.get("suites") or [])]
     if raw.get("model_usage") is None:

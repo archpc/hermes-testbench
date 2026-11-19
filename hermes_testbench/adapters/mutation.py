@@ -5,9 +5,10 @@ Phase 3 contract
 * The mutation tool is a third-party binary (``cargo-mutants`` or ``mutmut``); TestBench
   never generates mutants itself.
 * The tool runs against a disposable copy of the project staged under
-  ``scratch_root / f"tbmut-{nonce}"``. The real checkout is never mutated and is verified
-  byte-for-byte untouched afterwards (``git status --porcelain`` unchanged, no mutant
-  artefacts left behind).
+  ``scratch_root / f"tbmut-{nonce}"``. The real checkout is never handed to the tool;
+  afterwards it is compared against a snapshot taken before staging (``git status
+  --porcelain`` plus a sentinel scan) and any difference ends the suite ERROR /
+  harness_error. See ``_untouched_violations`` for what that check can and cannot see.
 * Seatbelt confinement is mandatory. The staged copy is handed to the sandbox as an
   internal extra writable directory (``run_isolated_command(extra_writable_dirs=...)``),
   which keeps ``allow_repo_write=False`` for the real repository.
@@ -17,6 +18,23 @@ Phase 3 contract
   interrupted, not checked, harness error).
 * Surviving mutants are findings, not failures: the suite passes unless an operator gate
   (``--mutation-gate``) or a *trusted* manifest ``mutation_score_gate`` says otherwise.
+
+Gate order (``run_mutation_suite``) — each one is cheap and each one exists because the
+alternative silently ran unconfined or silently passed:
+
+A. a manifest-declared score gate from an *untrusted* manifest is refused (BLOCKED):
+   the gate that can fail a build may not come from a file the agent under test writes.
+   An operator ``--mutation-gate`` is stamped ``mutation_gate_from_cli`` and is trusted
+   on its own.
+B. ``can_apply_seatbelt()`` must be true (BLOCKED / ``sandbox_denied``). There is no
+   environment-variable escape hatch — see the comment on the gate.
+C. the tool must resolve (SKIP, never PASS): "could not measure" is not "clean".
+
+Lifecycle of one run: snapshot ``git status`` → create a private stage dir → copy
+sources → resolve the suite cwd *inside* the copy twice (lexical before staging, real
+path after, because symlinks are copied verbatim) → one confined spawn (plus a second,
+bounded one for ``mutmut results``) → parse → ``finally`` remove the stage with
+``_safe_rmtree_no_symlinks`` → compare the real checkout → decide the verdict.
 """
 
 from __future__ import annotations
@@ -123,11 +141,27 @@ def _run_argv(adapter: str, base: List[str]) -> List[str]:
 
 
 def _stage_ignore(_dir: str, names: List[str]) -> List[str]:
+    """``copytree`` ignore hook: drop caches, VCS state, venvs and prior mutant output.
+
+    Skipping ``.git`` is what makes the stage a source tree rather than a clone, and
+    skipping prior artefacts (``mutants.out``, ``.mutmut-cache``) prevents an old run's
+    verdicts from being read as this run's.
+    """
     return [name for name in names if name in _STAGE_SKIP_NAMES]
 
 
 def stage_project_tree(project_root: Path, stage_dir: Path) -> Path:
-    """Copy the project sources into a fresh disposable directory and return it."""
+    """Copy the project sources into a fresh disposable directory and return it.
+
+    ``exist_ok=False`` is load-bearing: staging into a directory that already exists
+    would mix trees, and the nonce in ``run_mutation_suite`` exists to make that
+    impossible. Mode 0700 keeps the copy private to this user.
+
+    ``symlinks=True`` copies links *as links*, so a link inside the project can still
+    point at the real checkout from inside the stage. That is not a bug in the copy —
+    it is why ``run_mutation_suite`` re-checks the staged cwd with ``realpath`` after
+    this returns, and why links are never followed here.
+    """
     source = Path(project_root).resolve(strict=True)
     target = Path(stage_dir)
     target.mkdir(parents=True, exist_ok=False)
@@ -167,7 +201,19 @@ def _git_status(project_root: Path) -> Optional[str]:
 
 
 def _untouched_violations(project_root: Path, before_status: Optional[str]) -> List[str]:
-    """Reasons the real checkout is no longer pristine after a mutation run."""
+    """Reasons the real checkout is no longer pristine after a mutation run.
+
+    Two checks, both after the stage is deleted: a sentinel scan for artefacts a tool
+    would drop in the project root, and a ``git status --porcelain`` diff against the
+    pre-run snapshot.
+
+    Limits, stated so nobody over-trusts a PASS: ``git status`` says nothing about
+    ignored paths (``target/``, a ``.mutmut-cache`` in ``.gitignore``), nor about a
+    file that was modified and restored, nor about edits that leave the index clean
+    by definition. When the project is not a git repo both snapshots are ``None`` and
+    the comparison silently degrades to the sentinel scan alone. The real guarantee is
+    the sandbox: the tool is given write access to the stage only.
+    """
     problems: List[str] = []
     for name in SENTINEL_NAMES:
         if (Path(project_root) / name).exists():
@@ -202,7 +248,15 @@ def export_evidence(
     cases: List[CaseResult],
     summary: str,
 ) -> Optional[str]:
-    """Write a bounded, redacted mutation report under ``evidence_dir/mutation/``."""
+    """Write a bounded, redacted mutation report under ``evidence_dir/mutation/``.
+
+    Stored separately from the generic suite log so a mutant list survives stream
+    truncation. Bounded twice (400 cases, 8 MiB) and redacted per field via
+    ``redact_secrets``+``sanitize_terminal_text``: mutant names embed source text, which
+    can embed a secret. Returns the path, or ``None`` when the directory is unwritable —
+    a missing report is never allowed to fail the suite, because the verdict is already
+    in the store.
+    """
     out_dir = Path(evidence_dir) / "mutation"
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -245,6 +299,13 @@ def export_evidence(
 
 
 def _score(caught: int, survived: int) -> Optional[float]:
+    """``caught / (caught + survived)``, or ``None`` when no viable mutant completed.
+
+    ``None`` is the honest answer for "nothing was measured" and the gate turns it into
+    a failure; returning 0.0 or 1.0 here would let an empty run look decisive.
+    Timeouts and unviable mutants are excluded — ADR-0008 rejects counting a hang as a
+    kill because it rewards a suite that never asserts.
+    """
     tested = caught + survived
     if tested <= 0:
         return None
@@ -258,6 +319,12 @@ def _metrics(
     gate: Optional[float],
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """The ``metrics["mutation"]`` payload: five buckets, tested, score, gate, tool.
+
+    ``gate`` is echoed so a stored run explains its own verdict without the manifest,
+    and ``baseline_failed`` because a FAIL caused by a broken baseline looks identical
+    to a FAIL caused by survivors in the counts alone.
+    """
     caught = int(outcome.buckets.get("caught", 0))
     survived = int(outcome.buckets.get("survived", 0))
     payload: Dict[str, Any] = {
@@ -289,6 +356,12 @@ def _cases(suite_name: str, outcome: parsers.ParseOutcome) -> List[CaseResult]:
 
 
 def _bucket_counts(result: SuiteResult, metrics: Dict[str, Any]) -> None:
+    """Project the five buckets onto the generic count fields.
+
+    ``caught``→pass, ``survived``→fail, and invalid/timeout/inconclusive all collapse
+    into ``skip`` (they are "not a verdict"), which is why ``fail_count == 0`` alone
+    does not mean the suite proved anything — read ``metrics["mutation"]``.
+    """
     result.total_count = int(metrics["tested"]) + int(metrics["invalid"]) + int(
         metrics["timeout"]
     ) + int(metrics["inconclusive"])
@@ -399,7 +472,32 @@ def run_mutation_suite(
     scratch_root: Optional[Path] = None,
     on_spawn: Optional[Any] = None,
 ) -> Tuple[SuiteResult, Optional[Dict[str, Any]]]:
-    """Stage a disposable copy, run one mutation tool under Seatbelt, classify outcomes."""
+    """Stage a disposable copy, run one mutation tool under Seatbelt, classify outcomes.
+
+    Verdict precedence after the tool has run (first match wins, so a later check can
+    never mask an earlier one):
+
+    1. checkout violations → ERROR (harness wrote outside the stage);
+    2. ``cancelled`` → CANCELLED;
+    3. ``timed_out`` → TIMEOUT (a partial tally is *not* reported as a score);
+    4. ``outcome.baseline_failed`` → FAIL with an assertion-kind baseline record: a
+       broken baseline makes every mutant verdict meaningless;
+    5. nothing structured / nothing tested and nothing inconclusive → ERROR
+       (harness error), never a pass;
+    6. score gate (operator or trusted manifest): ``None`` score fails as "cannot be
+       evaluated", below-gate fails with the surviving mutants as the excerpt;
+    7. otherwise PASS — surviving mutants are findings in ``metrics``/evidence.
+
+    ``result.fail_count`` is the survivor count and ``result.pass_count`` the caught
+    count (``_bucket_counts``): a mutation suite reads as "how many mutants did the
+    suite notice", not "how many tests ran". ``metrics["mutation"]["tested"]`` is the
+    denominator the gate uses, and it excludes invalid/timeout/inconclusive by design.
+
+    Replay is deliberately weaker than the original run: ``engine.reproduce`` rebuilds
+    a ``SuiteSpec`` without ``mutation_score_gate``/``mutation_gate_from_cli``, so a
+    replayed gate failure reports PASS/FAIL purely on mutants. Reproducing a *gate*
+    verdict is not supported; the recorded summary is the evidence for it.
+    """
     adapter = suite.adapter
     project_root = Path(project_root).resolve()
     evidence_dir = Path(evidence_dir)
@@ -495,10 +593,11 @@ def run_mutation_suite(
         if not workdir.is_dir():
             raise RuntimeError(f"staged suite cwd is missing: {relative_cwd}")
 
-        # Defense in depth (ADJACENT-1): ``stage_project_tree`` copies symlinks verbatim, so a
-        # symlinked suite cwd inside the staged copy can still point back at the real checkout.
-        # The lexical containment check above runs *before* the copy and cannot see links that the
-        # copy itself created, so re-verify the staged entry on disk right before spawning.
+        # Defense in depth: ``stage_project_tree`` copies symlinks verbatim, so a
+        # symlinked suite cwd inside the staged copy can still point back at the real
+        # checkout. The lexical containment check above runs *before* the copy and cannot
+        # see links that the copy itself created, so re-verify the staged entry on disk
+        # right before spawning.
         staged_workdir = stage_dir / relative_cwd
         staged_root_real = Path(os.path.realpath(stage_dir))
         if staged_workdir.is_symlink() or not Path(
@@ -614,6 +713,8 @@ def run_mutation_suite(
         _safe_rmtree_no_symlinks(stage_dir)
 
     metrics = _metrics(outcome, adapter=adapter, gate=gate, extra={"isolation": exec_meta})
+    # Runs after the ``finally`` above deleted the stage, so a sentinel here can only have
+    # been written into the *real* checkout by something that escaped confinement.
     violations = _untouched_violations(project_root, before_status)
 
     result = SuiteResult(

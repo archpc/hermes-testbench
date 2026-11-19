@@ -16,6 +16,34 @@ actionable per-case failures: that is the control proving the assertions bite.
 
 Never touches the ambient environment: no live Ghostty, no ambient tmux server, and
 every tmux invocation carries ``-L <disposable-socket>`` plus an isolated TMUX_TMPDIR.
+
+This file is only the CLI shell around ``run_haunted_terminal_probe``: it owns argument
+parsing, the one-line-per-case rendering, and the process exit code. Every measurement,
+invariant, and teardown lives in the fixture, so a change in what is *checked* belongs
+there and a change in how it is *printed* belongs here.
+
+Output contract (consumed by ``parse_pty_tmux`` and by humans):
+
+* ``PASS <case>`` / ``FAIL <case>: <why>`` / ``SKIP <case>: <why>`` -- one line per case.
+  These are the count that matters: ``parse_pty_tmux`` applies its marker grammar at
+  line start, so total/pass/fail/skip are derived from exactly these lines. The text
+  after ``FAIL <case>:`` is kept as the failure label, which is why the reason is on the
+  marker line rather than on a following line;
+* ``AREA <area> cases=N pass=N fail=N skip=N`` -- one line per area, always in
+  ``HAUNTED_TERMINAL_AREAS`` order and always present even when an area produced
+  nothing, so an empty area reads as ``cases=0`` rather than a vanished line;
+* ``HAUNTED_SUMMARY mode=... areas=8 total=... tmux=on|off pty=on|off`` -- the single
+  aggregate line. It uses ``pass=``/``fail=`` tokens, not ``"N passed"``, so the parser's
+  summary heuristic deliberately ignores it: counts come from the markers, and this line
+  exists for logs and humans;
+* ``HAUNTED_JSON=<json>`` -- only with ``--json``, the full report including per-area
+  buckets and the transport sub-reports.
+
+Exit code is ``0`` iff ``report["failed"] == 0``. That is *not* the same as "passed":
+an all-SKIP run exits 0 by this rule, which is why the summary also carries ``tmux=`` /
+``pty=`` availability and the fixture's own ``all_passed`` (``failed == 0 and passed >
+0``) is the stricter signal. The script deliberately does not substitute its exit code
+for that distinction.
 """
 
 from __future__ import annotations
@@ -25,6 +53,8 @@ import json
 from pathlib import Path
 import sys
 
+# Run as a bare script (``.testbench.toml`` invokes it by path), so the package beside
+# it is not importable yet: prepend the repo root rather than requiring an install.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hermes_testbench.fixtures import (  # noqa: E402
@@ -34,6 +64,27 @@ from hermes_testbench.fixtures import (  # noqa: E402
 
 
 def main(argv=None) -> int:
+    """Parse the CLI, run the probe, render markers, and return the exit code.
+
+    Arguments map 1:1 onto ``run_haunted_terminal_probe``:
+
+    ``--fault-injection``
+        route the checker through the defective renderer/geometry-caching child; the run
+        is *expected* to fail, and is used as the control that the assertions bite.
+    ``--no-tmux``
+        skip the disposable tmux transport; those cases become ``SKIP`` with
+        "tmux disabled by caller", not failures.
+    ``--scratch-root``
+        parent directory for the probe's temp tree (default: the isolation scratch
+        root). The tree is created by the fixture and removed in its ``finally``.
+    ``--json``
+        append the whole report as one ``HAUNTED_JSON=`` line after the summary.
+
+    ``argv`` defaults to ``sys.argv[1:]`` so the function is importable and callable from
+    a test with an explicit list. Side effects are confined to the scratch tree: the
+    probe spawns a PTY child and, unless ``--no-tmux``, a short-lived ``-L`` tmux server
+    which it kills during teardown.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--fault-injection",

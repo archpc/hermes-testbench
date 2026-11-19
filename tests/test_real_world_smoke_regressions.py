@@ -1,4 +1,23 @@
-"""Regression tests for real-repository integration edge cases discovered during smoke testing."""
+"""Regression tests for real-repository integration edge cases discovered during smoke testing.
+
+Each test pins one defect that only appeared against a real repository or a real host,
+so the fixtures are shaped like the failing environment (a path long enough to matter, a
+polyglot tree, a sandboxed ``ps``) rather than like the smallest legal input.
+
+Host-conditional by nature, and that is the honest part of this file:
+
+* the tmux case skips without a ``tmux`` binary;
+* the Seatbelt case asserts full network confinement only when ``sandbox-exec`` exists —
+  on Linux it asserts loopback only, because network isolation is not implemented there
+  (OPERATING-GUIDE 1.1);
+* the messaging case skips unless the host has both a ``hermes-agent`` checkout and an
+  ``agent-messaging`` artifact directory.
+
+A green run on a bare host therefore proves less than the test count suggests; the skips
+are the reason, not flakiness. Several tests also *execute* suites for real (``cargo``
+in discovery only, ``clang`` for the C sanitizer, the repo's own verifier scripts), so a
+missing toolchain shows up as a failing suite, not as a skip.
+"""
 
 from __future__ import annotations
 
@@ -29,7 +48,18 @@ from hermes_testbench.store import TestBenchStore
 
 
 def _deepcheck_pids() -> set[int]:
-    """PIDs whose argv is a ``tmux ... new-session -d -s deepcheck`` server, read from ``ps``."""
+    """PIDs whose argv is a ``tmux ... new-session -d -s deepcheck`` server, read from ``ps``.
+
+    Read from a snapshot rather than from tmux itself: the whole point is to catch a
+    server that tmux no longer acknowledges (an orphaned default server in a
+    ``TMUX_TMPDIR`` the killer never learned about), so asking tmux would be circular.
+
+    The filter is a substring match on ``new-session`` and ``-s deepcheck``. Two guards
+    matter: the ``ps`` line is skipped (its own argv contains ``ps -axo``, and a naive
+    match could catch the probe process), and non-numeric first fields are ignored.
+    The match is still coarse — any unrelated command carrying both tokens is counted —
+    which is why callers subtract a baseline instead of asserting an empty set.
+    """
     out = subprocess.run(
         ["/bin/ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5.0, check=False
     ).stdout
@@ -44,6 +74,8 @@ def _deepcheck_pids() -> set[int]:
 
 
 class RealWorldSmokeRegressionTests(unittest.TestCase):
+    """One class: every test needs a scratch tree under the real scratch root."""
+
     def setUp(self) -> None:
         scratch = default_scratch_root()
         self.tmp = tempfile.TemporaryDirectory(dir=str(scratch), prefix="tb-reg-")
@@ -54,6 +86,27 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("tmux"), "tmux unavailable")
     def test_deeply_nested_scratch_root_keeps_tmux_unix_socket_under_macos_sun_path_limit(self) -> None:
+        """A long scratch path must not leak a default tmux server, and must still work.
+
+        ``sun_path`` is 104 bytes and tmux appends ``/tmux-<uid>/<name>``, so a scratch
+        root this deep (asserted > 115 characters) cannot be used directly as the socket
+        base. ``run_tmux_lifecycle_probe`` proves the product found a short base;
+        ``available``/``crash_recovered``/``server_gone`` are its three verdicts and all
+        three matter — a probe that failed to crash-test would report ``clean`` for the
+        wrong reason.
+
+        The leak check is the regression proper. A bare ``tmux new-session`` ignores the
+        disposable ``-L`` socket and starts the *default* server under
+        ``$TMUX_TMPDIR/tmux-<uid>/default``, which ``-L <socket> kill-server`` cannot
+        reach; before the socket sweep this left one orphan per invocation (83
+        reproduced). Subtracting ``baseline_deepcheck`` means a server that was already
+        running before the test cannot be blamed on it, so the assertion fails only on a
+        new survivor.
+
+        The second isolated command is the positive control: a suite that *does* honour
+        ``TESTBENCH_TMUX_SOCKET`` must still succeed in the same deep root, so the sweep
+        cannot have been "fixed" by breaking the supported path.
+        """
         deep = self.root / ("nested_level_" * 6) / "sub"
         deep.mkdir(parents=True, exist_ok=True)
         self.assertGreater(len(str(deep)), 115)
@@ -84,7 +137,8 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
         # A bare `tmux new-session` lands on the default server inside TMUX_TMPDIR
         # ($TMUX_TMPDIR/tmux-<uid>/default), which `-L <socket> kill-server` never reaches.
         # Before the socket sweep in _kill_disposable_tmux this leaked one orphan per run
-        # (83 reproduced); it must now be gone the moment run_isolated_command returns.
+        # (83 reproduced when the finding was filed — provenance, not a count this tree
+        # can reproduce); it must now be gone the moment run_isolated_command returns.
         self.assertEqual(
             _deepcheck_pids() - baseline_deepcheck,
             set(),
@@ -106,6 +160,35 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
         self.assertEqual(res2.exit_code, 0, res2.stderr_text)
 
     def test_isolated_env_provides_readonly_cargo_and_uv_caches_without_credentials(self) -> None:
+        """Suite environments get usable build caches that carry no credentials.
+
+        ``CARGO_HOME`` is a fresh directory holding symlinks to ``registry``/``git``/
+        ``bin`` only. The two ``credentials`` checks are the reason that layout matters:
+        cargo reads credentials from the ``CARGO_HOME`` *root*, so sharing the caches by
+        symlink while leaving the root fresh makes the cache safe to share. Both
+        spellings are checked (``credentials.toml`` and the older ``credentials``)
+        because a toolchain that still reads the legacy name would otherwise see a file
+        this test declared absent. The ``uv`` cache links are part of the same isolation
+        contract but are *not* asserted here — the suite name is broader than its
+        assertions.
+
+        The Seatbelt profile must deny ``.cargo/credentials`` by name and the Hermes
+        dashboard port ``9119`` — a deny that is not in the profile is not a deny, and
+        the port rule is what keeps a sandboxed suite from talking to the live Hermes
+        UI.
+
+        The network probe asserts three different things from one run: an ephemeral
+        loopback bind+connect works (suites host mock servers), ``127.0.0.1:9119`` is
+        blocked, and ``1.1.1.1:53`` is blocked. ``LOOP=ok`` is required unconditionally;
+        the two ``*_BLOCKED`` flags are required only with ``sandbox-exec``, because
+        Linux has no network confinement and asserting it there would fail for a
+        documented reason.
+
+        The final ``/bin/ps`` run checks the ``(with no-sandbox)`` exec rule: a
+        sandboxed ``ps`` cannot read other processes, and tmux plus the hermes-tmux job
+        checks shell out to it. Comparing stdout to ``os.getpid()`` proves the child saw
+        the *real* process table rather than an empty sandboxed view.
+        """
         sb_dir = self.root / "sb"
         env = build_isolated_env(sb_dir, run_id="r1", nonce="n1")
         self.assertIn("CARGO_HOME", env)
@@ -166,6 +249,25 @@ class RealWorldSmokeRegressionTests(unittest.TestCase):
         self.assertEqual(r_ps.stdout_text.strip(), str(os.getpid()))
 
     def test_discovery_handles_cargo_lock_sibling_c_sqlite_cobol_harness_and_verify_docs_arg(self) -> None:
+        """A polyglot tree yields the right suite set, and two of those suites really run.
+
+        Several behaviours, one fixture: ``Cargo.lock`` present ⇒ ``--locked`` is appended
+        (a lockfile-less tree gets a different command, so its presence must be read, not
+        assumed); the GnuCOBOL TUI harness exists ⇒ ``cobol-unit`` is *not* emitted,
+        because sources are only scanned when there is no harness — emitting both would
+        compile the same programs twice and count them as independent evidence;
+        ``.c`` files are matched by ``*selftest*.c``, so ``term.c`` (a plain helper) is
+        ignored while ``selftest.c`` becomes ``c-sanitizer``; and ``verify-docs`` gets
+        ``"."`` appended because the script reads ``sys.argv[1]``, meaning discovery
+        folded a source-level fact into the command.
+
+        The last two thirds execute for real: ``c-sanitizer`` needs ``clang`` with
+        ASan/UBSan, ``verify-docs`` needs the interpreter to run the repo's script. Their
+        exit status is the assertion, with ``summary_excerpt`` attached so a failure
+        carries the compiler or script output instead of just ``FAIL``. Discovery
+        correctness is thus cross-checked against execution rather than against the
+        spec alone.
+        """
         proj = self.root / "poly"
         proj.mkdir()
         (proj / "Cargo.toml").write_text('[package]\nname = "p"\n', encoding="utf-8")

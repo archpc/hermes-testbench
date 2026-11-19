@@ -3,6 +3,19 @@
 The suite is exercised against a synthetic source tree and synthetic artifact so the
 tests stay hermetic: no live LLM, no gateway, no dependency on this host's Hermes
 checkout. A final integration check against the real artifact lives outside unittest.
+
+The fixture source files (``BOT_MODE_DM`` and friends) are *text*, never imported:
+the contract cases are substring greps over a known-good upstream vocabulary, so a
+fixture that is not valid Python is still a valid fixture. What the fixtures must
+contain, exactly, is the string each case looks for — that is why they are excerpts
+with comments about intent rather than runnable modules.
+
+Layout of this file mirrors the suite under test: ``ContractSuiteTests`` (the greps
+and evidence receipts), ``WiringSuiteTests`` (the only part that executes artifact
+code), ``PytestSuiteTests`` (opt-in upstream run) and ``SettlementFallbackTests``
+(this package's own notification→receipt fallback). Negative controls edit the
+fixture and re-run, so each important case is shown to fail when its behavior is
+removed, not merely to pass on the fixture.
 """
 
 from __future__ import annotations
@@ -230,6 +243,14 @@ print("\\nwiring OK")
 
 
 class _FixtureCase(unittest.TestCase):
+    """Build the temp tree, source fixtures and artifact once per test.
+
+    Both trees are rewritten from the constants on every ``setUp``, so a test
+    that mutates a fixture file (the negative controls) cannot leak state into
+    the next one. ``self.evidence`` is the run's own evidence dir: the contract
+    suite reads receipts from it as well as from the artifact.
+    """
+
     def setUp(self) -> None:
         scratch = Path.home() / ".hermes/cache/scratch"
         scratch.mkdir(parents=True, exist_ok=True)
@@ -272,13 +293,25 @@ class _FixtureCase(unittest.TestCase):
         script.chmod(0o700)
 
     def _suites(self, **kwargs):
+        """Run the verification against this test's fixture trees; extra kwargs pass through."""
         kwargs.setdefault("artifact_root", self.artifact)
         kwargs.setdefault("hermes_agent_root", self.src)
         return run_agent_messaging_verification(self.evidence, **kwargs)
 
 
 class ContractSuiteTests(_FixtureCase):
+    """Controls on the contract checklist: full green, two negative controls, one absent input."""
+
     def test_contract_suite_verifies_all_seven_behaviors_and_records_restart_skip(self) -> None:
+        """A green contract run must contain every required case, including the skip.
+
+        ``required`` names the 26 behaviors explicitly, so a case silently
+        dropped from ``_REQUIRED_CASES`` (or renamed) fails here instead of
+        shrinking the suite. ``total_count == len(cases)`` pins ``_suite``'s
+        derivation; the one SKIP is the mid-flight restart case — it is part of
+        the contract ("this was not verified"), so a green run has
+        ``pass_count == total_count - 1`` and never ``total_count``.
+        """
         suites = self._suites()
         by_name = {s.name: s for s in suites}
         self.assertIn("agent-messaging:contract", by_name)
@@ -328,6 +361,14 @@ class ContractSuiteTests(_FixtureCase):
         self.assertEqual(contract.pass_count, contract.total_count - 1)
 
     def test_quota_retry_exclusion_regression_fails_its_case_and_the_suite(self) -> None:
+        """Negative control: making quota errors retryable must turn c2 red.
+
+        The fixture is edited on disk, not mocked, so this goes through the same
+        regex parse a real source change would. Asserting the case *and* the
+        suite status catches a regression where a failing case stops propagating
+        into ``_status_for``; the message check keeps the failure attributed to
+        the quota reason rather than to some unrelated parse change.
+        """
         path = self.src / "tools" / "bot_failure_reasons.py"
         path.write_text(
             path.read_text(encoding="utf-8").replace(
@@ -344,6 +385,13 @@ class ContractSuiteTests(_FixtureCase):
         self.assertGreaterEqual(contract.fail_count, 1)
 
     def test_removed_duplicate_guard_fails_the_dedupe_case(self) -> None:
+        """Negative control: dropping the ``bot_turn`` scope breaks exactly e1.
+
+        The case greps for the full guarded expression, so removing the bot-turn
+        condition fails it; that is what distinguishes "a duplicate guard exists"
+        from "the guard applies to bot turns only", which is the documented gap
+        for human-originated turns.
+        """
         path = self.src / "agent" / "bot_chain.py"
         path.write_text(
             path.read_text(encoding="utf-8").replace(
@@ -356,6 +404,12 @@ class ContractSuiteTests(_FixtureCase):
         self.assertIn("e1_bot_turn_duplicate_send_is_refused", failed)
 
     def test_missing_source_tree_marks_every_contract_case_skipped_not_passed(self) -> None:
+        """An unconfigured host must not look verified: absent tree → all SKIP.
+
+        ``pass_count == 0`` is asserted in addition to the statuses because a
+        caller that only aggregates statuses can still read SKIP as green; the
+        message check keeps the reason "source" rather than a generic skip.
+        """
         contract = {
             s.name: s
             for s in run_agent_messaging_verification(
@@ -371,7 +425,16 @@ class ContractSuiteTests(_FixtureCase):
 
 
 class WiringSuiteTests(_FixtureCase):
+    """The only suite that executes artifact code, so it is tested in both directions."""
+
     def test_wiring_suite_passes_on_a_synthetic_wired_home_and_flags_an_unwired_one(self) -> None:
+        """A wired home passes and an empty one is flagged — in the same run.
+
+        A checker that always exits 0 would satisfy the first case alone, which
+        is why w2 exists: requiring the unwired fixture to fail is what makes w1
+        evidence. Case statuses and the suite status are both asserted so a
+        wiring regression is visible at either level.
+        """
         suites = {s.name: s for s in self._suites()}
         wiring = suites["agent-messaging:wiring"]
         cases = {c.name: c for c in wiring.cases}
@@ -383,6 +446,12 @@ class WiringSuiteTests(_FixtureCase):
         self.assertIn("wiring", wiring.summary_excerpt.lower())
 
     def test_missing_artifact_root_skips_wiring_suite(self) -> None:
+        """No artifact root drops the suite rather than reporting it red.
+
+        Absence of the thing under test is not a failure — the contract suite
+        still runs and SKIPs its evidence cases — so this asserts only that the
+        wiring suite is absent from the result list.
+        """
         suites = {
             s.name: s
             for s in run_agent_messaging_verification(
@@ -393,11 +462,20 @@ class WiringSuiteTests(_FixtureCase):
 
 
 class PytestSuiteTests(_FixtureCase):
+    """The upstream pytest run is opt-in and must announce a skip when it cannot run."""
+
     def test_no_pytest_suite_without_opt_in(self) -> None:
+        """The default run must never spawn the upstream interpreter."""
         names = {s.name for s in self._suites()}
         self.assertNotIn("agent-messaging:pytest", names)
 
     def test_opt_in_without_a_venv_records_an_explicit_skip(self) -> None:
+        """Opting in without ``venv/bin/python`` is a recorded SKIP, not an omission.
+
+        ``skip_count == 1`` is asserted because the suite exists specifically to
+        say "this could not run"; a missing suite would be indistinguishable from
+        a passing one in any aggregate that only counts suites.
+        """
         suites = {s.name: s for s in self._suites(run_hermes_pytest=True)}
         self.assertIn("agent-messaging:pytest", suites)
         self.assertEqual(suites["agent-messaging:pytest"].status, RunStatus.SKIP)
@@ -405,7 +483,15 @@ class PytestSuiteTests(_FixtureCase):
 
 
 class SettlementFallbackTests(_FixtureCase):
+    """Receipt-path validation and the notification→file→missing fallback chain.
+
+    These exercise ``hermes_testbench.messaging_suite``'s own helpers, not the
+    artifact's delivery code: the fallback order asserted here is the one this
+    module documents, and the contract suite's g4 case re-runs the same logic.
+    """
+
     def _write_receipt(self, profile_home: Path, delivery_id: str, status: str = "settled") -> Path:
+        """Write a minimal durable receipt at the canonical path for ``delivery_id``."""
         path = delivery_receipt_path(profile_home, delivery_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -422,6 +508,11 @@ class SettlementFallbackTests(_FixtureCase):
         return path
 
     def test_receipt_path_is_the_runtime_bot_live_delivery_file(self) -> None:
+        """The path shape is what the durable-receipt cases and ``g4`` rely on.
+
+        ``profile_home`` is resolved before joining, so the returned path is
+        always absolute regardless of how the caller spelled the root.
+        """
         delivery_id = "ab" * 32
         path = delivery_receipt_path(self.root / "profile", delivery_id)
         self.assertEqual(
@@ -433,11 +524,24 @@ class SettlementFallbackTests(_FixtureCase):
         )
 
     def test_traversal_and_short_ids_are_rejected(self) -> None:
+        """The id is used as a filename, so validation *is* the traversal defence.
+
+        ``"../../etc/passwd"`` is the traversal case; ``"abc"`` and ``""`` are
+        the too-short and empty cases; ``"ZZ" * 20`` is the right length but not
+        lowercase hex, which is what makes ``fullmatch`` (not a length check) the
+        thing under test.
+        """
         for bad in ("../../etc/passwd", "abc", "ZZ" * 20, ""):
             with self.assertRaises(ValueError):
                 delivery_receipt_path(self.root / "profile", bad)
 
     def test_truncated_notification_falls_back_to_the_durable_receipt_file(self) -> None:
+        """A truncated notification has no JSON line, so the file is the only source.
+
+        ``source == "receipt_file"`` discriminates the fallback from the
+        notification path, and the reply text proves the payload was read from
+        the file rather than synthesized from the delivery id.
+        """
         profile = self.root / "profile"
         delivery_id = "cd" * 32
         self._write_receipt(profile, delivery_id)
@@ -452,6 +556,12 @@ class SettlementFallbackTests(_FixtureCase):
         self.assertEqual(result["delivery_id"], delivery_id)
 
     def test_complete_notification_json_is_preferred_over_the_file(self) -> None:
+        """Precedence: a matching notification line wins even when a file exists.
+
+        The file says ``settled`` and the notification says ``failed``, so a
+        result of ``failed``/``notification`` proves precedence rather than
+        agreement between the two channels.
+        """
         profile = self.root / "profile"
         delivery_id = "ef" * 32
         self._write_receipt(profile, delivery_id)
@@ -465,6 +575,12 @@ class SettlementFallbackTests(_FixtureCase):
         self.assertEqual(result["status"], "failed")
 
     def test_unknown_delivery_without_either_channel_is_reported_as_missing(self) -> None:
+        """Neither channel has data, so the result is ``source == "missing"`` and
+        ``status == "ambiguous"``; it never guesses settled.
+
+        ``ambiguous`` is the safe answer because the caller's documented retry
+        policy treats it as "do not resend" rather than as a failure to replay.
+        """
         result = settlement_from_notification(
             "truncated", profile_home=self.root / "profile", delivery_id="12" * 32
         )

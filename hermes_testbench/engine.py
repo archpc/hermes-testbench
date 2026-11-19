@@ -1,4 +1,33 @@
-"""Single orchestration engine shared by CLI, detached workers, MCP server, and TUI."""
+"""Single orchestration engine shared by CLI, detached workers, MCP server, and TUI.
+
+The engine owns the *run lifecycle* and nothing else: ``discovery`` decides what to run,
+``adapters`` decide how, ``isolation`` decides where, ``store`` decides what is true. Four
+surfaces call these same methods, so everything documented here holds for ``testbench run``,
+``testbench _worker``, the MCP server and the TUI alike.
+
+Run status machine — one writer per run, enforced by the ``runs/<id>/run.lock`` flock::
+
+    QUEUED --(worker takes lock)--> RUNNING --> PASS | FAIL | SKIP | BLOCKED
+                                            \\-> TIMEOUT | CANCELLED | ERROR
+
+* :meth:`run_sync` commits the row ``RUNNING`` before taking the lock; finalization may
+  write without it (the store module states the one-writer rule precisely).
+* :meth:`spawn_async` creates the row ``QUEUED`` and returns; a detached ``_worker`` takes
+  the lock later, flips ``RUNNING``, executes, finalizes.
+* A row left ``QUEUED``/``RUNNING`` with an *unheld* lock was abandoned (SIGKILL, ``^C`` on a
+  foreground run, host power loss). ``TestBenchEngine.__init__`` reconciles it to
+  ``ERROR``/``abandoned_worker`` and keeps it: that record is legitimate history. Nothing
+  here deletes or hides an interrupted run — a half-finished run that disappears makes "no
+  data" look like "no problem".
+* Cancellation is cooperative first (``cancel.flag`` in the evidence dir, polled at most
+  every 50ms by the isolation reader loop) and terminal second (fingerprinted
+  SIGTERM→SIGKILL of the run's *own* process group). It never signals the caller's group.
+
+Aggregation runs bottom-up: per-suite status → :func:`_aggregate_run_status` → run status.
+Status writes are last-writer-wins in the store (``ON CONFLICT DO UPDATE``), and the one
+fence that keeps a cancelled run from being rewritten as ``PASS`` is the ``cancel.flag``
+re-check inside :meth:`TestBenchEngine._populate_and_finalize`.
+"""
 
 from __future__ import annotations
 
@@ -114,6 +143,21 @@ def check_scoped_access(
     *,
     allowed_roots: Optional[Sequence[Path]] = None,
 ) -> Path:
+    """Resolve ``target`` or raise :class:`AuthorizationError`.
+
+    Order is the security property, so it is written top-down: (1) resolve strict and refuse
+    anything that cannot be resolved, (2) refuse the enumerated Hermes runtime paths
+    (``skills``, ``plugins``, ``memories``, ``sessions``, ``profiles``, ``mcp-tokens``,
+    ``logs``, ``state.db``, credentials) *before* any allow rule can match, (3) honour an
+    explicit registration, (4) honour ``allowed_roots``, (5) refuse every remaining path under
+    ``~/.hermes`` except ``artifacts``. Registration therefore widens the allowlist for
+    project trees but can never unlock the enumerated runtime paths.
+
+    The ``p.exists() or not p.suffix`` filter only skips enumerated *files* that are absent;
+    their parent directory deny and the step-5 blanket catch the rest, which is why a missing
+    ``auth.json`` is not a hole. ``allowed_roots`` is passed by callers that construct an
+    engine with a fixed scope (MCP) rather than reading the environment variable.
+    """
     try:
         resolved = target.expanduser().resolve(strict=True)
     except OSError as exc:
@@ -275,6 +319,21 @@ def _fallback_execute_suite(
     on_spawn: Optional[Any] = None,
     on_output: Optional[Callable[[str], None]] = None,
 ) -> Tuple[SuiteResult, Optional[Dict[str, Any]]]:
+    """Degraded single-pass executor used only when ``hermes_testbench.adapters`` is absent.
+
+    This path is the reason a stripped install still runs: it enforces the two pre-spawn
+    gates itself (billable, untrusted-manifest network/repo-write), then runs the argv under
+    isolation and reduces "exit 0" to one ``PASS``/``FAIL`` case with no structured parsing.
+
+    The ``try`` spans both the import *and* the call: ``ImportError`` raised from inside
+    ``execute_suite`` is indistinguishable here from "adapters not installed", so such a
+    suite silently falls through to this bare executor and runs a second time. Narrow the
+    ``try`` to the import if that is ever fixed; it is a defect, not a design choice.
+
+    A blocked suite returns ``BLOCKED`` with ``failures=[]``; which gate fired is then only
+    recoverable from ``summary_excerpt``, unlike the adapter path which records a
+    ``FailureKind``.
+    """
     try:
         from .adapters import execute_suite  # type: ignore
         return execute_suite(
@@ -445,6 +504,14 @@ def _blocked_failure_kind(suites: List[SuiteResult]) -> str:
 
 
 def _failed_suite_kind(suites: List[SuiteResult]) -> str:
+    """Pick the failure kind that best explains a mixed set of failing suites.
+
+    ``assertion`` wins over ``sandbox_denied`` on purpose: a sandbox denial usually surfaces
+    as an assertion or spawn error deeper in, and reporting the mechanism instead of the
+    observed failure sends the reader to the wrong place. ``harness_error`` is only inferred
+    when a failing suite counted errors and no failures — otherwise the absence of a kind
+    defaults to ``assertion``, which is the honest "a suite failed, we do not know why".
+    """
     failing = [s for s in suites if s.status == RunStatus.FAIL]
     kinds = [f.kind for s in failing for f in s.failures if f.kind]
     if FailureKind.ASSERTION in kinds:
@@ -459,10 +526,12 @@ def _failed_suite_kind(suites: List[SuiteResult]) -> str:
 
 
 def _apply_mutation_gate(suites: List[SuiteSpec], mutation_gate: Optional[float]) -> None:
-    """Stamp an operator-supplied mutation gate onto the selected suites.
+    """Stamp an operator-supplied mutation gate onto the selected suites (in place).
 
     A CLI gate is trusted by construction, unlike ``mutation_score_gate`` in a manifest,
-    which only counts once the manifest itself is trusted.
+    which only counts once the manifest itself is trusted. The value is validated as a
+    finite fraction here — out of range would otherwise make every mutation suite pass or
+    fail for the wrong reason, and the failure would look like a test result.
     """
     if mutation_gate is None:
         return
@@ -479,6 +548,20 @@ def _apply_mutation_gate(suites: List[SuiteSpec], mutation_gate: Optional[float]
 
 
 def _aggregate_run_status(suites: List[SuiteResult]) -> Tuple[str, Optional[str]]:
+    """Collapse per-suite statuses into one run status and failure kind.
+
+    Strict precedence, worst-wins: ``CANCELLED`` > ``ERROR`` > ``TIMEOUT`` > ``FAIL`` >
+    ``BLOCKED`` > ``SKIP``, with ``PASS`` last. Rationale for the top of that order: a
+    cancelled run must never read as a pass (it fenced the whole attempt), and an
+    ``ERROR`` — a harness fault — must not be reported as an ordinary assertion failure,
+    because the suite's verdict is unknown. ``TIMEOUT`` outranks ``FAIL`` for the same
+    reason: "did not finish" is not "failed".
+
+    ``BLOCKED`` is checked twice on purpose. An all-blocked set is ``BLOCKED``; a mixed set
+    with at least one ``PASS`` also ends ``BLOCKED`` (something was not evaluated — that is
+    not a green run); a ``BLOCKED``+``SKIP`` set takes the ``not any(PASS)`` branch and lands
+    in the same place. The ``SKIP``-only and empty cases are ``SKIP`` with no failure kind.
+    """
     if not suites:
         return RunStatus.SKIP, None
     statuses = [s.status for s in suites]
@@ -503,6 +586,24 @@ MAX_FLAKE_REPEATS = 100
 
 
 class TestBenchEngine:
+    """Owns run lifecycle for every surface: CLI, ``_worker``, MCP, TUI.
+
+    Collaboration: ``store`` is authoritative (rows, evidence dirs, run locks, trust registry);
+    ``discover_fn`` produces the suite list; ``execute_suite_fn`` runs one suite and returns
+    ``(SuiteResult, usage)``. Both are injectable for tests, which is why the shapes of those
+    callables are effectively part of this module's contract.
+
+    Constructing an engine calls ``store.reconcile_orphans()`` as a side effect: any run row
+    left ``QUEUED``/``RUNNING`` whose ``run.lock`` is unheld is rewritten to ``ERROR`` /
+    ``abandoned_worker``. Every surface constructs an engine, so a crashed worker is accounted
+    for by whoever looks at the store next — including a TUI that only renders. That is why
+    reconciliation happens here and not in ``run_sync``: readers must not be able to see an
+    eternal ``RUNNING``, and the record must survive rather than be deleted.
+
+    ``close()`` only closes a store this engine created; an injected store belongs to the
+    caller (the CLI wraps one store around one engine; MCP and the TUI each own theirs).
+    """
+
     def __init__(
         self,
         store: Optional[TestBenchStore] = None,
@@ -539,6 +640,13 @@ class TestBenchEngine:
         profile: Optional[str] = None,
         suite_names: Optional[Sequence[str]] = None,
     ) -> List[SuiteSpec]:
+        """Filter suites by explicit names, else by profile.
+
+        Naming suites overrides the profile filter entirely (including ``profile="all"``),
+        so ``run X --suite a --suite b`` cannot be silently widened by a profile. An empty
+        result is not an error at this layer: ``run_sync`` finalizes ``SKIP`` and the CLI
+        turns "you named a suite that does not exist" into a non-zero exit.
+        """
         wanted_names = set(suite_names or ())
         selected: List[SuiteSpec] = []
         for s in spec.suites:
@@ -556,6 +664,27 @@ class TestBenchEngine:
         usages: List[Dict[str, Any]],
         t0: float,
     ) -> RunRecord:
+        """Sum the suite results, derive run-level fields, and finalize the row.
+
+        Everything here is derivation from ``suite_results`` plus one fence:
+
+        * counts are plain sums; ``duration_ms`` is wall-clock from ``t0`` (monotonic), which
+          is why a run can take longer than the sum of its suites (discovery, teardown).
+        * the **cancel fence** (``cancel.flag`` on disk, or ``CANCELLED`` already in the
+          store) overrides the aggregate. Without it a worker that noticed the flag only
+          after its last suite finished would rewrite a cancelled run as ``PASS``, because
+          the store's upsert is last-writer-wins.
+        * ``exit_code`` is the first non-zero suite exit, ``0`` when every suite exited 0, and
+          ``None`` for a cancelled/timed-out run with no non-zero code — a cancelled run has
+          no meaningful exit status and inventing one would invite scripting on it.
+        * ``first_failure`` prefers a structured ``FailureRecord`` and falls back to the first
+          line of a non-pass suite's summary, so a ``BLOCKED`` or ``TIMEOUT`` run still says
+          something useful.
+        * ``repro_instructions`` prefers the non-passing suites, then everything, deduped in
+          order; ``&&``-joined because the field is read by humans and by ``repro.sh``.
+        * ``model_usage`` is ``None`` unless a suite actually measured tokens; nothing here
+          estimates usage.
+        """
         run.suites = suite_results
         run.duration_ms = round((time.monotonic() - t0) * 1000.0, 2)
         run.total_count = sum(s.total_count for s in suite_results)
@@ -635,6 +764,40 @@ class TestBenchEngine:
         env_meta: Optional[Dict[str, Any]] = None,
         on_output: Optional[Callable[[str], None]] = None,
     ) -> RunRecord:
+        """Run the selected suites now, in this process, and return the finalized record.
+
+        Sequence, and why it is in this order:
+
+        1. resolve + discover *outside* the lock. Discovery can be slow (git, manifest parse)
+           and must not be able to hold a run's lock; a concurrently-granted cancel then
+           applies to a run that has no suite rows yet, which the flag check below absorbs.
+        2. ``store.create_run`` writes ``RUNNING`` and creates ``runs/<id>/`` (``0700``).
+           From here on, a crash leaves a reconcilable row rather than nothing.
+        3. everything else happens under ``hold_run_lock``. Only one process may execute a
+           run id; a second holder gets ``EWOULDBLOCK`` and the exception path finalizes
+           ``ERROR``/``harness_error`` instead of racing.
+        4. per suite: re-check ``cancel.flag`` *before* spawning, then execute. A cancel that
+           lands mid-suite is handled inside isolation (the reader loop polls the same flag),
+           so the flag is read in two places on purpose — before, to avoid starting work, and
+           during, to stop it.
+        5. ``_populate_and_finalize`` aggregates and writes ``run.json``/``junit.xml``/
+           ``repro.sh`` plus the DB row.
+
+        Failure handling: any exception from discovery, execution or the store is caught and
+        the run is finalized ``ERROR``/``harness_error`` with ``first_failure`` naming the
+        exception. Swallowing it is deliberate — the alternative is an exception escaping into
+        a TUI render loop or an MCP frame, and an unfinalized row that reads as ``RUNNING``
+        forever. ``KeyboardInterrupt`` is *not* caught (it is a ``BaseException``): it unwinds,
+        the lock is released, ``run_isolated_command``'s ``finally`` still kills the suite, and
+        the row stays ``RUNNING`` until the next engine reconciles it to ``ERROR``. That
+        interrupted record is correct history and is never rewritten to look deliberate.
+
+        ``worker_pid``/``worker_pgid``/``worker_start_time`` are persisted at each spawn so a
+        *different* process (``testbench cancel``) can signal the suite group it does not own.
+        They are cleared in memory after each suite but not in the store: a stale pointer is
+        harmless because the start-time fingerprint makes a recycled pid unmatchable, while a
+        missing pointer would make cancellation impossible.
+        """
         resolved = self.resolve_target(target, enforce_scope=enforce_scope)
         spec = self._discover_fn(resolved, store=self.store)
         suites = self._select_suites(spec, profile=profile, suite_names=suite_names)
@@ -709,7 +872,12 @@ class TestBenchEngine:
                             **({"on_output": on_output} if on_output is not None else {}),
                         )
                     except TypeError:
-                        # Custom injected _execute_suite_fn in unit tests without on_spawn kwarg
+                        # Retry once without on_output, for injected execute_suite callables
+                        # that predate the streaming kwarg (test doubles, older adapters).
+                        # Broad by necessity and therefore hazardous: a TypeError raised
+                        # *inside* the call is indistinguishable from a signature mismatch
+                        # here, and the suite is then executed a second time, bare, with no
+                        # adapter parsing and no streaming.
                         sres, usage = self._execute_suite_fn(
                             s,
                             project_root=resolved,
@@ -720,6 +888,10 @@ class TestBenchEngine:
                             max_tokens=max_tokens,
                             cancel_flag_path=cancel_flag,
                         )
+                    # Cleared in memory only: the store keeps the last child's (pid, pgid,
+                    # start_fp) until the next suite overwrites it. Deliberate — a stale
+                    # pointer is unmatchable thanks to the fingerprint, whereas dropping it
+                    # would leave an in-flight run uncancellable.
                     run.worker_pid = None
                     run.worker_pgid = None
                     run.worker_start_time = None
@@ -818,6 +990,34 @@ class TestBenchEngine:
         delegation_id: Optional[str] = None,
         mutation_gate: Optional[float] = None,
     ) -> RunRecord:
+        """Create a ``QUEUED`` run and hand it to a detached ``_worker`` process.
+
+        The parent does only four things: allocate the run id, write the row (``QUEUED``, with
+        the suite argv already recorded so the TUI can show what will run), spawn the worker,
+        and persist the worker's ``(pid, pgid, start_time)``. Execution happens in the child,
+        so the caller may exit immediately — that is the entire point of the split, and why
+        this surface is also what MCP uses.
+
+        Details that are easy to break:
+
+        * ``start_new_session=True`` makes the worker's pgid equal to its pid, which is what
+          makes the recorded ``worker_pgid`` a killable group rather than the caller's.
+        * The worker must import *this* package, so ``PYTHONPATH`` is prefixed with
+          ``repo_package_root()`` and ``cwd`` is that root. A source tree, a site-packages
+          dir and a zipapp all work; a zipapp cannot be a ``cwd``, hence the ``is_dir`` test.
+        * ``TESTBENCH_HOME`` is exported so the worker opens the same store the parent wrote
+          the row into; without it the worker would use its own default home and never find
+          the run.
+        * ``proc.wait`` runs in a daemon thread purely to reap the direct child if it exits
+          early; the run's own lifecycle is driven by the worker's DB rows, not by this handle.
+        * The fingerprint is sampled *after* ``Popen``; a child that died during import
+          fingerprints as ``None``, and ``cancel`` then refuses to signal it (no proof of
+          ownership) and finalizes the row instead.
+
+        ``wait_up_to_s`` bounds how long the caller blocks waiting for a terminal status
+        (clamped to 0–30s). Returning a still-``QUEUED``/``RUNNING`` record is normal: MCP
+        and the TUI poll the store, the CLI prints an id.
+        """
         resolved = self.resolve_target(target, enforce_scope=enforce_scope)
         spec = self._discover_fn(resolved, store=self.store)
         suites = self._select_suites(spec, profile=profile, suite_names=suite_names)
@@ -913,6 +1113,31 @@ class TestBenchEngine:
         timeout_s: Optional[float] = None,
         mutation_gate: Optional[float] = None,
     ) -> int:
+        """Detached worker entry point (``testbench _worker``): execute a ``QUEUED`` run.
+
+        Exit codes are a harness contract: ``0`` when the run finalized ``PASS`` or ``SKIP``,
+        ``1`` for anything else (including a worker-side exception), ``2`` when the run id is
+        unknown to the store — the last one means the worker was pointed at the wrong home.
+
+        Two behaviors here that the foreground path does not have:
+
+        * ``SIGTERM``/``SIGINT`` install a handler that writes ``cancel.flag`` and returns.
+          This is what makes ``cancel()``'s fingerprinted SIGTERM a *cooperative* request
+          rather than a kill: the worker keeps running long enough to let isolation stop the
+          suite group and write the evidence. A second SIGKILL from the canceller, or any
+          crash before the handler runs, is what ``reconcile_orphans`` exists for.
+        * The worker records its *own* pid/pgid while running suites and never records the
+          suite child's — there is no ``on_spawn`` wiring on this path. So a cancel of an
+          async run signals the worker's group, and the suite group is only stopped if the
+          worker survives long enough to notice the flag. (Documented, not fixed here.)
+
+        ``RUNNING`` is written after the lock is acquired, so a row can never claim to be
+        executing while no one holds its lock. It is written unconditionally, though: a
+        ``CANCELLED`` row for a run cancelled before the worker started can be flipped back
+        to ``RUNNING`` for as long as this worker lives. The finalize step re-reads the flag
+        and lands on ``CANCELLED`` again, so the end state is right and the intermediate state
+        is a known monotonicity break.
+        """
         rec = self.store.get_run(run_id)
         if rec is None:
             return 2
@@ -996,6 +1221,31 @@ class TestBenchEngine:
             signal.signal(signal.SIGINT, old_int)
 
     def cancel(self, run_id: str) -> RunRecord:
+        """Ask a run to stop, then make it stop. Idempotent for terminal runs.
+
+        Three escalating steps, each narrower than the last:
+
+        1. write ``cancel.flag`` (``0600``) into the run's evidence dir. Every execution path
+           polls it: the engine between suites, ``run_isolated_command`` every ≤50ms inside a
+           suite. Cooperative, so evidence and teardown still complete.
+        2. wait up to 1.5s for the run to reach a terminal status while its lock is held,
+           then **signal only a verified owned group**. All of these must hold:
+           the run is still non-terminal, its ``run.lock`` is still held, ``worker_pgid > 1``,
+           it is not *our* pgid, and ``worker_start_time`` is recorded and matches. That
+           conjunction is ADR-0005's R1 fix — before it, a run whose ``worker_pgid`` had been
+           recorded as ``os.getpgrp()`` could SIGTERM the caller's own shell job.
+        3. finalize ``CANCELLED`` unconditionally if the row is still non-terminal.
+
+        Step 3 does not require the lock, so this method can write ``CANCELLED`` while a
+        worker still owns the run. That is intentional (a cancel must never be unable to
+        complete because the worker is wedged) and it is why the worker re-checks the flag
+        and why ``_populate_and_finalize`` fences on it. The cost is a visible
+        ``CANCELLED → RUNNING → CANCELLED`` flap when a queued worker starts just after a
+        cancel; the end state is correct.
+
+        ``KeyError`` for an unknown id — the CLI turns that into a non-zero exit, and that
+        check is also what keeps this from creating evidence dirs for arbitrary strings.
+        """
         rec = self.store.get_run(run_id)
         if rec is None:
             raise KeyError(f"Unknown TestBench run_id: {run_id}")
@@ -1045,6 +1295,34 @@ class TestBenchEngine:
         print_only: bool = False,
         enforce_scope: bool = False,
     ) -> Dict[str, Any]:
+        """Re-execute a historical run as a *new* run, or just print its command.
+
+        Three replay paths, tried in order, because the recorded data differs by age:
+
+        1. ``print_only`` — return the stored repro command (or rebuild it from
+           ``orig.commands``) without touching the target. Always safe, always cheap.
+        2. agent-messaging verification runs — they are not suite-argv runs at all, so they
+           are replayed through ``run_agent_messaging_verification`` with the artifact root
+           the *original* recorded (``environment['messaging_artifact_root']``; older runs
+           fall back to comparing the recorded project root against the default).
+        3. runs with persisted suites — replay the recorded argv verbatim, without
+           rediscovery, so a changed ``.testbench.toml`` cannot silently alter the repro.
+           Isolation flags (``needs_tmux``/``needs_pty``/``allow_*``) are recovered from each
+           suite's ``isolation_meta``, which is why adapters must record them there; trust is
+           re-read from the store (a repro of a now-untrusted manifest is blocked, correctly).
+
+        A run with no persisted suites falls back to a plain ``run_sync`` by profile — the
+        weakest path, and the only one where discovery can pick different suites.
+
+        Invariants: the source record is never mutated, every path allocates a fresh
+        ``new_run_id()`` and evidence dir, and the new profile is prefixed ``repro:``. Only the
+        messaging path strips an existing prefix (``base_profile``), so a repro of a
+        suite-replay record accumulates ``repro:repro:...`` — cosmetic, but do not "fix" one
+        path without checking the other. A failure inside the replay is captured as
+        ``ERROR``/``harness_error`` on the new record and returned. An unknown id raises
+        ``KeyError``; ``resolve_target`` runs before the replay's ``try``, so a moved or
+        deleted ``project_root`` can still raise ``OSError``.
+        """
         orig = self.store.get_run(run_id)
         if orig is None:
             raise KeyError(f"Unknown run_id: {run_id}")
