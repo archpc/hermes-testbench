@@ -271,5 +271,40 @@ class UnittestDocstringVerboseTests(unittest.TestCase):
         self.assertEqual(outcome.cases[0]["name"], "test_dots (tests.test_x.DocTests.test_dots)")
 
 
+class MutmutRedactedVerdictTests(unittest.TestCase):
+    """The in-stream redactor over-matches identifier: value lines whose key
+    merely CONTAINS a secret word: 'x_redact_secrets__mutmut_1: killed' has
+    its status replaced with [REDACTED] (sanitize._ENV_ASSIGN_RE). Observed on
+    run tb_20261119_192933_f59f14bb: all 37 verdicts of the redaction function
+    itself were corrupted and then silently dropped by the parser, shrinking
+    the score denominator. Redaction must stay fail-closed, but the loss must
+    be VISIBLE: a redacted verdict is an inconclusive case, never a drop.
+    """
+
+    def test_redacted_status_is_inconclusive_not_dropped(self) -> None:
+        results_text = (
+            "    pkg.x_redact_secrets__mutmut_1: [REDACTED]\n"
+            "    pkg.x_helper__mutmut_1: killed\n"
+        )
+        outcome = parse_mutmut("", results_text=results_text)
+        self.assertEqual(outcome.buckets["caught"], 1)
+        self.assertEqual(outcome.buckets["inconclusive"], 1)
+        self.assertEqual(outcome.total, 2)
+        by_name = {c["name"]: c for c in outcome.cases}
+        self.assertEqual(by_name["pkg.x_redact_secrets__mutmut_1"]["status"], "SKIP")
+        self.assertEqual(len(by_name), 2)
+
+    def test_fully_redacted_listing_is_structured_not_silent(self) -> None:
+        results_text = (
+            "    pkg.x_redact_secrets__mutmut_1: [REDACTED]\n"
+            "    pkg.x_redact_secrets__mutmut_2: [REDACTED]\n"
+        )
+        outcome = parse_mutmut("", results_text=results_text)
+        self.assertTrue(outcome.structured)
+        self.assertEqual(outcome.buckets["inconclusive"], 2)
+        self.assertEqual(outcome.total, 2)
+        self.assertEqual(outcome.passed, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

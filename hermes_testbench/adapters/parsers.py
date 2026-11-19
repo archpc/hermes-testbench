@@ -721,6 +721,10 @@ _MUTMUT_STATUS_BUCKET: Dict[str, str] = {
     "suspicious": "inconclusive",
     "check was interrupted by user": "inconclusive",
     "segfault": "inconclusive",
+    # The in-stream redactor can corrupt a verdict line whose mutant name
+    # contains a secret word ("x_redact_secrets__mutmut_1: killed" -> status
+    # [REDACTED]). Keep the loss visible as inconclusive, never a silent drop.
+    "[redacted]": "inconclusive",
 }
 
 _MUTMUT_EMOJI_BUCKET: Dict[str, str] = {
@@ -770,7 +774,7 @@ _MUTTALLY_BUCKET = {
 # method names with the Unicode class marker ``ǁ`` (U+01C1), so the name class
 # must be Unicode-aware (\w), not ASCII-only, or every class-method verdict is
 # silently dropped and the score denominator is wrong.
-_MUTMUT_RESULT_LINE_RE = re.compile(r"^\s*(?P<name>[\w.\-]+):\s*(?P<status>[a-z][a-z \t]*[a-z])\s*$")
+_MUTMUT_RESULT_LINE_RE = re.compile(r"^\s*(?P<name>[\w.\-]+):\s*(?P<status>[a-z][a-z \t]*[a-z]|\[REDACTED\])\s*$")
 _MUTMUT_EMOJI_TALLY_RE = re.compile(r"(🎉|🧙|🙁|⏰|🫥|🤔|🔇|🛑|💥)\s*(\d+)")
 
 _CARGO_BASELINE_FAILURE_MARKERS = (
