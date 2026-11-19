@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import shutil
 import sqlite3
 import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -18,7 +20,7 @@ from hermes_testbench.schema import (
     SuiteResult,
     new_run_id,
 )
-from hermes_testbench.store import SchemaMismatchError, TestBenchStore
+from hermes_testbench.store import SCHEMA_VERSION, SchemaMismatchError, TestBenchStore
 
 
 def _concurrent_writer(store_dir: str, worker_idx: int, count: int) -> int:
@@ -234,6 +236,56 @@ class StoreTests(unittest.TestCase):
         runs = store.list_runs(limit=100)
         self.assertEqual(len(runs), 48)
         self.assertTrue(all(r.status == RunStatus.PASS for r in runs))
+
+    def test_concurrent_first_open_of_fresh_home_does_not_lock(self) -> None:
+        # Regression: several connections first-opening the SAME fresh home race
+        # on the WAL switch + schema probe/DDL. Before the fix this raised
+        # sqlite3.OperationalError "database is locked" (~38% of 4-thread trials)
+        # and, via a torn user_version/has_runs read, a spurious SchemaMismatchError.
+        # This is what killed test_r1's worker thread on macos-15 CI: the poll
+        # loop opened the store while the runner thread was still initializing
+        # it, the runner died, and no RUNNING row ever appeared. The fix retries
+        # BUSY/LOCKED and runs the probe+DDL under one BEGIN IMMEDIATE. The barrier
+        # forces simultaneous first-open; 40 trials x 8 threads make a base
+        # regression essentially certain to surface.
+        errors: list[BaseException] = []
+        parents: list[Path] = []
+        home = None
+        try:
+            for _ in range(40):
+                parent = Path(tempfile.mkdtemp(prefix="tb-race-"))
+                parents.append(parent)
+                home = parent / "tb"
+                barrier = threading.Barrier(8)
+
+                def opener() -> None:
+                    try:
+                        barrier.wait(timeout=15)
+                        with TestBenchStore(home) as st:
+                            st.list_runs(limit=1)
+                    except BaseException as exc:  # noqa: BLE001 - record any failure
+                        errors.append(exc)
+
+                threads = [threading.Thread(target=opener) for _ in range(8)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=30)
+                    self.assertFalse(t.is_alive(), "opener thread hung past join timeout")
+            self.assertEqual(errors, [], "concurrent first-open raised: %r" % errors[:3])
+            # The raced home must still be a correct, usable store afterwards.
+            with TestBenchStore(home) as st:
+                self.assertEqual(st.list_runs(limit=1), [])
+                self.assertEqual(st.journal_mode(), "wal")
+                # Direct signature of the torn-read bug: the raced home must end
+                # at the real schema version, not a spurious 0.
+                self.assertEqual(
+                    int(st._conn.execute("PRAGMA user_version").fetchone()[0]),
+                    SCHEMA_VERSION,
+                )
+        finally:
+            for p in parents:
+                shutil.rmtree(p, ignore_errors=True)
 
 
 if __name__ == "__main__":
