@@ -155,6 +155,14 @@ class TuiPtyTests(unittest.TestCase):
             pty_h.resize(136, 36)
             pty_h.wait_for_text("tb_20261114_174000_pty00001")
 
+            # Sort stays interactive after a resize and is shown in the title.
+            pty_h.buffer = ""
+            pty_h.send("2s")
+            pty_h.wait_for_text("failures first")
+            pty_h.wait_for_text("s sort")
+            pty_h.send("s")
+            pty_h.wait_for_text("longest")
+
             # 4. Lowercase 'q' in permanent tab mode does NOT exit; shows hint
             pty_h.buffer = ""
             pty_h.send("q")

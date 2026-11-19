@@ -260,6 +260,73 @@ class FrameContentTests(unittest.TestCase):
                 else:
                     self.assertRegex(view, r"started\s+-")
 
+    def test_history_sort_cycles_without_hiding_or_retargeting_runs(self) -> None:
+        runs = (
+            make_run("new", project="recent", status=RunStatus.PASS, created_at="2026-11-14T17:03:00Z", duration_ms=100),
+            make_run("err", project="error-run", status=RunStatus.ERROR, created_at="2026-11-14T17:02:00Z", duration_ms=None),
+            make_run("slow", project="slow-run", status=RunStatus.PASS, created_at="2026-11-14T17:01:00Z", duration_ms=1200),
+            make_run("bad", project="older-fail", created_at="2026-11-14T17:00:00Z", duration_ms=1200),
+        )
+        state = sample_state(view="history", runs=runs)
+        for order, expected in (
+            ("newest", ("recent", "error-run", "slow-run", "older-fail")),
+            ("failures first", ("error-run", "older-fail", "recent", "slow-run")),
+            ("longest", ("slow-run", "older-fail", "recent", "error-run")),
+            ("newest", ("recent", "error-run", "slow-run", "older-fail")),
+        ):
+            with self.subTest(order=order):
+                lines = [_strip(line) for line in render_frame(state, 140, 24)]
+                self.assertIn(f"history · {order}", lines[0])
+                self.assertIn("s sort", lines[-2])
+                for row, project in zip(lines[1:5], expected):
+                    self.assertIn(project, row[:68])
+                self.assertIn("RUN new", lines[1][70:])
+                state, action = handle_key(state, "s")
+                self.assertIsNone(action)
+        prompt, _ = handle_key(state, "R")
+        _, action = handle_key(prompt, "y")
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action.payload["run_id"], "new")
+
+    def test_history_sort_respects_filters_and_leaves_overview_unchanged(self) -> None:
+        state = sample_state(view="history", project_filter="demo", search_query="failed")
+        sorted_state, _ = handle_key(state, "s")
+        frame = _strip("\n".join(render_frame(sorted_state, 140, 24)))
+        self.assertIn("failures first", frame)
+        self.assertIn("failed01", frame)
+        self.assertNotIn("passed01", frame)
+        overview, _ = handle_key(sorted_state, "1")
+        after, action = handle_key(overview, "s")
+        self.assertIsNone(action)
+        self.assertEqual(overview, after)
+
+    def test_history_selection_survives_a_refresh_that_reorders_rows(self) -> None:
+        first = make_run("tb_20261114_170101_newer", status=RunStatus.PASS, duration_ms=10,
+                         created_at="2026-11-14T17:01:01Z")
+        second = make_run("tb_20261114_170000_older", status=RunStatus.PASS, duration_ms=20,
+                          created_at="2026-11-14T17:00:00Z")
+        with tempfile.TemporaryDirectory(prefix="tb-history-") as tmp, TestBenchStore(Path(tmp)) as store:
+            store.finalize_run(first)
+            store.finalize_run(second)
+            state = _refresh_from_store(store, TuiState(view="history"))
+            state, _ = handle_key(state, "s")
+            state, _ = handle_key(state, "s")
+            self.assertEqual(state.selected, 1)
+            store.finalize_run(dc_replace(first, duration_ms=50))
+            refreshed = _refresh_from_store(store, state)
+            view = _strip("\n".join(render_frame(refreshed, 140, 24)))
+            self.assertEqual(refreshed.selected, 0)
+            self.assertIn(f"RUN {first.run_id}", view)
+
+    def test_history_keeps_the_selected_row_visible_in_short_frames(self) -> None:
+        runs = tuple(make_run(f"id-{i}", project=f"project-{i:02}") for i in range(20))
+        state, _ = handle_key(sample_state(view="history", runs=runs), "G")
+        for width in (80, 140):
+            with self.subTest(width=width):
+                body = "\n".join(_strip(line)[:68] for line in render_frame(state, width, 10)[1:-2])
+                self.assertRegex(body, r"▸\s+FAIL\s+project-19")
+
     def test_overview_puts_active_runs_first_then_failures(self) -> None:
         text = _strip("\n".join(render_frame(sample_state(), 140, 36)))
         self.assertIn("RUN ", text)

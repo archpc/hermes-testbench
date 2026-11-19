@@ -33,6 +33,7 @@ from .tui_render import (
     TuiState,
     format_ansi_frame,
     handle_key,
+    preserve_history_selection,
     render_frame,
 )
 
@@ -208,7 +209,7 @@ def _refresh_from_store(store: TestBenchStore, prev: TuiState) -> TuiState:
         ProfileOption(ProfileName.AGENT_EVAL, True, "opt-in bounded LLM behavior probe"),
     )
 
-    return replace(
+    updated = replace(
         prev,
         runs=runs,
         projects=projects,
@@ -220,6 +221,7 @@ def _refresh_from_store(store: TestBenchStore, prev: TuiState) -> TuiState:
         store_status="ok",
         now_iso=utc_now_iso(),
     )
+    return preserve_history_selection(prev, updated)
 
 
 def _copy_text(text: str) -> str:
