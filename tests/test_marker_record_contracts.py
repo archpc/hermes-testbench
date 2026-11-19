@@ -39,6 +39,33 @@ class MarkerRecordContractTests(unittest.TestCase):
         self.assertEqual(
             [f["case_name"] for f in out.failures], ["named_case", "case_2"]
         )
+        # Inline message is the label, not the whole marker line; records
+        # carry kind and case shape too.
+        self.assertEqual(out.failures[0]["message"], "named_case")
+        self.assertEqual(out.failures[0]["kind"], "assertion")
+        self.assertEqual(
+            out.cases[0],
+            {"name": "named_case", "status": "FAIL", "message": "named_case"},
+        )
+
+    def test_bare_pass_and_skip_names_and_numbering(self) -> None:
+        out = parse_generic("PASS\nPASS\nSKIP\nSKIP\n")
+        self.assertEqual((out.passed, out.skipped), (2, 2))
+        self.assertEqual(
+            [c["name"] for c in out.cases],
+            ["case_1", "case_2", "case_1", "case_2"],
+        )
+
+    def test_scan_continues_after_skip(self) -> None:
+        out = parse_generic("SKIP s\nTB-PASS after\n")
+        self.assertEqual((out.passed, out.skipped), (1, 1))
+        self.assertEqual([c["name"] for c in out.cases], ["s", "after"])
+
+    def test_scan_continues_after_numbered_list(self) -> None:
+        # The bullet-list branch must continue the scan, not break out of it.
+        out = parse_generic("FAILED:\n  1. item\nTB-PASS after\n")
+        self.assertEqual((out.passed, out.failed), (1, 1))
+        self.assertEqual([c["name"] for c in out.cases], ["failure_1", "after"])
 
     def test_pass_and_skip_records(self) -> None:
         out = parse_generic("TB-PASS p1\nSKIP s1\n")
@@ -79,7 +106,9 @@ class MarkerRecordContractTests(unittest.TestCase):
         )
 
     def test_blank_line_inside_block_ends_excerpt(self) -> None:
-        out = parse_generic("TB-FAIL\n  line one\n\n  line two\n")
+        # Whitespace-ONLY line (not empty): for '' both or/and operands are
+        # true, so only a spaces-only line distinguishes the break condition.
+        out = parse_generic("TB-FAIL\n  line one\n   \n  line two\n")
         self.assertEqual(out.failed, 1)
         self.assertEqual(out.failures[0]["excerpt"], "line one")
 
