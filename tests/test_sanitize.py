@@ -210,6 +210,19 @@ class StreamRedactorLongValueTests(unittest.TestCase):
         self.assertNotIn("B" * 64, out)
         self.assertIn("[REDACTED]", out)
 
+    def test_pem_prefix_secret_immediate_branch_is_redacted(self) -> None:
+        # N2 (convergence review): the IMMEDIATE PEM entry branch (base64 body
+        # already on the marker line, no space) must also redact its prefix.
+        # The deferred-path test above does not exercise this branch.
+        tok = "secret" + "token"
+        body = "MIIB" + "A" * 60
+        text = "TOKEN=" + tok + " -----BEGIN RSA PRIVATE KEY-----" + body + "\n" + body + "\n-----END RSA PRIVATE KEY-----\n"
+        sr = StreamRedactor()
+        out = sr.feed(text) + sr.flush()
+        self.assertNotIn(tok, out)
+        self.assertNotIn(body, out)
+        self.assertIn("[REDACTED]", out)
+
     def test_short_value_terminated_at_cut_never_leaks(self) -> None:
         # Genuine SEC-3 shape: a sub-minimum value followed by whitespace
         # exactly at the cut ('PASSWORD=*** '). Exercises _ENV_ASSIGN_SHORT_RE
