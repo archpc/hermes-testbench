@@ -46,4 +46,5 @@ pytest_add_cli_args_test_selection = [
     "tests/test_output_contract.py",
     "tests/test_cobol_parser_coverage.py",
     "tests/test_marker_record_contracts.py",
+    "tests/test_mutmut_parser_contracts.py",
 ]
