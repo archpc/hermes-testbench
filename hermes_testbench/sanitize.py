@@ -26,6 +26,10 @@ _ENV_ASSIGN_RE = re.compile(
     r"(?i)(\b[A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH_KEY)"
     r"[A-Z0-9_]*\s*[:=]\s*['\"]?)([^\s'\"`,;]{4,})"
 )
+# URL userinfo whose closing '@' has not arrived yet (buffer cut mid-password).
+# Only used on the fail-closed over-cap stream path, never in redact_secrets,
+# so a line-final host:port in ordinary text is not over-redacted.
+_URL_USERINFO_OPEN_RE = re.compile(r"(https?://[^/\s:@]+:)[^@\s/]+$")
 
 
 def redact_secrets(text: str) -> str:
@@ -41,6 +45,20 @@ def redact_secrets(text: str) -> str:
     return out
 
 
+def _ends_in_secret(head: str) -> bool:
+    """True when a secret pattern's match runs to the end of ``head``.
+
+    A buffer cut there leaves the retained tail INSIDE a secret value (an
+    assignment value, a long known token, a bearer token, or URL userinfo),
+    so the tail must be treated as secret continuation, not emitted raw.
+    """
+    for rx in (_ENV_ASSIGN_RE, _KNOWN_TOKEN_RE, _BEARER_RE, _URL_USERINFO_RE):
+        for m in rx.finditer(head):
+            if m.end() == len(head):
+                return True
+    return False
+
+
 class StreamRedactor:
     """Line-buffered chunk redactor so secrets split across read() boundaries never hit disk."""
 
@@ -51,6 +69,7 @@ class StreamRedactor:
         self._buf: str = ""
         self._in_pem: Optional[str] = None
         self._pem_redacted_emitted: bool = False
+        self._secret_tail: bool = False
 
     def _redact_complete_lines(self, block: str) -> str:
         out_lines: List[str] = []
@@ -77,11 +96,22 @@ class StreamRedactor:
         if not chunk:
             return ""
         self._buf += chunk
+        prefix = ""
+        if self._secret_tail:
+            # Continuation of a secret value cut mid-stream: fail closed and
+            # discard up to the next newline (the head already shows [REDACTED]).
+            nl = self._buf.find("\n")
+            if nl < 0:
+                self._buf = ""
+                return ""
+            self._buf = self._buf[nl + 1 :]
+            self._secret_tail = False
+            prefix = "\n"
         last_nl = self._buf.rfind("\n")
         if last_nl >= 0:
             complete = self._buf[: last_nl + 1]
             self._buf = self._buf[last_nl + 1 :]
-            return self._redact_complete_lines(complete)
+            return prefix + self._redact_complete_lines(complete)
         if len(self._buf) > self.MAX_BUFFER_CHARS:
             if self._in_pem is not None:
                 # Cap memory inside an unclosed PEM stream while retaining tail for split END marker
@@ -95,11 +125,29 @@ class StreamRedactor:
             ws = self._buf.rfind(" ", 0, cut)
             split_at = ws + 1 if ws > 0 else cut
             head = self._buf[:split_at]
+            if ws <= 0 and _URL_USERINFO_OPEN_RE.search(head):
+                # Cut inside URL userinfo before the '@': redact the open
+                # password and suppress the continuation (fail closed).
+                head = _URL_USERINFO_OPEN_RE.sub(r"\1[REDACTED]", head)
+                self._buf = ""
+                self._secret_tail = True
+                return prefix + redact_secrets(head)
+            if ws <= 0 and _ends_in_secret(head):
+                # No whitespace boundary and the cut landed inside a secret
+                # value: the retained tail would be raw secret continuation.
+                # Drop it and suppress the rest of the line (fail closed).
+                self._buf = ""
+                self._secret_tail = True
+                return prefix + redact_secrets(head)
             self._buf = self._buf[split_at:]
-            return redact_secrets(head)
-        return ""
+            return prefix + redact_secrets(head)
+        return prefix
 
     def flush(self) -> str:
+        if self._secret_tail:
+            self._buf = ""
+            self._secret_tail = False
+            return ""
         if not self._buf and self._in_pem is None:
             return ""
         rem = self._buf

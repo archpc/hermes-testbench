@@ -77,5 +77,75 @@ class SanitizeTests(unittest.TestCase):
         self.assertIn("truncated", out)
 
 
+class StreamRedactorLongValueTests(unittest.TestCase):
+    """ADR-0004: unredacted raw output is never persisted. A secret assignment
+    value longer than MAX_BUFFER_CHARS on a line with no whitespace forces the
+    no-whitespace flush cut; the retained tail is the secret's continuation and
+    must not be emitted raw (found by campaign probe: 512-char password tail
+    leaked on a 66K single-line value, reproducible with one feed + flush).
+    """
+
+    SECRET = "Zk9" * 22000  # 66000 chars, no whitespace
+
+    def assert_no_fragment(self, out: str) -> None:
+        self.assertNotIn(self.SECRET[-512:], out)
+        for i in range(0, len(self.SECRET) - 32, 4096):
+            self.assertNotIn(self.SECRET[i:i + 32], out)
+
+    def test_long_assignment_value_tail_never_reaches_output_single_feed(self) -> None:
+        sr = StreamRedactor()
+        out = sr.feed("PASSWORD=" + self.SECRET) + sr.flush()
+        self.assertTrue(out.startswith("PASSWORD=[REDACTED]"))
+        self.assert_no_fragment(out)
+
+    def test_long_assignment_value_tail_chunked(self) -> None:
+        sr = StreamRedactor()
+        text = "PASSWORD=" + self.SECRET
+        out = []
+        for i in range(0, len(text), 700):
+            out.append(sr.feed(text[i:i + 700]))
+        out.append(sr.flush())
+        joined = "".join(out)
+        self.assertIn("[REDACTED]", joined)
+        self.assert_no_fragment(joined)
+
+    def test_long_assignment_value_then_newline_keeps_following_lines(self) -> None:
+        sr = StreamRedactor()
+        out = sr.feed("PASSWORD=" + self.SECRET)
+        out += sr.feed("\nnext line\n")
+        out += sr.flush()
+        self.assert_no_fragment(out)
+        self.assertIn("next line", out)
+
+    def test_long_known_token_tail_is_not_emitted(self) -> None:
+        sr = StreamRedactor()
+        out = sr.feed("sk-" + "A" * 70000) + sr.flush()
+        self.assertIn("[REDACTED]", out)
+        self.assertNotIn("A" * 64, out)
+
+    def test_long_url_userinfo_password_never_reaches_output(self) -> None:
+        # The closing '@' is beyond the buffer cut, so the complete-URL pattern
+        # cannot match: the open userinfo must still be redacted fail-closed.
+        pw = "Pq7" * 23000
+        sr = StreamRedactor()
+        out = sr.feed("https://user:" + pw + "@api.example.com/v1") + sr.flush()
+        self.assertIn("[REDACTED]", out)
+        self.assertTrue(out.startswith("https://user:[REDACTED]"))
+        for i in range(0, len(pw) - 32, 4096):
+            self.assertNotIn(pw[i:i + 32], out)
+
+    def test_benign_long_line_with_whitespace_is_preserved(self) -> None:
+        sr = StreamRedactor()
+        text = "word " * 15000
+        out = sr.feed(text) + sr.flush()
+        self.assertEqual(out, text)
+
+    def test_benign_long_line_without_whitespace_is_preserved(self) -> None:
+        sr = StreamRedactor()
+        text = "x" * 70000
+        out = sr.feed(text) + sr.flush()
+        self.assertEqual(out, text)
+
+
 if __name__ == "__main__":
     unittest.main()
