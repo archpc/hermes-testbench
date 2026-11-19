@@ -278,12 +278,36 @@ def parse_python_unittest(text: str) -> ParseOutcome:
         ordered_fail_names.append(display)
 
     seen_cases: set[str] = set()
+    # unittest -v prints docstring-described tests on two lines: the identity
+    # line without a state, then the docstring's first line carrying the state.
+    # Track the pending identity so those cases keep their names instead of
+    # being dropped (and later padded with synthetic placeholders in junit).
+    pending_name_re = re.compile(r"^(\S+) \(([^)]*\.[^)]*)\)\s*$")
+    state_line_re = re.compile(
+        r"^.* \.\.\. (ok|FAIL|ERROR|skipped(?:\s+(?:['\"].*['\"]|\S.*))?|expected failure|unexpected success)\s*$"
+    )
+    pending_display: Optional[str] = None
     for line in lines:
-        vm = verbose_re.match(line.strip())
-        if not vm:
-            continue
-        func_name, loc, raw_state = vm.groups()
-        display = f"{func_name} ({loc})"
+        stripped = line.strip()
+        vm = verbose_re.match(stripped)
+        if vm:
+            func_name, loc, raw_state = vm.groups()
+            display = f"{func_name} ({loc})"
+            pending_display = None
+        else:
+            if header_re.match(stripped):
+                pending_display = None
+                continue
+            pm = pending_name_re.match(stripped)
+            if pm:
+                pending_display = f"{pm.group(1)} ({pm.group(2)})"
+                continue
+            sm = state_line_re.match(stripped) if pending_display else None
+            if not sm or pending_display is None:
+                pending_display = None
+                continue
+            display, raw_state = pending_display, sm.group(1)
+            pending_display = None
         if display in seen_cases:
             continue
         seen_cases.add(display)

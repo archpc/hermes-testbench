@@ -202,5 +202,74 @@ class MutmutUnicodeMutantNameTests(unittest.TestCase):
         self.assertEqual(outcome.cases[0]["name"], "my-module.x_f__mutmut_1")
 
 
+class UnittestDocstringVerboseTests(unittest.TestCase):
+    """unittest -v prints docstring-described tests on TWO lines: the test
+    identity line without a state, then the docstring's first line carrying
+    ``... ok`` / ``... skipped 'reason'``. The parser must attach the state to
+    the pending identity instead of dropping the case. Observed live on
+    core-unit run tb_20261119_191953_3f2f1afc: 10 of 224 case identities were
+    lost and junit padded them with synthetic skip_N/pass_N placeholders.
+    """
+
+    def test_docstring_ok_and_skip_keep_their_identity(self) -> None:
+        text = (
+            "test_plain (tests.test_x.PlainTests.test_plain) ... ok\n"
+            "test_doc (tests.test_x.DocTests.test_doc)\n"
+            "First line of the docstring. ... ok\n"
+            "test_doc_skip (tests.test_x.DocTests.test_doc_skip)\n"
+            "Docstring skip. ... skipped 'capability unavailable'\n"
+            "Ran 3 tests in 0.001s\n"
+            "\n"
+            "OK (skipped=1)\n"
+        )
+        outcome = parse_python_unittest(text)
+        self.assertEqual((outcome.total, outcome.passed, outcome.skipped), (3, 2, 1))
+        by_name = {c["name"]: c for c in outcome.cases}
+        self.assertEqual(len(by_name), 3)
+        self.assertEqual(by_name["test_doc (tests.test_x.DocTests.test_doc)"]["status"], "PASS")
+        skip = by_name["test_doc_skip (tests.test_x.DocTests.test_doc_skip)"]
+        self.assertEqual(skip["status"], "SKIP")
+        self.assertEqual(skip["message"], "capability unavailable")
+
+    def test_docstring_failure_keeps_identity_and_detail(self) -> None:
+        text = (
+            "test_doc_fail (tests.test_x.DocTests.test_doc_fail)\n"
+            "Docstring fail. ... FAIL\n"
+            "\n"
+            "======================================================================\n"
+            "FAIL: test_doc_fail (tests.test_x.DocTests.test_doc_fail)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            '  File "x.py", line 3, in test_doc_fail\n'
+            "    self.assertEqual(1, 2)\n"
+            "AssertionError: 1 != 2\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 1 test in 0.001s\n"
+            "\n"
+            "FAILED (failures=1)\n"
+        )
+        outcome = parse_python_unittest(text)
+        self.assertEqual((outcome.total, outcome.failed), (1, 1))
+        self.assertEqual(len(outcome.cases), 1)
+        case = outcome.cases[0]
+        self.assertEqual(case["name"], "test_doc_fail (tests.test_x.DocTests.test_doc_fail)")
+        self.assertEqual(case["status"], "FAIL")
+        self.assertIn("1 != 2", case["message"])
+
+    def test_docstring_line_with_ellipsis_inside_still_parses(self) -> None:
+        text = (
+            "test_dots (tests.test_x.DocTests.test_dots)\n"
+            "Wait for it... then more... ... ok\n"
+            "Ran 1 test in 0.001s\n"
+            "\n"
+            "OK\n"
+        )
+        outcome = parse_python_unittest(text)
+        self.assertEqual(len(outcome.cases), 1)
+        self.assertEqual(outcome.cases[0]["status"], "PASS")
+        self.assertEqual(outcome.cases[0]["name"], "test_dots (tests.test_x.DocTests.test_dots)")
+
+
 if __name__ == "__main__":
     unittest.main()
