@@ -6,6 +6,29 @@ evaluates ONLY observable outcomes (exit status, persisted TestBench run record,
 wall-clock duration, observable tool-call metadata, and recorded
 ``session_model_usage`` rows from ``state.db``). Never fabricates token or cost
 accounting and never claims access to private model reasoning.
+
+Two modes
+---------
+``--self-check-db PATH``
+    Offline. Pure SQLite read of the given file; no subprocess, no network. Prints
+    ``TESTBENCH_MODEL_USAGE=<json>`` and ``PASS observable_usage_extracted`` when a
+    usage row was found, else ``FAIL no observable usage found``. This is the mode the
+    unit tests use, because it needs no ``hermes`` binary and no model spend.
+(default)
+    Live. Spawns one ``hermes chat -q ... -Q`` session against a throwaway project with
+    a single trivially passing unittest, and asks the agent to discover and run it
+    through TestBench. Verification is on artifacts only: the agent's exit status, a
+    persisted ``tb_*/run.json`` under the TestBench home passed in the prompt, and that
+    record's ``status``/``pass_count``. The prompt text and the agent's prose are not
+    parsed.
+
+Cost of running the live mode is a real model session: it spends tokens and wall time
+on the operator's own account, with a 180 s ceiling per call. Nothing outside a
+``TemporaryDirectory`` is written; the usage query opens the state DB read-only.
+
+Exit codes are 0 for pass *and* for the ``SKIP: hermes CLI not on PATH`` case, so a
+caller must read the marker, not just the status, to tell "verified" from "not run".
+Anything else -- missing run record, non-PASS record, zero passes, nonzero exit -- is 1.
 """
 
 from __future__ import annotations
@@ -26,6 +49,13 @@ from typing import Any, Dict, Optional
 
 
 def _real_hermes_db() -> Path:
+    """Path to the active profile's ``state.db``, resolved from the passwd entry.
+
+    ``pwd.getpwuid`` is preferred over ``Path.home()`` because it survives a HOME that
+    an invoking harness has redefined; the ``Path.home()`` branch is only the fallback
+    when the passwd lookup fails. Nothing here verifies the file exists -- a missing DB
+    is a normal "no evidence" outcome for the callers below, not an error.
+    """
     try:
         uh = Path(pwd.getpwuid(os.getuid()).pw_dir)
     except Exception:
@@ -34,6 +64,34 @@ def _real_hermes_db() -> Path:
 
 
 def read_observable_session_usage(db_path: Path, session_id: Optional[str] = None, since_ts: float = 0.0) -> Optional[Dict[str, Any]]:
+    """Extract one session's recorded token/cost/tool-call rows, or ``None``.
+
+    The DB is opened read-only through a ``file:...?mode=ro`` URI: this probe must never
+    create, lock-for-write, or migrate the operator's live state file.
+
+    Schema drift is absorbed by introspection rather than assumed: the column set is read
+    from ``PRAGMA table_info`` and each optional column has an explicit fallback
+    (``billing_provider`` -> ``provider`` -> empty, ``SUM(api_call_count)`` -> ``COUNT(*)``,
+    ``actual_cost_usd`` absent -> SQL ``NULL``). A missing ``session_model_usage`` table,
+    an unresolvable session, or a row whose token sums are both NULL returns ``None``;
+    that is the "no observable evidence" answer, and it is deliberately not zeroes --
+    reporting ``input_tokens: 0`` would be an assertion the DB never made.
+
+    Session selection: without an explicit ``session_id`` the newest row with
+    ``started_at >= since_ts`` is used. ``since_ts`` is therefore the only fence between
+    "the session this probe just started" and a concurrent one, and it is a heuristic.
+
+    ``actual_cost_usd`` is only included when the recorded value is positive, because the
+    column is optional and a stored 0 usually means "not yet priced" rather than "free".
+
+    Two limits a reader must not over-read:
+
+    * the aggregate is ``GROUP BY model`` fetched with ``fetchone()``, so a session that
+      used several models reports only the first group -- the totals are that model's,
+      not the session's;
+    * ``except sqlite3.Error`` returns ``None``, so a corrupt or locked DB is
+      indistinguishable from "no rows" at this layer.
+    """
     if not db_path.is_file():
         return None
     try:
@@ -95,6 +153,18 @@ def read_observable_session_usage(db_path: Path, session_id: Optional[str] = Non
 
 
 def main() -> int:
+    """CLI entry point; see the module docstring for the two modes and the exit contract.
+
+    Emits, in order: an optional ``TESTBENCH_MODEL_USAGE=<json>`` line, then exactly one
+    terminal line -- ``PASS ...``, ``FAIL ...``, or ``SKIP: ...``. The ``PASS`` line
+    carries the run id, wall-clock duration, and pass count taken from the persisted
+    record, never from the agent's own claim.
+
+    Failure paths stay distinguishing: a spawn timeout raises
+    ``subprocess.TimeoutExpired`` uncaught (traceback, non-zero from the interpreter), and
+    a passing exit with no persisted record prints the exit code, the record count, and
+    the last 300 characters of stdout so the two causes are separable from the message.
+    """
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--self-check-db", default="", help="Offline unit-test mode reading a synthetic state.db")
     ap.add_argument("--session-id", default="", help="Specific session_id to inspect")
@@ -139,6 +209,8 @@ def main() -> int:
         )
         elapsed_s = time.time() - t_start
         runs_dir = tb_home / "runs"
+        # Glob order is filesystem order, not recency: ``persisted_runs[0]`` is whichever
+        # record sorts first, so a stale run left in the tree can be the one judged.
         persisted_runs = list(runs_dir.glob("tb_*/run.json")) if runs_dir.is_dir() else []
 
         usage = read_observable_session_usage(_real_hermes_db(), since_ts=t_start - 1.0)
