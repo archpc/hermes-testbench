@@ -75,10 +75,24 @@ class MutmutEmojiTallyFallbackTests(unittest.TestCase):
         out = parse_mutmut("🤔 6\n")
         self.assertEqual(out.buckets["inconclusive"], 6)
 
+    def test_same_bucket_emojis_accumulate(self) -> None:
+        # 🎉 and 🧙 both map to caught; the tally must ADD, not overwrite.
+        out = parse_mutmut("🎉 3 🧙 4\n")
+        self.assertEqual(out.buckets["caught"], 7)
+
     def test_baseline_failure_marker(self) -> None:
         out = parse_mutmut("failed to collect tests\n")
         self.assertTrue(out.baseline_failed)
         self.assertTrue(out.structured)
+        self.assertEqual(
+            out.cases[0],
+            {
+                "name": "<baseline>",
+                "status": "SKIP",
+                "message": "mutmut could not collect a passing baseline",
+            },
+        )
+        self.assertEqual(out.buckets["inconclusive"], 1)
 
 
 if __name__ == "__main__":
