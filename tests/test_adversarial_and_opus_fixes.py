@@ -67,7 +67,12 @@ class AdversarialAndOpusRegressionTests(unittest.TestCase):
             t.start()
 
             rid = ""
-            deadline = time.monotonic() + 5.0
+            # run_sync persists RUNNING only after resolve_target + discovery
+            # (git subprocesses) + the environment snapshot. On a slow CI runner
+            # that setup can exceed a few seconds; 5s was too tight and failed
+            # with an empty rid on macos-15. The suite below sleeps 15s, so once
+            # RUNNING appears it persists well past this window.
+            deadline = time.monotonic() + 30.0
             while time.monotonic() < deadline and not rid:
                 if self.tb_home.exists():
                     with TestBenchStore(self.tb_home) as st2:
