@@ -89,6 +89,33 @@ class EngineAndCliTests(unittest.TestCase):
                 outside.resolve(),
             )
 
+    def test_bench_without_subaction_lists_without_error(self) -> None:
+        # `testbench bench` (no run/compare/list) must list, not crash on a
+        # missing args.project. Regression for the AttributeError at the list branch.
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli_main(["--home", str(self.tb_home), "bench"])
+        self.assertEqual(rc, 0)
+        self.assertIn("no benchmarks recorded", buf.getvalue())
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            rc2 = cli_main(["--home", str(self.tb_home), "bench", "--json"])
+        self.assertEqual(rc2, 0)
+        self.assertEqual(buf2.getvalue().strip(), "[]")
+
+    def test_tui_picker_includes_mutation_profile(self) -> None:
+        # The picker must offer mutation (CLI --profile mutation works); agent-eval
+        # stays last because it is billable.
+        from hermes_testbench.tui import _refresh_from_store
+        from hermes_testbench.tui_render import TuiState
+        with TestBenchStore(self.tb_home) as store:
+            st = _refresh_from_store(store, TuiState())
+        names = [p.name for p in st.profiles]
+        self.assertIn("mutation", names)
+        self.assertEqual(names[-1], "agent-eval")
+
     def test_sync_run_persists_results_and_reproduce_replays_without_rediscovery(self) -> None:
         with TestBenchStore(self.tb_home) as store:
             eng = TestBenchEngine(store, discover_fn=self._fake_discover)

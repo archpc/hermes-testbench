@@ -96,6 +96,9 @@ def build_parser() -> argparse.ArgumentParser:
     canp.add_argument("--json", action="store_true")
 
     bench = sub.add_parser("bench", help="Run or compare reproducible benchmarks")
+    # Parent-level so `testbench bench` (no sub-action) lists without AttributeError.
+    bench.add_argument("--project", default="")
+    bench.add_argument("--json", action="store_true")
     bsub = bench.add_subparsers(dest="bench_action")
     brun = bsub.add_parser("run", help="Run a benchmark workload")
     brun.add_argument("path", nargs="?", default=".")
