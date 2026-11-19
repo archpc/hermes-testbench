@@ -208,7 +208,8 @@ class TuiPtyTests(unittest.TestCase):
         # Two-column proof: one line carries the list row left of cell 68 AND
         # the inspector header ("RUN <id>") at cell 70+. A full-width layout
         # spans the list past 70 and puts the inspector on separate lines below,
-        # so requiring the inspector header at 70 rejects it (and a widened cap).
+        # so requiring the inspector header at 70 rejects it. (The 68-cap itself
+        # is pinned by the render boundary test, not here.)
         lines = _frame_lines(buffer)
         header = "RUN " + run_id
         self.assertTrue(
