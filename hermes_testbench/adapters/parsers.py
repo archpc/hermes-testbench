@@ -742,7 +742,11 @@ _MUTTALLY_BUCKET = {
     "unviable": "invalid",
     "failed": "inconclusive",
 }
-_MUTMUT_RESULT_LINE_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9_.\-]+):\s*(?P<status>[a-z][a-z \t]*[a-z])\s*$")
+# Mutant names are Python identifiers joined with dots: mutmut >= 3 mangles
+# method names with the Unicode class marker ``ǁ`` (U+01C1), so the name class
+# must be Unicode-aware (\w), not ASCII-only, or every class-method verdict is
+# silently dropped and the score denominator is wrong.
+_MUTMUT_RESULT_LINE_RE = re.compile(r"^\s*(?P<name>[\w.\-]+):\s*(?P<status>[a-z][a-z \t]*[a-z])\s*$")
 _MUTMUT_EMOJI_TALLY_RE = re.compile(r"(🎉|🧙|🙁|⏰|🫥|🤔|🔇|🛑|💥)\s*(\d+)")
 
 _CARGO_BASELINE_FAILURE_MARKERS = (

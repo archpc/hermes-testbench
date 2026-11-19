@@ -14,6 +14,7 @@ import unittest
 from hermes_testbench.adapters.parsers import (
     parse_cobol,
     parse_generic,
+    parse_mutmut,
     parse_python_unittest,
     parse_shell,
     parse_sqlite_probe,
@@ -147,6 +148,58 @@ class UnittestParseStillStructuredTests(unittest.TestCase):
             "FAILED (failures=1)\n"
         )
         self.assertEqual((outcome.total, outcome.passed, outcome.failed), (2, 1, 1))
+
+
+class MutmutUnicodeMutantNameTests(unittest.TestCase):
+    """mutmut >= 3 names method mutants with the Unicode class marker ``ǁ``
+    (U+01C1), e.g. ``pkg.mod.xǁStyleǁ__call____mutmut_2``. The results-line
+    parser must not silently drop them: dropping kills and survivors corrupts
+    the score denominator and hides per-mutant evidence. Observed live on
+    hermes-tmux-workspace run tb_20261119_190950_6c1b2120: 760 of 3178 verdicts
+    (every class-method mutant) vanished from the receipt.
+    """
+
+    def test_class_scoped_unicode_names_are_counted_and_preserved(self) -> None:
+        results_text = (
+            "    pkg.mod.xǁStyleǁ__init____mutmut_1: killed\n"
+            "    pkg.mod.xǁStyleǁ__call____mutmut_2: survived\n"
+            "    pkg.mod.x_plain__mutmut_3: killed\n"
+            "    pkg.mod.xǁStyleǁfg__mutmut_4: no tests\n"
+        )
+        outcome = parse_mutmut("", results_text=results_text)
+        self.assertEqual(outcome.buckets["caught"], 2)
+        self.assertEqual(outcome.buckets["survived"], 1)
+        self.assertEqual(outcome.buckets["inconclusive"], 1)
+        self.assertEqual(outcome.total, 4)
+        self.assertEqual(
+            {case["name"] for case in outcome.cases},
+            {
+                "pkg.mod.xǁStyleǁ__init____mutmut_1",
+                "pkg.mod.xǁStyleǁ__call____mutmut_2",
+                "pkg.mod.x_plain__mutmut_3",
+                "pkg.mod.xǁStyleǁfg__mutmut_4",
+            },
+        )
+
+    def test_unicode_survivors_change_the_score_denominator(self) -> None:
+        # Two killed method mutants + one survived module mutant: the true
+        # score is 2/3. Silently dropping the Unicode names yields 0/1.
+        results_text = (
+            "    pkg.mod.xǁKlassǁwork__mutmut_1: killed\n"
+            "    pkg.mod.xǁKlassǁwork__mutmut_2: killed\n"
+            "    pkg.mod.x_helper__mutmut_1: survived\n"
+        )
+        outcome = parse_mutmut("", results_text=results_text)
+        self.assertEqual(outcome.passed, 2)
+        self.assertEqual(outcome.failed, 1)
+        self.assertEqual(outcome.total, 3)
+
+    def test_hyphenated_module_names_still_parse(self) -> None:
+        outcome = parse_mutmut(
+            "", results_text="    my-module.x_f__mutmut_1: killed\n"
+        )
+        self.assertEqual(outcome.buckets["caught"], 1)
+        self.assertEqual(outcome.cases[0]["name"], "my-module.x_f__mutmut_1")
 
 
 if __name__ == "__main__":
