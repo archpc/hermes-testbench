@@ -185,7 +185,7 @@ class PaletteTests(unittest.TestCase):
 
 class FrameGeometryTests(unittest.TestCase):
     def test_frame_is_exactly_height_lines_of_exact_cell_width(self) -> None:
-        for width, height in ((80, 24), (140, 36), (30, 6)):
+        for width, height in ((80, 24), (120, 35), (140, 36), (200, 50), (280, 70), (30, 6)):
             lines = render_frame(sample_state(), width, height)
             self.assertEqual(len(lines), height, (width, height))
             for index, line in enumerate(lines):
@@ -206,7 +206,7 @@ class FrameGeometryTests(unittest.TestCase):
         self.assertTrue(_strip(lines[35]).strip())
 
     def test_no_decorative_borders_or_spinners(self) -> None:
-        for width, height in ((80, 24), (140, 36)):
+        for width, height in ((80, 24), (140, 36), (200, 50), (280, 70)):
             text = _strip("\n".join(render_frame(sample_state(), width, height)))
             for glyph in "╭╮╰╯│─┌┐└┘┏┓┗┛━┃╔╗╚╝║╠╣╬╪╫╭":
                 self.assertNotIn(glyph, text)
@@ -234,6 +234,48 @@ class FrameGeometryTests(unittest.TestCase):
         self.assertIn("tb_20261114_164000_failed01", body)
         self.assertIn("repro", body.lower())
         self.assertIn("line one", body)
+
+    def test_wide_split_caps_list_at_68_and_grows_inspector(self) -> None:
+        # width >= 120: left_w = max(30, min(68, width//2 - 2)) caps at 68,
+        # then a 2-cell gutter, so the inspector starts at cell 70. Pin the
+        # boundary itself: widening the cap moves the gutter and breaks this.
+        selected_id = "tb_20261114_164000_failed01"
+        for width, height in ((200, 50), (280, 70)):
+            with self.subTest(width=width):
+                lines = render_frame(sample_state(selected=2), width, height)
+                body = lines[1 : height - 2]
+                first = _strip(body[0])
+                self.assertEqual(first[68:74], "  RUN ")
+                self.assertIn(selected_id, first[70:])
+                right_text = "\n".join(_strip(line)[70:] for line in body)
+                self.assertIn(f"/runs/{selected_id}", right_text)
+                for line in body:
+                    self.assertEqual(display_width(line), width)
+
+    def test_resize_does_not_retarget_selection_or_mutate_payloads(self) -> None:
+        # Geometry changes must not retarget the selection or mutate the
+        # mutable payloads a frozen dataclass still carries (dicts/tuples).
+        state = sample_state(selected=2)
+        baselines_before = dict(state.baselines)
+        logs_before = {k: tuple(v) for k, v in state.log_lines.items()}
+        narrow = render_frame(state, 80, 24)
+        wide = render_frame(state, 280, 70)
+        mid = render_frame(state, 120, 35)
+        back = render_frame(state, 80, 24)
+        self.assertEqual(state.selected, 2)
+        self.assertEqual(dict(state.baselines), baselines_before)
+        self.assertEqual({k: tuple(v) for k, v in state.log_lines.items()}, logs_before)
+        self.assertEqual(narrow, back)
+        selected_id = "tb_20261114_164000_failed01"
+        self.assertIn(selected_id, _strip("\n".join(wide)))
+        self.assertIn(selected_id, _strip("\n".join(mid)))
+        moved, action = handle_key(state, "j")
+        self.assertIsNone(action)
+        self.assertEqual(moved.selected, 3)
+        narrow_moved = render_frame(moved, 80, 24)
+        render_frame(moved, 280, 70)
+        self.assertEqual(moved.selected, 3)
+        self.assertEqual(narrow_moved, render_frame(moved, 80, 24))
 
 
 class FrameContentTests(unittest.TestCase):

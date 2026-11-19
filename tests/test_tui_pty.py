@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import os
 import pty
+import re
 import select
 import signal
 import struct
@@ -21,6 +22,14 @@ from hermes_testbench.store import TestBenchStore
 
 PY = sys.executable
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Strip SGR/CSI/OSC so a redrawn frame can be sliced by cell column.
+_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
+
+
+def _frame_lines(buffer: str) -> list[str]:
+    clean = _CSI_RE.sub("", buffer)
+    return [ln for ln in re.split(r"\r\n|\n|\r", clean) if ln.strip()]
 
 
 class PtyTuiHarness:
@@ -170,6 +179,107 @@ class TuiPtyTests(unittest.TestCase):
             self.assertIsNone(pty_h.proc.poll())
 
             # 5. Uppercase 'Q' exits cleanly and restores normal screen (\033[?1049l) and cursor (\033[?25h)
+            pty_h.send("Q")
+            rc = pty_h.close()
+            self.assertEqual(rc, 0)
+            self.assertIn("\033[?1049l", pty_h.buffer)
+            self.assertIn("\033[?25h", pty_h.buffer)
+        except Exception:
+            pty_h.close()
+            raise
+
+
+    def _settle(self, pty_h: "PtyTuiHarness") -> None:
+        # Let the redraw finish streaming before slicing cells by column.
+        time.sleep(0.15)
+        while True:
+            r, _, _ = select.select([pty_h.master], [], [], 0.1)
+            if not r:
+                break
+            try:
+                chunk = os.read(pty_h.master, 16384)
+                if not chunk:
+                    break
+                pty_h.buffer += chunk.decode("utf-8", errors="replace")
+            except OSError:
+                break
+
+    def _assert_wide_split(self, buffer: str, project: str, run_id: str) -> None:
+        # Two-column proof: one line carries the list row left of cell 68 AND
+        # the inspector header ("RUN <id>") at cell 70+. A full-width layout
+        # spans the list past 70 and puts the inspector on separate lines below,
+        # so requiring the inspector header at 70 rejects it (and a widened cap).
+        lines = _frame_lines(buffer)
+        header = "RUN " + run_id
+        self.assertTrue(
+            any(project in ln[:68] and header in ln[70:] for ln in lines),
+            "no two-column line (list <68, inspector header >=70); "
+            f"tail={buffer[-400:]!r}",
+        )
+
+    def test_pty_resize_to_6k_wide_and_back_preserves_interaction(self) -> None:
+        # 80x24 -> 280x70 -> 200x50 -> 80x24: SIGWINCH redraws at each geometry,
+        # the wide inspector appears, history sort stays interactive, and the
+        # narrow frame returns without losing the view or the alt screen.
+        pty_h = PtyTuiHarness([PY, "-m", "hermes_testbench", "tui"], self._env(), cols=80, rows=24)
+        try:
+            pty_h.wait_for_text("TESTBENCH")
+            self.assertIn("\033[?1049h", pty_h.buffer)
+
+            with TestBenchStore(self.tb_home) as store:
+                rec = RunRecord(
+                    run_id="tb_20261114_180000_wide0001",
+                    project="wideproj",
+                    project_root="/tmp/wideproj",
+                    revision="8234029",
+                    profile="unit",
+                    status=RunStatus.FAIL,
+                    created_at="2026-11-14T23:00:00Z",
+                    finished_at="2026-11-14T23:00:02Z",
+                    duration_ms=1230.0,
+                    total_count=10,
+                    pass_count=9,
+                    fail_count=1,
+                    first_failure="wide_resize: boom",
+                    repro_instructions="python3 -m unittest tests.test_wide",
+                )
+                store.create_run(rec)
+                store.finalize_run(rec)
+
+            pty_h.wait_for_text("wideproj")
+            pty_h.wait_for_text("FAIL")
+
+            pty_h.buffer = ""
+            pty_h.resize(280, 70)
+            pty_h.wait_for_text("tb_20261114_180000_wide0001", timeout=6.0)
+            pty_h.wait_for_text("Enter inspect", timeout=6.0)
+            self._settle(pty_h)
+            self._assert_wide_split(pty_h.buffer, "wideproj", "tb_20261114_180000_wide0001")
+
+            pty_h.buffer = ""
+            pty_h.resize(200, 50)
+            pty_h.wait_for_text("tb_20261114_180000_wide0001", timeout=6.0)
+            pty_h.wait_for_text("Enter inspect", timeout=6.0)
+            self._settle(pty_h)
+            self._assert_wide_split(pty_h.buffer, "wideproj", "tb_20261114_180000_wide0001")
+
+            # History sort survives the wide resizes.
+            pty_h.buffer = ""
+            pty_h.send("2s")
+            pty_h.wait_for_text("failures first")
+            pty_h.wait_for_text("s sort")
+
+            # Shrink back to narrow: view and sort hint persist.
+            pty_h.buffer = ""
+            pty_h.resize(80, 24)
+            pty_h.wait_for_text("s sort", timeout=6.0)
+            pty_h.wait_for_text("wideproj")
+
+            pty_h.buffer = ""
+            pty_h.send("q")
+            pty_h.wait_for_text("press Q")
+            self.assertIsNone(pty_h.proc.poll())
+
             pty_h.send("Q")
             rc = pty_h.close()
             self.assertEqual(rc, 0)
