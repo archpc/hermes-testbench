@@ -180,6 +180,23 @@ class StreamRedactorLongValueTests(unittest.TestCase):
         self.assertNotIn("B" * 64, out)
         self.assertIn("[REDACTED]", out)
 
+    def test_midline_pem_mention_with_following_prose_is_preserved(self) -> None:
+        # A mid-line BEGIN with nothing after the marker is ambiguous until the
+        # next line: prose means it was a mention, not a key (test_r6 contract).
+        text = "note -----BEGIN RSA PRIVATE KEY-----\nRan 5 tests in 0.1s\n\nOK\n"
+        sr = StreamRedactor()
+        out = sr.feed(text) + sr.flush()
+        self.assertIn("Ran 5 tests in 0.1s", out)
+        self.assertIn("note -----BEGIN RSA PRIVATE KEY-----", out)
+
+    def test_midline_pem_with_same_line_body_suppresses_body(self) -> None:
+        body = "B" * 64
+        text = "pad -----BEGIN RSA PRIVATE KEY-----" + body + "\n" + body + "\n-----END RSA PRIVATE KEY-----\n"
+        sr = StreamRedactor()
+        out = sr.feed(text) + sr.flush()
+        self.assertNotIn(body, out)
+        self.assertIn("[REDACTED]", out)
+
     def test_benign_long_line_with_whitespace_is_preserved(self) -> None:
         sr = StreamRedactor()
         text = "word " * 15000
